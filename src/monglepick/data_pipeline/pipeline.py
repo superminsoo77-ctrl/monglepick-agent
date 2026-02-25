@@ -15,7 +15,7 @@
 - Qdrant 적재: ~5분
 - Neo4j 구축: ~15분
 - CF 매트릭스: ~20분
-- 총합: ~4시간
+- 총합: ~4시간 
 """
 
 from __future__ import annotations
