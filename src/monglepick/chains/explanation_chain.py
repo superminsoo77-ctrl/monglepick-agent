@@ -14,6 +14,8 @@ EXAONE 32B (자유 텍스트)로 실행한다.
 from __future__ import annotations
 
 import asyncio
+import time
+import traceback
 
 import structlog
 from langchain_core.prompts import ChatPromptTemplate
@@ -24,6 +26,7 @@ from monglepick.agents.chat.models import (
     RankedMovie,
     ScoreDetail,
 )
+from monglepick.config import settings
 from monglepick.llm.factory import get_explanation_llm
 from monglepick.prompts.explanation import (
     EXPLANATION_HUMAN_PROMPT,
@@ -151,19 +154,48 @@ async def generate_explanation(
         "score_detail": score_text,
     }
 
+    logger.info(
+        "explanation_chain_start",
+        title=movie_dict.get("title", ""),
+        emotion=emotion,
+        preferences_preview=pref_text[:100],
+        score_detail_preview=score_text[:100],
+    )
+
     try:
         # 프롬프트 포맷 → LLM 호출 (명시적 2단계)
+        llm_start = time.perf_counter()
         prompt_value = await prompt.ainvoke(inputs)
+        logger.debug(
+            "explanation_chain_prompt_formatted",
+            title=movie_dict.get("title", ""),
+            prompt_preview=str(prompt_value)[:300],
+        )
+        logger.debug(
+            "explanation_chain_prompt_full",
+            title=movie_dict.get("title", ""),
+            prompt_text=str(prompt_value),
+            model=settings.EXPLANATION_MODEL,
+        )
         response = await llm.ainvoke(prompt_value)
+        elapsed_ms = (time.perf_counter() - llm_start) * 1000
 
         # LangChain BaseMessage → 문자열 추출
         explanation = response.content if hasattr(response, "content") else str(response)
         explanation = explanation.strip() if isinstance(explanation, str) else str(explanation).strip()
 
+        logger.debug(
+            "explanation_chain_llm_raw_response",
+            title=movie_dict.get("title", ""),
+            raw_response=str(response),
+            model=settings.EXPLANATION_MODEL,
+        )
         logger.info(
             "explanation_generated",
             title=movie_dict.get("title", ""),
             explanation_preview=explanation[:50],
+            elapsed_ms=round(elapsed_ms, 1),
+            model=settings.EXPLANATION_MODEL,
         )
         return explanation
 
@@ -172,6 +204,8 @@ async def generate_explanation(
             "explanation_generation_error",
             error=str(e),
             title=movie_dict.get("title", ""),
+            error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(),
         )
         return _build_fallback_explanation(movie_dict)
 
@@ -196,6 +230,9 @@ async def generate_explanations_batch(
     Returns:
         영화 순서대로 추천 이유 문자열 목록
     """
+    # 배치 전체 소요시간 측정 시작
+    batch_start = time.perf_counter()
+
     # 각 영화의 score_detail 추출 (RankedMovie만 해당)
     tasks = []
     for movie in movies:
@@ -217,6 +254,14 @@ async def generate_explanations_batch(
 
     # 병렬 실행
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000
+
+    logger.info(
+        "explanations_batch_completed",
+        movie_count=len(movies),
+        elapsed_ms=round(batch_elapsed_ms, 1),
+        model=settings.EXPLANATION_MODEL,
+    )
 
     # 예외 → fallback 변환
     explanations = []
@@ -227,6 +272,8 @@ async def generate_explanations_batch(
                 "batch_explanation_error",
                 title=movie_dict.get("title", ""),
                 error=str(result),
+                error_type=type(result).__name__,
+                stack_trace=str(result),
             )
             explanations.append(_build_fallback_explanation(movie_dict))
         else:

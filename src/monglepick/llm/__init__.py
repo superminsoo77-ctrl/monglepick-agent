@@ -9,11 +9,13 @@ from monglepick.llm.factory import (
     get_conversation_llm,
     get_emotion_llm,
     get_explanation_llm,
+    get_intent_emotion_llm,
     get_intent_llm,
     get_llm,
     get_preference_llm,
     get_question_llm,
     get_structured_llm,
+    get_vision_llm,
 )
 
 __all__ = [
@@ -21,8 +23,10 @@ __all__ = [
     "get_structured_llm",
     "get_intent_llm",
     "get_emotion_llm",
+    "get_intent_emotion_llm",
     "get_preference_llm",
     "get_conversation_llm",
     "get_question_llm",
     "get_explanation_llm",
+    "get_vision_llm",
 ]

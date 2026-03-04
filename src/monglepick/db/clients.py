@@ -7,6 +7,9 @@ DB 클라이언트 초기화 및 컬렉션/인덱스 설정.
 
 from __future__ import annotations
 
+import time
+import traceback
+
 import aiomysql
 import structlog
 from elasticsearch import AsyncElasticsearch
@@ -373,43 +376,147 @@ async def ensure_es_index() -> None:
 # ============================================================
 
 async def init_all_clients() -> None:
-    """모든 DB 클라이언트를 초기화하고 컬렉션/인덱스를 설정한다."""
-    await get_qdrant()
-    await get_neo4j()
-    await get_redis()
-    await get_elasticsearch()
-    await get_mysql()
+    """
+    모든 DB 클라이언트를 초기화하고 컬렉션/인덱스를 설정한다.
 
-    await ensure_qdrant_collection()
-    await ensure_neo4j_indexes()
-    await ensure_es_index()
+    5개 DB를 개별 try/except로 격리하여, 하나의 DB 실패가 다른 DB 초기화를 막지 않도록 한다.
+    각 DB별 초기화 소요 시간을 개별 측정하여 성능 병목을 파악할 수 있게 한다.
+    """
+    init_start = time.perf_counter()
+    failed_dbs: list[str] = []
 
-    logger.info("all_db_clients_initialized")
+    # ── Qdrant 초기화 + 컬렉션/인덱스 설정 ──
+    try:
+        db_start = time.perf_counter()
+        await get_qdrant()
+        await ensure_qdrant_collection()
+        db_elapsed_ms = (time.perf_counter() - db_start) * 1000
+        logger.info("qdrant_init_done", elapsed_ms=round(db_elapsed_ms, 1))
+    except Exception as e:
+        db_elapsed_ms = (time.perf_counter() - db_start) * 1000
+        failed_dbs.append("qdrant")
+        logger.error(
+            "qdrant_init_error", error=str(e), error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(), elapsed_ms=round(db_elapsed_ms, 1),
+        )
+
+    # ── Neo4j 초기화 + 인덱스/제약조건 설정 ──
+    try:
+        db_start = time.perf_counter()
+        await get_neo4j()
+        await ensure_neo4j_indexes()
+        db_elapsed_ms = (time.perf_counter() - db_start) * 1000
+        logger.info("neo4j_init_done", elapsed_ms=round(db_elapsed_ms, 1))
+    except Exception as e:
+        db_elapsed_ms = (time.perf_counter() - db_start) * 1000
+        failed_dbs.append("neo4j")
+        logger.error(
+            "neo4j_init_error", error=str(e), error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(), elapsed_ms=round(db_elapsed_ms, 1),
+        )
+
+    # ── Redis 초기화 ──
+    try:
+        db_start = time.perf_counter()
+        await get_redis()
+        db_elapsed_ms = (time.perf_counter() - db_start) * 1000
+        logger.info("redis_init_done", elapsed_ms=round(db_elapsed_ms, 1))
+    except Exception as e:
+        db_elapsed_ms = (time.perf_counter() - db_start) * 1000
+        failed_dbs.append("redis")
+        logger.error(
+            "redis_init_error", error=str(e), error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(), elapsed_ms=round(db_elapsed_ms, 1),
+        )
+
+    # ── Elasticsearch 초기화 + 인덱스 설정 ──
+    try:
+        db_start = time.perf_counter()
+        await get_elasticsearch()
+        await ensure_es_index()
+        db_elapsed_ms = (time.perf_counter() - db_start) * 1000
+        logger.info("elasticsearch_init_done", elapsed_ms=round(db_elapsed_ms, 1))
+    except Exception as e:
+        db_elapsed_ms = (time.perf_counter() - db_start) * 1000
+        failed_dbs.append("elasticsearch")
+        logger.error(
+            "elasticsearch_init_error", error=str(e), error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(), elapsed_ms=round(db_elapsed_ms, 1),
+        )
+
+    # ── MySQL 초기화 ──
+    try:
+        db_start = time.perf_counter()
+        await get_mysql()
+        db_elapsed_ms = (time.perf_counter() - db_start) * 1000
+        logger.info("mysql_init_done", elapsed_ms=round(db_elapsed_ms, 1))
+    except Exception as e:
+        db_elapsed_ms = (time.perf_counter() - db_start) * 1000
+        failed_dbs.append("mysql")
+        logger.error(
+            "mysql_init_error", error=str(e), error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(), elapsed_ms=round(db_elapsed_ms, 1),
+        )
+
+    # ── 전체 초기화 완료 요약 ──
+    total_elapsed_ms = (time.perf_counter() - init_start) * 1000
+    logger.info(
+        "all_db_clients_initialized",
+        total_elapsed_ms=round(total_elapsed_ms, 1),
+        failed_count=len(failed_dbs),
+        failed_dbs=failed_dbs if failed_dbs else None,
+    )
 
 
 async def close_all_clients() -> None:
-    """모든 DB 클라이언트 연결을 정리한다."""
+    """
+    모든 DB 클라이언트 연결을 정리한다.
+
+    개별 DB 종료 실패가 다른 DB 종료를 막지 않도록 각각 try/except로 격리한다.
+    """
     global _qdrant_client, _neo4j_driver, _redis_client, _es_client, _mysql_pool
+    close_start = time.perf_counter()
 
     if _qdrant_client is not None:
-        await _qdrant_client.close()
+        try:
+            await _qdrant_client.close()
+            logger.info("qdrant_client_closed")
+        except Exception as e:
+            logger.error("qdrant_close_error", error=str(e), error_type=type(e).__name__)
         _qdrant_client = None
 
     if _neo4j_driver is not None:
-        await _neo4j_driver.close()
+        try:
+            await _neo4j_driver.close()
+            logger.info("neo4j_driver_closed")
+        except Exception as e:
+            logger.error("neo4j_close_error", error=str(e), error_type=type(e).__name__)
         _neo4j_driver = None
 
     if _redis_client is not None:
-        await _redis_client.close()
+        try:
+            await _redis_client.close()
+            logger.info("redis_client_closed")
+        except Exception as e:
+            logger.error("redis_close_error", error=str(e), error_type=type(e).__name__)
         _redis_client = None
 
     if _es_client is not None:
-        await _es_client.close()
+        try:
+            await _es_client.close()
+            logger.info("elasticsearch_client_closed")
+        except Exception as e:
+            logger.error("elasticsearch_close_error", error=str(e), error_type=type(e).__name__)
         _es_client = None
 
     if _mysql_pool is not None:
-        _mysql_pool.close()
-        await _mysql_pool.wait_closed()
+        try:
+            _mysql_pool.close()
+            await _mysql_pool.wait_closed()
+            logger.info("mysql_pool_closed")
+        except Exception as e:
+            logger.error("mysql_close_error", error=str(e), error_type=type(e).__name__)
         _mysql_pool = None
 
-    logger.info("all_db_clients_closed")
+    close_elapsed_ms = (time.perf_counter() - close_start) * 1000
+    logger.info("all_db_clients_closed", elapsed_ms=round(close_elapsed_ms, 1))

@@ -26,19 +26,36 @@ RELATION_BATCH_SIZE = 500
 
 
 async def _run_batch(cypher: str, params: dict) -> None:
-    """Neo4j Cypher 쿼리를 실행한다."""
+    """
+    Neo4j Cypher 쿼리를 단일 실행한다.
+
+    Args:
+        cypher: 실행할 Cypher 쿼리 문자열 ($batch 파라미터 포함)
+        params: 쿼리 파라미터 딕셔너리 (예: {"batch": [...]})
+    """
     driver = await get_neo4j()
     async with driver.session() as session:
         await session.run(cypher, params)
 
 
 async def _batch_execute(cypher: str, data: list[dict], batch_size: int, label: str) -> None:
-    """데이터를 배치로 나누어 UNWIND Cypher를 실행한다."""
+    """
+    데이터를 배치로 나누어 UNWIND Cypher를 실행한다.
+
+    대량 데이터를 한 번에 전송하면 Neo4j 메모리 부족이 발생할 수 있으므로
+    batch_size 단위로 분할하여 순차 실행한다.
+
+    Args:
+        cypher: UNWIND $batch 패턴을 포함하는 Cypher 쿼리
+        data: UNWIND 대상 딕셔너리 리스트
+        batch_size: 배치당 최대 건수 (기본 500)
+        label: 로깅용 라벨 (예: "movie_nodes", "directed_relations")
+    """
     if not data:
         logger.info(f"neo4j_{label}_skipped", count=0)
         return
 
-    # batch_size가 0이면 기본값 사용 (OTT 등 빈 데이터 방어)
+    # batch_size가 0 이하이면 기본값 사용 (Genre/OTT 등 소량 데이터에서 len(data)=0일 때 방어)
     if batch_size <= 0:
         batch_size = NODE_BATCH_SIZE
 
@@ -205,11 +222,14 @@ async def load_person_nodes(documents: list[MovieDocument]) -> None:
     Phase C 확장: 모든 크루 직군 포함 + TMDB person ID/프로필 사진 속성 추가.
     감독 + 배우 + 촬영감독 + 작곡가 + 각본가 + 프로듀서 + 편집자
     + 총괄 프로듀서 + 프로덕션 디자이너 + 의상 디자이너 + 원작 작가
+
+    Args:
+        documents: Person 노드를 추출할 MovieDocument 리스트
     """
-    # person_id → {name, profile_path} 매핑 (ID 기반 중복 제거)
+    # 이름을 키로 사용하여 중복 제거하면서 ID/프로필 정보는 덮어쓴다
     persons_by_name: dict[str, dict] = {}
     for doc in documents:
-        # 감독 (ID/프로필 있음)
+        # 감독은 ID/프로필 정보가 있으므로 우선 등록
         if doc.director:
             persons_by_name[doc.director] = {
                 "name": doc.director,
@@ -225,7 +245,7 @@ async def load_person_nodes(documents: list[MovieDocument]) -> None:
                     "person_id": actor_info.get("id", 0),
                     "profile_path": actor_info.get("profile_path", ""),
                 }
-        # 이름만 있는 크루
+        # cast 배열에만 있고 cast_characters에 없는 배우 (fallback)
         for name in doc.cast:
             if name and name not in persons_by_name:
                 persons_by_name[name] = {"name": name, "person_id": 0, "profile_path": ""}
@@ -241,7 +261,7 @@ async def load_person_nodes(documents: list[MovieDocument]) -> None:
 
     data = list(persons_by_name.values())
 
-    # Phase C: Person 노드에 person_id, profile_path 속성 추가
+    # MERGE로 중복 방지, CASE WHEN으로 기존 값이 있으면 유지 (더 상세한 정보 우선)
     cypher = """
     UNWIND $batch AS p
     MERGE (person:Person {name: p.name})
@@ -252,7 +272,7 @@ async def load_person_nodes(documents: list[MovieDocument]) -> None:
 
 
 async def load_keyword_nodes(documents: list[MovieDocument]) -> None:
-    """Keyword 노드를 배치 생성한다."""
+    """Keyword 노드를 배치 생성한다. 영화 수가 많으면 수만 개의 키워드가 생성될 수 있어 배치 처리한다."""
     keywords = list({kw for doc in documents for kw in doc.keywords})
     data = [{"name": k} for k in keywords if k]
 
@@ -692,26 +712,34 @@ async def load_to_neo4j(documents: list[MovieDocument]) -> None:
     """
     MovieDocument 리스트를 Neo4j 그래프에 적재한다.
 
-    §11-7-2 적재 순서: 노드 → 관계 → SIMILAR_TO
-    Phase A: SIMILAR_TO 관계를 TMDB similar 데이터로 생성한다.
-    Phase B: Studio/Collection/Country 노드 + 8개 새 관계 타입 추가.
+    적재 순서가 중요하다: 반드시 노드를 먼저 생성한 뒤 관계를 생성해야 한다.
+    MATCH 기반 관계 생성은 양쪽 노드가 존재하지 않으면 무시된다.
+
+    §11-7-2 적재 순서:
+      Step 1: 9종 노드 생성 (Movie, Person, Genre, Keyword, MoodTag, OTTPlatform, Studio, Collection, Country)
+      Step 2: 6종 기본 관계 (DIRECTED, ACTED_IN, HAS_GENRE, HAS_KEYWORD, HAS_MOOD, AVAILABLE_ON)
+      Step 3: SIMILAR_TO 관계 (Phase A)
+      Step 4: 8종 확장 관계 (Phase B — 제작사/컬렉션/국가/확장크루)
+      Step 5: 5종 추가 관계 (Phase C — 총괄프로듀서/디자이너/원작/RECOMMENDED)
+
+    Args:
+        documents: 적재할 MovieDocument 리스트
     """
     logger.info("neo4j_load_started", count=len(documents))
 
-    # Step 1: 노드 생성 (기존 6종)
+    # ── Step 1: 노드 생성 (9종) ──
+    # 노드가 먼저 존재해야 관계 MERGE가 동작한다
     await load_movie_nodes(documents)
-    await load_person_nodes(documents)  # Phase B: 확장 크루 포함
+    await load_person_nodes(documents)
     await load_genre_nodes(documents)
     await load_keyword_nodes(documents)
     await load_mood_tag_nodes(documents)
     await load_ott_nodes(documents)
-
-    # Step 1-B: Phase B 새 노드 타입
     await load_studio_nodes(documents)
     await load_collection_nodes(documents)
     await load_country_nodes(documents)
 
-    # Step 2: 기존 관계 생성 (노드 생성 완료 후)
+    # ── Step 2: 기본 관계 생성 (6종) ──
     await load_directed_relations(documents)
     await load_acted_in_relations(documents)
     await load_has_genre_relations(documents)
@@ -719,10 +747,10 @@ async def load_to_neo4j(documents: list[MovieDocument]) -> None:
     await load_has_mood_relations(documents)
     await load_available_on_relations(documents)
 
-    # Step 3: Phase A — SIMILAR_TO 관계 생성
+    # ── Step 3: Phase A — SIMILAR_TO 관계 ──
     await load_similar_to_relations(documents)
 
-    # Step 4: Phase B — 새 관계 생성 (제작사/컬렉션/국가/확장크루)
+    # ── Step 4: Phase B — 확장 관계 (8종) ──
     await load_produced_by_relations(documents)
     await load_part_of_collection_relations(documents)
     await load_produced_in_relations(documents)
@@ -732,7 +760,7 @@ async def load_to_neo4j(documents: list[MovieDocument]) -> None:
     await load_produced_relations(documents)
     await load_edited_by_relations(documents)
 
-    # Step 5: Phase C — 추가 크루 관계 + RECOMMENDED 관계
+    # ── Step 5: Phase C — 추가 크루 관계 + RECOMMENDED (5종) ──
     await load_executive_produced_relations(documents)
     await load_designed_relations(documents)
     await load_costumed_relations(documents)

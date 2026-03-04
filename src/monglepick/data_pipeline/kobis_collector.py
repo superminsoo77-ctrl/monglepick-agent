@@ -80,12 +80,14 @@ class KOBISCollector:
     """
 
     def __init__(self) -> None:
+        """KOBIS 수집기를 초기화한다. 반드시 async with 문으로 사용해야 한다."""
         self._client: httpx.AsyncClient | None = None
         self._base_url = settings.KOBIS_BASE_URL
         self._api_key = settings.KOBIS_API_KEY
-        self._call_count = 0  # API 호출 카운트 (일일 한도 추적용)
+        self._call_count = 0  # API 호출 카운트 (일일 ~3,000건 한도 추적용)
 
     async def __aenter__(self) -> KOBISCollector:
+        """비동기 HTTP 클라이언트를 초기화한다."""
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=30.0,
@@ -93,6 +95,7 @@ class KOBISCollector:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
+        """HTTP 클라이언트를 안전하게 종료한다."""
         if self._client:
             await self._client.aclose()
 
@@ -118,7 +121,7 @@ class KOBISCollector:
         Raises:
             Exception: KOBIS API 에러 (faultInfo) 발생 시
         """
-        async with _semaphore:
+        async with _semaphore:  # Semaphore(2)로 동시 요청 2개 제한
             params["key"] = self._api_key
             url = f"/{endpoint}.json"
 
@@ -128,10 +131,10 @@ class KOBISCollector:
             self._call_count += 1
             data = resp.json()
 
-            # Rate limit: 0.5초 간격
+            # Rate Limit 준수: 요청 간 최소 0.5초 대기
             await asyncio.sleep(0.5)
 
-            # KOBIS API 에러 체크 (검증 에러는 재시도 불필요)
+            # KOBIS API는 HTTP 200으로 비즈니스 에러를 반환하므로 별도 체크 필요
             if "faultInfo" in data:
                 error_msg = data["faultInfo"].get("message", "Unknown error")
                 error_code = data["faultInfo"].get("errorCode", "")
@@ -233,8 +236,8 @@ class KOBISCollector:
         )
         all_movies.extend(first_page)
 
-        # 전체 페이지 수 계산
-        total_pages = (total_count + 99) // 100  # ceil division
+        # 전체 페이지 수 계산 (올림 나눗셈)
+        total_pages = (total_count + 99) // 100
         if max_pages > 0:
             total_pages = min(total_pages, max_pages)
 
@@ -429,14 +432,16 @@ class KOBISCollector:
             dict[str, KOBISBoxOffice]: movieCd → 최대 누적 데이터 매핑
         """
         if not end_date:
-            # 기본: 어제 (당일 박스오피스는 집계 전일 수 있음)
+            # 당일 박스오피스는 집계 전일 수 있으므로 어제를 기본값으로 사용
             end_date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
 
-        # {movieCd: KOBISBoxOffice} — 누적치가 가장 큰 것을 보존
+        # 영화별 최대 누적 데이터를 보존하는 딕셔너리
+        # 같은 영화가 여러 날짜에 등장하면 누적 관객수가 가장 큰 것을 유지
         movie_boxoffice: dict[str, KOBISBoxOffice] = {}
 
         end_dt = datetime.strptime(end_date, "%Y%m%d")
 
+        # 종료일부터 역순으로 N일간 박스오피스 데이터 수집
         for day_offset in range(days):
             target_dt = end_dt - timedelta(days=day_offset)
             target_date = target_dt.strftime("%Y%m%d")
@@ -446,7 +451,6 @@ class KOBISCollector:
 
                 for item in daily:
                     mc = item.movie_cd
-                    # 누적 관객수가 더 큰 (= 더 최근) 데이터로 업데이트
                     if mc not in movie_boxoffice or item.audi_acc > movie_boxoffice[mc].audi_acc:
                         movie_boxoffice[mc] = item
             except Exception as e:
@@ -498,26 +502,25 @@ def match_kobis_to_db(
     Returns:
         list[tuple[dict, dict]]: (kobis_movie, db_movie) 매칭 쌍 리스트
     """
-    # DB 영화 인덱스 구축: (normalized_title, year) → db_movie
+    # DB 영화 인덱스 구축: (정규화된_제목, 연도) → db_movie
+    # O(1) 검색을 위해 해시 테이블로 구성
     db_index_kr: dict[tuple[str, int], dict] = {}
     db_index_en: dict[tuple[str, int], dict] = {}
 
     for movie in db_movies:
         year = movie.get("release_year", 0)
-        # 한국어 제목 인덱스
         title_kr = _normalize_title(movie.get("title", ""))
         if title_kr and year:
             db_index_kr[(title_kr, year)] = movie
-        # 영문 제목 인덱스
         title_en = _normalize_title(movie.get("title_en", ""))
         if title_en and year:
             db_index_en[(title_en, year)] = movie
 
     matched: list[tuple[dict, dict]] = []
-    matched_db_ids: set[str] = set()  # 중복 매칭 방지
+    matched_db_ids: set[str] = set()  # 하나의 DB 영화가 여러 KOBIS 영화에 매칭되는 것 방지
 
     for kobis in kobis_movies:
-        # KOBIS 개봉 연도 추출
+        # KOBIS 개봉 연도 추출 (openDt 우선, prdtYear 보조)
         open_dt = kobis.get("openDt", "")
         prdt_year = kobis.get("prdtYear", "")
         year = 0
@@ -534,10 +537,9 @@ def match_kobis_to_db(
         if not year:
             continue
 
-        # 1차 매칭: 한국어 제목 + 연도
+        # 1차 매칭: 한국어 제목 + 연도 (±1년 허용, 개봉일/제작년도 차이 보정)
         kobis_title_kr = _normalize_title(kobis.get("movieNm", ""))
         if kobis_title_kr:
-            # 연도 ±1 허용 (개봉일/제작년도 차이 보정)
             for y_offset in [0, -1, 1]:
                 key = (kobis_title_kr, year + y_offset)
                 db_movie = db_index_kr.get(key)
@@ -546,7 +548,7 @@ def match_kobis_to_db(
                     matched_db_ids.add(db_movie["id"])
                     break
             else:
-                # 2차 매칭: 영문 제목 + 연도
+                # for-else: 한국어 제목으로 매칭 실패 시 영문 제목으로 2차 매칭
                 kobis_title_en = _normalize_title(kobis.get("movieNmEn", ""))
                 if kobis_title_en:
                     for y_offset in [0, -1, 1]:

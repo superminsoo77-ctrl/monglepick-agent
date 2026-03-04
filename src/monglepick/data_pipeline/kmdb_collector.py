@@ -63,39 +63,42 @@ def _parse_movie(raw: dict) -> KMDbRawMovie:
     """
     KMDb API 응답의 단일 영화 객체(Result[i])를 KMDbRawMovie로 변환한다.
 
-    중첩 구조(directors.director, actors.actor, plots.plot 등)를 플랫하게 파싱한다.
+    KMDb API는 중첩 구조(directors.director, actors.actor 등)를 사용하며,
+    단일 결과일 때는 dict, 복수 결과일 때는 list를 반환하는 비일관적인 형태이므로
+    모든 경우를 list로 통일한다.
+
+    Args:
+        raw: KMDb API 응답의 단일 영화 dict (Data[0].Result[i])
+
+    Returns:
+        KMDbRawMovie: 파싱된 영화 데이터 모델
     """
-    # 감독 배열 파싱: directors.director (dict 또는 list 가능)
+    # KMDb API는 단일 항목이면 dict, 복수면 list로 반환 → list로 통일
     directors_data = raw.get("directors", {})
     directors = directors_data.get("director", []) if isinstance(directors_data, dict) else []
     if isinstance(directors, dict):
         directors = [directors]
 
-    # 배우 배열 파싱: actors.actor
     actors_data = raw.get("actors", {})
     actors = actors_data.get("actor", []) if isinstance(actors_data, dict) else []
     if isinstance(actors, dict):
         actors = [actors]
 
-    # 줄거리 배열 파싱: plots.plot
     plots_data = raw.get("plots", {})
     plots = plots_data.get("plot", []) if isinstance(plots_data, dict) else []
     if isinstance(plots, dict):
         plots = [plots]
 
-    # 스태프 배열 파싱: staffs.staff
     staffs_data = raw.get("staffs", {})
     staffs = staffs_data.get("staff", []) if isinstance(staffs_data, dict) else []
     if isinstance(staffs, dict):
         staffs = [staffs]
 
-    # VOD 배열 파싱: vods.vod
     vods_data = raw.get("vods", {})
     vods = vods_data.get("vod", []) if isinstance(vods_data, dict) else []
     if isinstance(vods, dict):
         vods = [vods]
 
-    # Codes 배열 파싱: Codes.Code
     codes_data = raw.get("Codes", {})
     codes = codes_data.get("Code", []) if isinstance(codes_data, dict) else []
     if isinstance(codes, dict):
@@ -159,10 +162,11 @@ class KMDbCollector:
     """
 
     def __init__(self) -> None:
+        """KMDb 수집기를 초기화한다. 반드시 async with 문으로 사용해야 한다."""
         self._client: httpx.AsyncClient | None = None
         self._base_url = settings.KMDB_BASE_URL
         self._api_key = settings.KMDB_API_KEY
-        self._request_count = 0  # 일일 요청 카운터
+        self._request_count = 0  # 일일 요청 카운터 (1,000건 한도 추적)
 
     async def __aenter__(self) -> KMDbCollector:
         """HTTP 클라이언트 초기화."""
@@ -193,8 +197,8 @@ class KMDbCollector:
             httpx.HTTPStatusError: 4xx/5xx 응답 시
             ValueError: API 에러 코드 반환 시
         """
-        async with _semaphore:
-            # 필수 파라미터 추가
+        async with _semaphore:  # Semaphore(5)로 동시 요청 5개 제한
+            # collection, ServiceKey는 모든 요청에 필수이므로 자동 추가
             full_params = {
                 "collection": "kmdb_new2",
                 "ServiceKey": self._api_key,
@@ -207,20 +211,18 @@ class KMDbCollector:
 
             self._request_count += 1
 
-            # KMDb API 응답에 유효하지 않은 제어 문자가 포함될 수 있음.
-            # resp.json()이 JSONDecodeError를 발생시키면 제어 문자를 제거한 뒤 재파싱한다.
+            # KMDb API 응답에 유효하지 않은 제어 문자(0x00~0x1F)가 포함되어
+            # JSON 파싱이 실패할 수 있음. 이 경우 제어 문자를 제거한 뒤 재파싱한다.
             import json as _json
             import re as _re
 
             try:
                 data = resp.json()
             except _json.JSONDecodeError:
-                # 0x00~0x1F 범위의 제어 문자 중 탭(\t), 줄바꿈(\n, \r)을 제외하고 제거
+                # 탭(\t=0x09), LF(\n=0x0a), CR(\r=0x0d)은 유지하고 나머지 제어 문자 제거
                 cleaned = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', resp.text)
                 data = _json.loads(cleaned)
 
-            # API 에러 체크 (KMDb는 HTTP 200으로 에러를 반환할 수 있음)
-            # TotalCount가 0이면 결과 없음 (에러는 아님)
             return data
 
     # ── 검색 메서드 ──
@@ -252,7 +254,7 @@ class KMDbCollector:
 
         data = await self._get(params)
 
-        # 응답 구조: Data[0].Result
+        # KMDb 응답 구조: { "Data": [{ "TotalCount": N, "Result": [...] }] }
         data_list = data.get("Data", [])
         if not data_list:
             return [], 0
@@ -261,7 +263,7 @@ class KMDbCollector:
         total_count = int(collection_data.get("TotalCount", 0))
         results = collection_data.get("Result", [])
 
-        # 결과가 None인 경우 방어
+        # TotalCount > 0이지만 Result가 None인 경우 방어
         if not results:
             return [], total_count
 
@@ -290,7 +292,7 @@ class KMDbCollector:
         Returns:
             검색된 영화 목록
         """
-        # KMDb는 공백이 포함되면 검색 결과가 부정확할 수 있음
+        # KMDb API는 공백 포함 제목 검색 시 결과가 부정확하므로 공백 제거
         clean_title = title.replace(" ", "")
         movies, _ = await self.search(title=clean_title)
         return movies
@@ -345,7 +347,7 @@ class KMDbCollector:
                 if start_count >= total_count:
                     break
 
-                # 안전장치: 일일 요청 한도 초과 방지
+                # 일일 한도 1,000건 초과 방지 (안전 임계값 950건에서 중단)
                 if self._request_count >= 950:
                     logger.warning(
                         "kmdb_daily_limit_approaching",

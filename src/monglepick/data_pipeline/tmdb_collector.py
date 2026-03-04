@@ -44,6 +44,7 @@ class TMDBCollector:
         self._api_key = settings.TMDB_API_KEY
 
     async def __aenter__(self) -> TMDBCollector:
+        """비동기 컨텍스트 매니저 진입: httpx 클라이언트를 초기화한다."""
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             params={"api_key": self._api_key, "language": "ko-KR"},
@@ -52,6 +53,7 @@ class TMDBCollector:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
+        """비동기 컨텍스트 매니저 종료: httpx 클라이언트를 정리한다."""
         if self._client:
             await self._client.aclose()
 
@@ -69,12 +71,23 @@ class TMDBCollector:
     # ── 목록 수집 메서드 ──
 
     async def _collect_list(self, endpoint: str, pages: int, extra_params: dict | None = None) -> list[dict]:
-        """페이지네이션 목록 API에서 영화 ID 목록을 수집한다."""
+        """
+        페이지네이션 목록 API에서 영화 ID 목록을 수집한다.
+
+        Args:
+            endpoint: TMDB API 엔드포인트 (예: "/movie/popular")
+            pages: 최대 수집할 페이지 수
+            extra_params: 추가 쿼리 파라미터 (예: region, sort_by)
+
+        Returns:
+            영화 요약 정보 딕셔너리 리스트
+        """
         results: list[dict] = []
         for page in range(1, pages + 1):
             params = {"page": page, **(extra_params or {})}
             data = await self._get(endpoint, params)
             results.extend(data.get("results", []))
+            # TMDB 응답의 total_pages를 확인하여 마지막 페이지면 조기 종료
             total_pages = data.get("total_pages", 1)
             if page >= total_pages:
                 break
@@ -275,27 +288,32 @@ class TMDBCollector:
         """
         영화 ID 목록에 대해 상세정보 + OTT 정보를 수집한다.
 
-        §11-5: 영화당 상세 API + OTT API 호출.
+        §11-5: 영화당 상세 API 1회 + OTT API 1회 = 총 2회 호출.
         개별 실패 시 로그 기록 후 건너뛴다 (§11-9: 부분 실패 허용).
+
+        Args:
+            movie_ids: 수집할 TMDB 영화 ID 리스트
+
+        Returns:
+            성공적으로 수집된 TMDBRawMovie 리스트 (실패 건은 제외)
         """
         results: list[TMDBRawMovie] = []
 
         for i, mid in enumerate(movie_ids):
             try:
-                # 상세 정보 수집
                 movie = await self.collect_movie_details(mid)
 
-                # OTT 정보 수집 및 병합
+                # OTT 정보는 별도 API로 수집 후 병합
                 providers = await self.collect_watch_providers(mid)
                 movie.watch_providers = providers
 
                 results.append(movie)
 
-                # 진행률 로깅 (500건마다)
                 if (i + 1) % 500 == 0:
                     logger.info("tmdb_detail_progress", completed=i + 1, total=len(movie_ids))
 
             except Exception as e:
+                # 개별 영화 실패는 전체 파이프라인을 중단하지 않음
                 logger.warning("tmdb_detail_failed", movie_id=mid, error=str(e))
                 continue
 

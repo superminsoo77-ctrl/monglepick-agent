@@ -14,6 +14,9 @@ EXAONE 32B 구조화 출력으로 ExtractedPreferences를 반환한다.
 
 from __future__ import annotations
 
+import time
+import traceback
+
 import structlog
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -21,6 +24,7 @@ from monglepick.agents.chat.models import (
     ExtractedPreferences,
     merge_preferences,
 )
+from monglepick.config import settings
 from monglepick.llm.factory import get_preference_llm
 from monglepick.prompts.preference import (
     PREFERENCE_HUMAN_PROMPT,
@@ -98,10 +102,48 @@ async def extract_preferences(
         "existing_prefs": existing_prefs_str,
     }
 
+    logger.info(
+        "preference_chain_start",
+        input_preview=current_input[:100],
+        existing_prefs_preview=existing_prefs_str[:200],
+    )
+
     try:
+        # LLM 파이프라인 타이밍 측정 시작 (프롬프트 포맷 + LLM 호출)
+        llm_start = time.perf_counter()
+
         # 프롬프트 포맷 → LLM 호출 (명시적 2단계)
         prompt_value = await prompt.ainvoke(inputs)
+        logger.debug(
+            "preference_chain_prompt_formatted",
+            prompt_preview=str(prompt_value)[:300],
+        )
+        # 전체 프롬프트 텍스트 디버그 로그 (상세 디버깅용)
+        logger.debug(
+            "preference_chain_prompt_full",
+            prompt_text=str(prompt_value),
+            model=settings.PREFERENCE_MODEL,
+        )
         extracted: ExtractedPreferences = await llm.ainvoke(prompt_value)
+
+        # LLM 응답 시간 계산 (밀리초 단위)
+        elapsed_ms = (time.perf_counter() - llm_start) * 1000
+
+        # LLM 원시 응답 디버그 로그 (파싱 전 전체 응답)
+        logger.debug(
+            "preference_chain_llm_raw_response",
+            raw_response=str(extracted),
+            model=settings.PREFERENCE_MODEL,
+        )
+
+        logger.info(
+            "preference_chain_llm_response",
+            raw_genre=extracted.genre_preference,
+            raw_mood=extracted.mood,
+            raw_context=extracted.viewing_context,
+            raw_reference=extracted.reference_movies,
+            raw_era=extracted.era,
+        )
 
         # 이전 선호와 병합
         merged = merge_preferences(previous_preferences, extracted)
@@ -112,6 +154,8 @@ async def extract_preferences(
             mood=merged.mood,
             reference_movies=merged.reference_movies,
             input_preview=current_input[:50],
+            elapsed_ms=round(elapsed_ms, 1),
+            model=settings.PREFERENCE_MODEL,
         )
         return merged
 
@@ -120,6 +164,8 @@ async def extract_preferences(
             "preference_extraction_error",
             error=str(e),
             input_preview=current_input[:50],
+            error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(),
         )
         # 에러 시: 이전 선호 유지 (첫 턴이면 빈 선호)
         return previous_preferences or ExtractedPreferences()

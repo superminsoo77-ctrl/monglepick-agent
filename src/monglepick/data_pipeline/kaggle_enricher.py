@@ -82,13 +82,15 @@ def load_kaggle_movies(
     for _, row in merged.iterrows():
         try:
             doc = _row_to_movie_document(row)
+            # 변환 성공 + 유효성 검증 통과 시에만 결과에 포함
             if doc and validate_movie(doc):
                 documents.append(doc)
             else:
                 failed += 1
         except Exception as e:
             failed += 1
-            if failed <= 10:  # 처음 10개만 로그
+            # 에러 로그 폭증 방지: 처음 10건만 상세 로그 출력
+            if failed <= 10:
                 logger.warning("kaggle_enricher_convert_failed", id=row.get("id"), error=str(e))
 
     logger.info(
@@ -153,16 +155,17 @@ def _row_to_movie_document(row: pd.Series) -> MovieDocument | None:
     runtime = int(row.get("runtime", 0)) if pd.notna(row.get("runtime")) else 0
     poster_path = str(row.get("poster_path", "")) if pd.notna(row.get("poster_path")) else ""
 
-    # Phase B: 재무 정보
+    # ── Phase B: 재무 정보 ──
     budget = int(row.get("budget", 0)) if pd.notna(row.get("budget")) else 0
     revenue = int(row.get("revenue", 0)) if pd.notna(row.get("revenue")) else 0
     vote_count = int(row.get("vote_count", 0)) if pd.notna(row.get("vote_count")) else 0
 
-    # Phase B: 텍스트 메타데이터
+    # ── Phase B: 텍스트 메타데이터 ──
     tagline = str(row.get("tagline", "")) if pd.notna(row.get("tagline")) else ""
     homepage = str(row.get("homepage", "")) if pd.notna(row.get("homepage")) else ""
 
-    # Phase B: 컬렉션/프랜차이즈
+    # ── Phase B: 컬렉션/프랜차이즈 ──
+    # KaggleLoader에서 belongs_to_collection을 파싱한 결과 (dict 또는 None)
     collection_parsed = row.get("collection_parsed")
     collection_id = 0
     collection_name = ""
@@ -170,7 +173,8 @@ def _row_to_movie_document(row: pd.Series) -> MovieDocument | None:
         collection_id = int(collection_parsed.get("id", 0) or 0)
         collection_name = str(collection_parsed.get("name", "") or "")
 
-    # Phase B: 제작사
+    # ── Phase B: 제작사 ──
+    # KaggleLoader에서 production_companies를 파싱한 결과 (list[dict])
     production_companies_parsed = row.get("production_companies_parsed", [])
     if not isinstance(production_companies_parsed, list):
         production_companies_parsed = []
@@ -180,7 +184,7 @@ def _row_to_movie_document(row: pd.Series) -> MovieDocument | None:
         if c.get("name")
     ]
 
-    # Phase B: 제작 국가
+    # ── Phase B: 제작 국가 ──
     production_countries_parsed = row.get("production_countries_parsed", [])
     if not isinstance(production_countries_parsed, list):
         production_countries_parsed = []
@@ -190,7 +194,7 @@ def _row_to_movie_document(row: pd.Series) -> MovieDocument | None:
         if c.get("iso_3166_1")
     ]
 
-    # Phase B: 언어 정보
+    # ── Phase B: 언어 정보 ──
     original_language = str(row.get("original_language", "")) if pd.notna(row.get("original_language")) else ""
     spoken_languages_parsed = row.get("spoken_languages_parsed", [])
     if not isinstance(spoken_languages_parsed, list):
@@ -201,12 +205,13 @@ def _row_to_movie_document(row: pd.Series) -> MovieDocument | None:
         if lang.get("iso_639_1")
     ]
 
-    # Phase B: 외부 ID 및 메타
+    # ── Phase B: 외부 ID 및 메타 ──
     imdb_id = str(row.get("imdb_id", "")) if pd.notna(row.get("imdb_id")) else ""
     adult = bool(row.get("adult", False))
     status = str(row.get("status", "")) if pd.notna(row.get("status")) else ""
 
-    # Phase B: 확장 크레딧
+    # ── Phase B: 확장 크레딧 (credits_df에서 조인된 컬럼) ──
+    # DataFrame 조인 시 NaN이 들어올 수 있으므로 타입 방어 필수
     cast_characters = row.get("cast_characters", [])
     if not isinstance(cast_characters, list):
         cast_characters = []
@@ -220,7 +225,7 @@ def _row_to_movie_document(row: pd.Series) -> MovieDocument | None:
         producers = []
     editor = str(row.get("editor", "")) if pd.notna(row.get("editor")) else ""
 
-    # Phase C: 추가 크루
+    # ── Phase C: 추가 크루 ──
     executive_producers = row.get("executive_producers", [])
     if not isinstance(executive_producers, list):
         executive_producers = []
@@ -228,7 +233,7 @@ def _row_to_movie_document(row: pd.Series) -> MovieDocument | None:
     costume_designer_val = str(row.get("costume_designer", "")) if pd.notna(row.get("costume_designer")) else ""
     source_author_val = str(row.get("source_author", "")) if pd.notna(row.get("source_author")) else ""
 
-    # Phase C: 감독 상세 정보
+    # ── Phase C: 감독 상세 정보 ──
     director_details = row.get("director_details", {})
     if not isinstance(director_details, dict):
         director_details = {}

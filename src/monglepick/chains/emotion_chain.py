@@ -13,10 +13,14 @@ Qwen 14B 구조화 출력으로 EmotionResult를 반환한다.
 
 from __future__ import annotations
 
+import time
+import traceback
+
 import structlog
 from langchain_core.prompts import ChatPromptTemplate
 
 from monglepick.agents.chat.models import EmotionResult
+from monglepick.config import settings
 from monglepick.data_pipeline.preprocessor import MOOD_WHITELIST
 from monglepick.llm.factory import get_emotion_llm
 from monglepick.prompts.emotion import (
@@ -84,10 +88,45 @@ async def analyze_emotion(
         "recent_messages": recent_messages or "(대화 시작)",
     }
 
+    logger.info(
+        "emotion_chain_start",
+        input_preview=current_input[:100],
+        recent_messages_preview=recent_messages[:100] if recent_messages else "(없음)",
+    )
+
     try:
+        # LLM 파이프라인 타이밍 측정 시작 (프롬프트 포맷 + LLM 호출)
+        llm_start = time.perf_counter()
+
         # 프롬프트 포맷 → LLM 호출 (명시적 2단계)
         prompt_value = await prompt.ainvoke(inputs)
+        logger.debug(
+            "emotion_chain_prompt_formatted",
+            prompt_preview=str(prompt_value)[:300],
+        )
+        # 전체 프롬프트 텍스트 디버그 로그 (상세 디버깅용)
+        logger.debug(
+            "emotion_chain_prompt_full",
+            prompt_text=str(prompt_value),
+            model=settings.EMOTION_MODEL,
+        )
         result: EmotionResult = await llm.ainvoke(prompt_value)
+
+        # LLM 응답 시간 계산 (밀리초 단위)
+        elapsed_ms = (time.perf_counter() - llm_start) * 1000
+
+        # LLM 원시 응답 디버그 로그 (파싱 전 전체 응답)
+        logger.debug(
+            "emotion_chain_llm_raw_response",
+            raw_response=str(result),
+            model=settings.EMOTION_MODEL,
+        )
+
+        logger.info(
+            "emotion_chain_llm_response",
+            raw_emotion=result.emotion,
+            raw_mood_tags=result.mood_tags,
+        )
 
         # 감정이 감지되면 매핑 테이블에서 무드 태그 보완 (합집합)
         if result.emotion and result.emotion in EMOTION_TO_MOOD_MAP:
@@ -110,6 +149,8 @@ async def analyze_emotion(
             emotion=result.emotion,
             mood_tags=result.mood_tags,
             input_preview=current_input[:50],
+            elapsed_ms=round(elapsed_ms, 1),
+            model=settings.EMOTION_MODEL,
         )
         return result
 
@@ -118,5 +159,7 @@ async def analyze_emotion(
             "emotion_analysis_error",
             error=str(e),
             input_preview=current_input[:50],
+            error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(),
         )
         return EmotionResult(emotion=None, mood_tags=[])

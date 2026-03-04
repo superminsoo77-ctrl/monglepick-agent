@@ -41,7 +41,12 @@ RATE_LIMIT_DELAY = 0.7  # 초 (100 RPM = 1.67 req/sec → 여유 확보)
 
 
 def _get_client() -> OpenAI:
-    """Upstage API 클라이언트를 반환한다 (싱글턴)."""
+    """
+    Upstage API 클라이언트를 반환한다 (싱글턴).
+
+    모듈 레벨에서 한 번만 초기화되며, 이후 호출에서는 캐시된 인스턴스를 재사용한다.
+    OpenAI 호환 API이므로 openai.OpenAI 클라이언트를 base_url만 변경하여 사용한다.
+    """
     global _client
     if _client is None:
         _client = OpenAI(
@@ -80,7 +85,7 @@ def embed_texts(texts: list[str], batch_size: int = 50) -> np.ndarray:
             input=batch,
         )
 
-        # 응답에서 임베딩 벡터 추출 (인덱스 순서 보장)
+        # 응답의 data 배열 순서가 입력 순서와 다를 수 있으므로 index 기준 정렬
         batch_embeddings = [
             item.embedding
             for item in sorted(response.data, key=lambda x: x.index)
@@ -91,7 +96,7 @@ def embed_texts(texts: list[str], batch_size: int = 50) -> np.ndarray:
         if completed % 500 == 0 or completed >= len(texts):
             logger.info("embedding_progress", completed=completed, total=len(texts))
 
-        # Rate Limit 준수 (100 RPM)
+        # 마지막 배치가 아닌 경우에만 Rate Limit 딜레이 적용 (100 RPM 준수)
         if i + batch_size < len(texts):
             import time
             time.sleep(RATE_LIMIT_DELAY)
@@ -106,10 +111,13 @@ def embed_query(query: str) -> np.ndarray:
     검색 쿼리를 벡터로 변환한다.
 
     Upstage 'embedding-query' 모델을 사용한다.
-    짧은 검색 질문에 최적화되어 있다.
+    짧은 검색 질문에 최적화되어 있으며, embed_texts(passage)와 동일 벡터 공간을 공유한다.
+
+    Args:
+        query: 검색 쿼리 텍스트 (예: "우울한데 볼 만한 영화")
 
     Returns:
-        np.ndarray: shape (embedding_dimension,)
+        np.ndarray: shape (embedding_dimension,) — 4096차원 벡터
     """
     client = _get_client()
 

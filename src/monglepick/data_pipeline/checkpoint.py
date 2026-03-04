@@ -29,20 +29,32 @@ CHECKPOINT_FILE = Path("data/checkpoint.json")
 
 
 class PipelineCheckpoint:
-    """파이프라인 진행 상태를 파일로 관리한다."""
+    """
+    파이프라인 체크포인트 관리자.
+
+    TMDB API 수집과 Kaggle 보강 파이프라인의 진행 상태를 JSON 파일로 관리한다.
+    파이프라인이 중단되면 마지막 체크포인트부터 이어서 진행할 수 있다.
+
+    각 ID 집합은 set으로 관리되어 O(1) 멤버십 검사가 가능하다.
+    save() 시 sorted list로 변환하여 JSON 직렬화한다.
+    """
 
     def __init__(self, filepath: Path = CHECKPOINT_FILE) -> None:
         self.filepath = filepath
-        self.tmdb_api_loaded_ids: set[int] = set()
-        self.kaggle_loaded_ids: set[int] = set()
-        self.embedded_ids: set[int] = set()
-        self.failed_ids: set[int] = set()
+        self.tmdb_api_loaded_ids: set[int] = set()   # TMDB API로 수집+적재 완료된 영화 ID
+        self.kaggle_loaded_ids: set[int] = set()     # Kaggle CSV에서 적재 완료된 영화 ID
+        self.embedded_ids: set[int] = set()          # 임베딩 벡터 생성 완료된 영화 ID
+        self.failed_ids: set[int] = set()            # 처리 실패한 영화 ID (디버깅용)
         self.last_updated: str = ""
-        self.tmdb_api_total_collected: int = 0
-        self.kaggle_total_available: int = 0
+        self.tmdb_api_total_collected: int = 0       # TMDB API 수집 시도 총 수
+        self.kaggle_total_available: int = 0         # Kaggle에서 보강 가능한 총 수
 
     def load(self) -> None:
-        """체크포인트 파일에서 상태를 로드한다."""
+        """
+        체크포인트 파일에서 상태를 로드한다.
+
+        파일이 존재하지 않으면 초기 상태를 유지하고 새로운 체크포인트를 생성한다.
+        """
         if self.filepath.exists():
             data = json.loads(self.filepath.read_text())
             self.tmdb_api_loaded_ids = set(data.get("tmdb_api_loaded_ids", []))
@@ -63,7 +75,12 @@ class PipelineCheckpoint:
             logger.info("checkpoint_not_found_creating_new")
 
     def save(self) -> None:
-        """체크포인트 상태를 파일에 저장한다."""
+        """
+        현재 체크포인트 상태를 JSON 파일에 저장한다.
+
+        set을 sorted list로 변환하여 직렬화한다.
+        배치 처리 완료 시마다 호출하여 중단 복구를 보장한다.
+        """
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
         self.last_updated = datetime.now().isoformat()
         data = {

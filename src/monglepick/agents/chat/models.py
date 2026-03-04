@@ -7,7 +7,11 @@ Phase 2에서 체인 입출력으로 사용하고, Phase 3에서 LangGraph State
 모델 목록:
 - IntentResult: 의도 분류 결과 (6가지 intent + confidence)
 - EmotionResult: 감정 분석 결과 (emotion + mood_tags)
+- IntentEmotionResult: 의도+감정 통합 LLM 출력 모델 (1회 LLM 호출로 intent+emotion 동시 추출)
 - ExtractedPreferences: 사용자 선호 조건 7개 필드
+- ImageAnalysisResult: VLM 이미지 분석 결과 (장르/무드/시각요소/키워드/설명/포스터 여부)
+- ClarificationHint: 후속 질문 힌트 옵션 (칩/버튼 UI용)
+- ClarificationResponse: 후속 질문 + 힌트 구조화 응답
 - SearchQuery: RAG 검색 쿼리 구조 (Phase 3 준비)
 - CandidateMovie: 검색 결과 후보 영화 (Phase 3 준비)
 - ScoreDetail: 추천 점수 분해 (Phase 4 준비)
@@ -74,6 +78,86 @@ class EmotionResult(BaseModel):
     mood_tags: list[str] = Field(
         default_factory=list,
         description="감정에서 매핑된 무드 태그 목록 (25개 화이트리스트 한정)",
+    )
+
+
+# ============================================================
+# 의도+감정 통합 결과 (1회 LLM 호출)
+# ============================================================
+
+class IntentEmotionResult(BaseModel):
+    """
+    의도 분류 + 감정 분석 통합 LLM 출력 모델.
+
+    기존 IntentResult + EmotionResult를 1회 LLM 호출로 동시 추출한다.
+    동일 모델(qwen3.5:35b-a3b)로 동일 입력을 분석하므로
+    2번 호출할 필요 없이 통합하여 지연 시간을 ~45초 절감한다.
+    """
+
+    intent: IntentType = Field(
+        default="general",
+        description="분류된 사용자 의도 (6가지 중 하나)",
+    )
+    confidence: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="의도 분류 신뢰도 (0.0~1.0)",
+    )
+    emotion: str | None = Field(
+        default=None,
+        description="감지된 감정 (happy/sad/excited/angry/calm 또는 None)",
+    )
+    mood_tags: list[str] = Field(
+        default_factory=list,
+        description="감정에서 매핑된 무드 태그 목록 (25개 화이트리스트 한정)",
+    )
+
+
+# ============================================================
+# 이미지 분석 결과 (VLM)
+# ============================================================
+
+class ImageAnalysisResult(BaseModel):
+    """
+    VLM(Vision Language Model) 이미지 분석 결과.
+
+    사용자가 업로드한 이미지(영화 포스터, 분위기 사진 등)를 분석하여
+    장르/무드/시각요소/키워드/설명을 추출한다.
+    이 결과는 선호 추출, 검색 쿼리 구성, 충분성 판정에 활용된다.
+    """
+
+    genre_cues: list[str] = Field(
+        default_factory=list,
+        description="이미지에서 감지된 장르 힌트 (예: ['SF', '모험'])",
+    )
+    mood_cues: list[str] = Field(
+        default_factory=list,
+        description="이미지에서 감지된 분위기/무드 (MOOD_WHITELIST 기준)",
+    )
+    visual_elements: list[str] = Field(
+        default_factory=list,
+        description="시각적 요소 (예: ['우주선', '폭발', '야경'])",
+    )
+    search_keywords: list[str] = Field(
+        default_factory=list,
+        description="검색용 키워드 (RAG 부스트에 활용)",
+    )
+    description: str = Field(
+        default="",
+        description="이미지 설명 텍스트 (시맨틱 검색 쿼리에 추가)",
+    )
+    is_movie_poster: bool = Field(
+        default=False,
+        description="영화 포스터 여부 (True이면 제목 인식 시도)",
+    )
+    detected_movie_title: str | None = Field(
+        default=None,
+        description="포스터에서 인식된 영화 제목 (포스터가 아니면 None)",
+    )
+    analyzed: bool = Field(
+        default=False,
+        description="분석 수행 여부 (False면 이미지 없음 또는 분석 실패)",
     )
 
 
@@ -146,6 +230,100 @@ PREFERENCE_WEIGHTS: dict[str, float] = {
 SUFFICIENCY_THRESHOLD: float = 3.0
 # 턴 카운트 오버라이드 임계값 (선호 부족해도 3턴 이상이면 추천 진행)
 TURN_COUNT_OVERRIDE: int = 3
+
+
+# ============================================================
+# 후속 질문 힌트 (Part 2: 구조화된 후속 질문)
+# ============================================================
+
+class ClarificationHint(BaseModel):
+    """
+    후속 질문 힌트 옵션 (칩/버튼 UI용).
+
+    프론트엔드에서 사용자가 선택할 수 있는 옵션 칩으로 렌더링된다.
+    field: 대응하는 ExtractedPreferences 필드명
+    label: 사용자에게 표시할 한국어 레이블
+    options: 선택 가능한 옵션 목록
+    """
+
+    field: str = Field(..., description="대응하는 선호 필드명 (예: 'genre_preference')")
+    label: str = Field(..., description="사용자에게 표시할 한국어 레이블 (예: '장르')")
+    options: list[str] = Field(default_factory=list, description="선택 가능한 옵션 목록")
+
+
+class ClarificationResponse(BaseModel):
+    """
+    후속 질문 + 힌트 구조화 응답.
+
+    question_generator 노드가 생성하여 SSE clarification 이벤트로 발행한다.
+    기존 텍스트 질문에 구조화된 힌트를 추가하여 UX를 향상한다.
+    """
+
+    question: str = Field(default="", description="후속 질문 텍스트")
+    hints: list[ClarificationHint] = Field(
+        default_factory=list,
+        description="부족 필드 상위 3개의 힌트 목록",
+    )
+    primary_field: str = Field(
+        default="",
+        description="가장 중요한 부족 필드명",
+    )
+
+
+# 필드별 힌트 옵션 상수 (UI 칩 렌더링용)
+FIELD_HINTS: dict[str, dict[str, Any]] = {
+    "genre_preference": {
+        "label": "장르",
+        "options": [
+            "액션", "SF", "로맨스", "코미디", "드라마", "공포", "스릴러",
+            "애니메이션", "판타지", "모험", "범죄", "미스터리", "다큐멘터리",
+            "가족", "전쟁", "역사", "음악",
+        ],
+    },
+    "mood": {
+        "label": "분위기",
+        "options": [
+            "힐링", "감동", "유쾌", "웅장", "긴장감", "따뜻", "몰입",
+            "스릴", "잔잔", "로맨틱", "철학적", "카타르시스", "공포", "다크",
+        ],
+    },
+    "viewing_context": {
+        "label": "시청 상황",
+        "options": ["혼자", "연인과", "가족과", "친구와"],
+    },
+    "platform": {
+        "label": "플랫폼",
+        "options": [
+            "넷플릭스", "왓챠", "디즈니+", "티빙", "웨이브",
+            "쿠팡플레이", "애플TV+", "극장",
+        ],
+    },
+    "era": {
+        "label": "시대",
+        "options": ["최신 (2020년대)", "2010년대", "2000년대", "90년대 이전", "상관없음"],
+    },
+    "exclude": {
+        "label": "제외",
+        "options": ["공포/호러 빼주세요", "한국 영화 제외", "19금 제외", "없음"],
+    },
+    "reference_movies": {
+        "label": "참조 영화",
+        "options": [],  # 자유 입력
+    },
+}
+
+
+# ============================================================
+# RAG 검색 품질 판정 임계값 (Part 3)
+# ============================================================
+
+# 최소 후보 수: 이 값 미만이면 검색 품질 미달
+RETRIEVAL_MIN_CANDIDATES: int = 3
+# Top-1 RRF 점수 최소값: RRF(k=60)에서 단일 엔진 1위 = 1/61 ≈ 0.01639
+# 0.015로 설정하면 최소 1개 엔진에서 Top-2 이내에 포함되어야 통과
+RETRIEVAL_MIN_TOP_SCORE: float = 0.015
+# 상위 5개 평균 RRF 점수 최소값
+RETRIEVAL_QUALITY_MIN_AVG: float = 0.01
 
 
 # ============================================================
@@ -293,11 +471,15 @@ class ChatAgentState(TypedDict, total=False):
     user_id: str
     session_id: str
     current_input: str
+    image_data: str | None  # base64 인코딩된 이미지 데이터 (None이면 이미지 없음)
 
     # ── context_loader 출력 ──
     user_profile: dict[str, Any]
     watch_history: list[dict[str, Any]]
     messages: list[dict[str, str]]
+
+    # ── image_analyzer 출력 ──
+    image_analysis: ImageAnalysisResult
 
     # ── intent_classifier 출력 ──
     intent: IntentResult
@@ -325,6 +507,13 @@ class ChatAgentState(TypedDict, total=False):
     # ── response_formatter 출력 ──
     response: str
 
+    # ── question_generator 출력 (Part 2: 구조화된 힌트) ──
+    clarification: ClarificationResponse | None  # 후속 질문 힌트 (SSE clarification 이벤트)
+
+    # ── RAG 검색 품질 판정 (Part 3) ──
+    retrieval_quality_passed: bool  # 검색 품질 통과 여부
+    retrieval_feedback: str  # 품질 미달 시 피드백 메시지
+
     # ── error_handler ──
     error: str | None
 
@@ -336,6 +525,7 @@ class ChatAgentState(TypedDict, total=False):
 def calculate_sufficiency(
     prefs: ExtractedPreferences,
     has_emotion: bool = False,
+    has_image_analysis: bool = False,
 ) -> float:
     """
     선호 조건의 가중치 합산 점수를 계산한다 (§6-2 Node 4).
@@ -343,10 +533,13 @@ def calculate_sufficiency(
     채워진 필드의 가중치를 합산하여 충분성 점수를 반환.
     has_emotion이 True이면 mood 가중치(2.0)를 추가한다
     (감정 분석 결과가 있으면 무드가 암시적으로 파악된 것으로 간주).
+    has_image_analysis가 True이면 +1.5 보너스를 추가한다
+    (이미지 분석으로 장르/무드/키워드가 보강된 것으로 간주).
 
     Args:
         prefs: 현재까지 파악된 사용자 선호 조건
         has_emotion: 감정 분석 결과 존재 여부
+        has_image_analysis: 이미지 분석 수행 여부
 
     Returns:
         가중치 합산 점수 (float)
@@ -370,6 +563,9 @@ def calculate_sufficiency(
         score += PREFERENCE_WEIGHTS["era"]
     if prefs.exclude:
         score += PREFERENCE_WEIGHTS["exclude"]
+    # 이미지 분석 보너스: 이미지에서 장르/무드/키워드가 추출되면 +1.5
+    if has_image_analysis:
+        score += 1.5
     return score
 
 
@@ -377,6 +573,7 @@ def is_sufficient(
     prefs: ExtractedPreferences,
     turn_count: int = 0,
     has_emotion: bool = False,
+    has_image_analysis: bool = False,
 ) -> bool:
     """
     추천 진행 가능 여부를 판정한다 (§6-2 Node 4).
@@ -389,6 +586,7 @@ def is_sufficient(
         prefs: 현재까지 파악된 사용자 선호 조건
         turn_count: 현재 대화 턴 수
         has_emotion: 감정 분석 결과 존재 여부
+        has_image_analysis: 이미지 분석 수행 여부 (True이면 +1.5 보너스)
 
     Returns:
         True면 추천 진행, False면 후속 질문 필요
@@ -397,7 +595,7 @@ def is_sufficient(
     if turn_count >= TURN_COUNT_OVERRIDE:
         return True
     # 가중치 합산 기반 판정
-    return calculate_sufficiency(prefs, has_emotion) >= SUFFICIENCY_THRESHOLD
+    return calculate_sufficiency(prefs, has_emotion, has_image_analysis) >= SUFFICIENCY_THRESHOLD
 
 
 def merge_preferences(

@@ -20,7 +20,20 @@ logger = structlog.get_logger()
 
 
 def _movie_to_es_doc(doc: MovieDocument) -> dict:
-    """MovieDocument를 Elasticsearch 인덱싱용 dict로 변환한다."""
+    """
+    MovieDocument를 Elasticsearch bulk API 형식의 dict로 변환한다.
+
+    반환되는 dict는 elasticsearch-py의 async_bulk()이 요구하는 형태로,
+    _index, _id, _source 키를 포함한다.
+    list[dict] 필드(cast, keywords, production_companies 등)는 공백 구분 텍스트로
+    변환하여 Nori 형태소 분석기가 토큰화할 수 있게 한다.
+
+    Args:
+        doc: 변환할 MovieDocument 인스턴스
+
+    Returns:
+        dict: ES bulk API 형식의 문서 (_index, _id, _source 포함)
+    """
     return {
         "_index": ES_INDEX_NAME,
         "_id": doc.id,
@@ -31,7 +44,7 @@ def _movie_to_es_doc(doc: MovieDocument) -> dict:
             "title_en": doc.title_en,
             "director": doc.director,
             "overview": doc.overview,
-            # cast: 배열 → 공백 구분 텍스트 (text 필드용)
+            # 배열 필드는 공백 구분 텍스트로 변환 (Nori 분석기 토큰화 대상)
             "cast": " ".join(doc.cast),
             "keywords": " ".join(doc.keywords),
             "genres": doc.genres,
@@ -87,12 +100,12 @@ def _movie_to_es_doc(doc: MovieDocument) -> dict:
             "source_author": doc.source_author,
             "production_country_names": doc.production_country_names,
             "spoken_language_names": doc.spoken_language_names,
-            # 캐스트 캐릭터 매핑 (검색용 텍스트)
+            # 캐스트 캐릭터: "배우명(역할)" 형식으로 결합하여 전문 검색 가능하게 함
             "cast_characters": " ".join(
                 f"{c.get('name', '')}({c.get('character', '')})"
                 for c in doc.cast_characters
             ),
-            # 임베딩 텍스트 (감사 추적용)
+            # 임베딩 텍스트 (디버깅 및 감사 추적용, 검색 대상 아님)
             "embedding_text": doc.embedding_text,
             # ── KOBIS 보강 필드 ──
             "kobis_movie_cd": doc.kobis_movie_cd,
@@ -103,7 +116,8 @@ def _movie_to_es_doc(doc: MovieDocument) -> dict:
             "kobis_watch_grade": doc.kobis_watch_grade,
             "kobis_open_dt": doc.kobis_open_dt,
             "kobis_type_nm": doc.kobis_type_nm,
-            # KOBIS 감독/배우/회사/스태프 (검색용 텍스트)
+            # KOBIS list[dict] 필드는 ES에 직접 저장 불가 → 텍스트로 변환
+            # (Neo4j도 동일 이유로 dict 필드를 제외함)
             "kobis_directors": " ".join(
                 d.get("peopleNm", "") for d in doc.kobis_directors
             ),
@@ -144,7 +158,8 @@ async def load_to_elasticsearch(
     """
     client = await get_elasticsearch()
 
-    # 배치 적재 중 refresh 비활성화 (성능 최적화)
+    # 대량 적재 중 세그먼트 병합(refresh)을 비활성화하여 I/O 부하를 줄인다.
+    # 적재 완료 후 refresh_interval을 복원하고 강제 refresh를 수행한다.
     await client.indices.put_settings(
         index=ES_INDEX_NAME,
         body={"refresh_interval": "-1"},

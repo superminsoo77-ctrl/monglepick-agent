@@ -286,10 +286,10 @@ def kmdb_to_movie_document(raw: KMDbRawMovie) -> MovieDocument | None:
 
     # ID 생성: KMDb movieId + movieSeq (예: "K_12345")
     kmdb_id = f"{raw.movie_id}_{raw.movie_seq}"
-    # Qdrant ID는 정수여야 하므로 movieSeq를 음수로 변환하여 TMDB ID와 충돌 방지
-    # KMDb movieSeq는 보통 5자리 숫자
+    # TMDB ID(1~7자리)와 범위가 겹치지 않도록 10,000,000 오프셋을 더한다.
+    # movieSeq가 숫자가 아닌 경우(드물지만 존재) 문자열 연결로 fallback.
     try:
-        doc_id = str(int(raw.movie_seq) + 10_000_000)  # 10,000,000 오프셋으로 TMDB ID와 분리
+        doc_id = str(int(raw.movie_seq) + 10_000_000)
     except ValueError:
         doc_id = kmdb_id.replace("_", "")
 
@@ -353,7 +353,8 @@ def kmdb_to_movie_document(raw: KMDbRawMovie) -> MovieDocument | None:
     # 무드태그 (장르 기반 fallback)
     mood_tags = get_fallback_mood_tags(genres)
 
-    # 줄거리 빈 문자열 대체
+    # 줄거리가 없거나 너무 짧으면 장르/키워드로 대체 텍스트 생성
+    # (임베딩 품질 유지를 위해 최소한의 맥락 정보 제공)
     if not overview or len(overview) < 10:
         overview = f"{', '.join(genres)} 장르의 한국영화."
         if keywords_list:
@@ -491,11 +492,11 @@ def process_kmdb_batch(
 
     for raw in kmdb_movies:
         try:
-            # 기존 영화와 매칭 시도
+            # 제목+연도로 기존 DB 영화와 매칭 시도
             match = match_kmdb_to_existing(raw, title_index)
 
             if match:
-                # 매칭 성공 → 보강 데이터 추출
+                # 매칭 성공 → KMDb 고유 데이터(수상내역/관객수/촬영장소 등)를 추출
                 existing_id = match.get("id") or match.get("_id", "")
                 enrichment_data = extract_enrichment_data(raw)
                 enrichments.append({
@@ -504,7 +505,7 @@ def process_kmdb_batch(
                 })
                 matched_count += 1
             else:
-                # 매칭 실패 → 신규 영화로 변환
+                # 매칭 실패 → TMDB/Kaggle에 없는 한국영화이므로 신규 생성
                 doc = kmdb_to_movie_document(raw)
                 if doc:
                     new_documents.append(doc)
@@ -513,6 +514,7 @@ def process_kmdb_batch(
                     failed_count += 1
         except Exception as e:
             failed_count += 1
+            # 에러 로그 폭주 방지: 처음 10건만 상세 로깅
             if failed_count <= 10:
                 logger.warning(
                     "kmdb_process_failed",

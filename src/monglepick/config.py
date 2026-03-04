@@ -59,10 +59,10 @@ class Settings(BaseSettings):
     EMBEDDING_DIMENSION: int = 4096
 
     # ── LLM Models (Ollama 로컬 모델) ──
-    # 구조화 출력 (JSON): Qwen2.5 14B
-    INTENT_MODEL: str = "qwen2.5:14b"
-    EMOTION_MODEL: str = "qwen2.5:14b"
-    MOOD_MODEL: str = "qwen2.5:14b"
+    # 구조화 출력 (JSON) + 비전: Qwen3.5 35B-A3B (텍스트 분류 + 이미지 분석 통합)
+    INTENT_MODEL: str = "qwen3.5:35b-a3b"
+    EMOTION_MODEL: str = "qwen3.5:35b-a3b"
+    MOOD_MODEL: str = "qwen3.5:35b-a3b"
     # 한국어 자연어 생성: EXAONE 4.0 32B (비추론 모드: temperature < 0.6)
     PREFERENCE_MODEL: str = "exaone-32b:latest"
     CONVERSATION_MODEL: str = "exaone-32b:latest"
@@ -70,8 +70,14 @@ class Settings(BaseSettings):
     QUESTION_MODEL: str = "exaone-32b:latest"
     # 추천 이유 생성: EXAONE 4.0 32B (자연어 설명)
     EXPLANATION_MODEL: str = "exaone-32b:latest"
-    # Vision (포스터 분석): Qwen2.5 VL 32B
-    VISION_MODEL: str = "qwen2.5vl:32b"
+    # Vision (이미지 분석): Qwen3.5 35B-A3B (비전 내장 멀티모달 모델)
+    VISION_MODEL: str = "qwen3.5:35b-a3b"
+
+    # ── Image Upload ──
+    # 이미지 업로드 최대 크기 (MB)
+    IMAGE_MAX_SIZE_MB: int = 10
+    # 이미지 분석(VLM) 호출 타임아웃(초). 초과 시 분석 생략 후 진행
+    VISION_TIMEOUT_SEC: int = 180
 
     # ── Session / Conversation ──
     SESSION_TTL_DAYS: int = 30

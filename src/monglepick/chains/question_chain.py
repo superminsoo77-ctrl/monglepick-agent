@@ -13,6 +13,9 @@ EXAONE 32B (자유 텍스트)로 실행한다.
 
 from __future__ import annotations
 
+import time
+import traceback
+
 import structlog
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -20,6 +23,7 @@ from monglepick.agents.chat.models import (
     PREFERENCE_WEIGHTS,
     ExtractedPreferences,
 )
+from monglepick.config import settings
 from monglepick.llm.factory import get_question_llm
 from monglepick.prompts.question import QUESTION_HUMAN_PROMPT, QUESTION_SYSTEM_PROMPT
 
@@ -151,10 +155,41 @@ async def generate_question(
         "turn_count": str(turn_count),
     }
 
+    logger.info(
+        "question_chain_start",
+        missing_fields=[f[0] for f in missing],
+        turn_count=turn_count,
+        emotion=emotion,
+        known_prefs_preview=_format_known_preferences(extracted_preferences)[:200],
+    )
+
     try:
+        # LLM 파이프라인 타이밍 측정 시작 (프롬프트 포맷 + LLM 호출)
+        llm_start = time.perf_counter()
+
         # 프롬프트 포맷 → LLM 호출 (명시적 2단계)
         prompt_value = await prompt.ainvoke(inputs)
+        logger.debug(
+            "question_chain_prompt_formatted",
+            prompt_preview=str(prompt_value)[:300],
+        )
+        # 전체 프롬프트 텍스트 디버그 로그 (상세 디버깅용)
+        logger.debug(
+            "question_chain_prompt_full",
+            prompt_text=str(prompt_value),
+            model=settings.QUESTION_MODEL,
+        )
         response = await llm.ainvoke(prompt_value)
+
+        # LLM 응답 시간 계산 (밀리초 단위)
+        elapsed_ms = (time.perf_counter() - llm_start) * 1000
+
+        # LLM 원시 응답 디버그 로그 (파싱 전 전체 응답)
+        logger.debug(
+            "question_chain_llm_raw_response",
+            raw_response=str(response),
+            model=settings.QUESTION_MODEL,
+        )
 
         # LangChain BaseMessage → 문자열 추출
         question = response.content if hasattr(response, "content") else str(response)
@@ -165,6 +200,8 @@ async def generate_question(
             question_preview=question[:50],
             missing_count=len(missing),
             turn_count=turn_count,
+            elapsed_ms=round(elapsed_ms, 1),
+            model=settings.QUESTION_MODEL,
         )
         return question
 
@@ -172,6 +209,8 @@ async def generate_question(
         logger.error(
             "question_generation_error",
             error=str(e),
+            error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(),
         )
         # fallback: 최고 가중치 부족 필드의 기본 질문
         top_missing_field = missing[0][0]

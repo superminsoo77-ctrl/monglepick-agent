@@ -48,7 +48,15 @@ TMDB_RAW_CACHE = TMDB_CACHE_DIR / "tmdb_raw_movies.json"
 
 
 def _load_state() -> PipelineState:
-    """파이프라인 진행 상태를 파일에서 로드한다."""
+    """
+    파이프라인 진행 상태를 JSON 파일에서 로드한다.
+
+    파일이 없으면 초기 상태(PipelineState)를 반환한다.
+    중단된 파이프라인을 이어서 실행할 때 마지막 성공 단계를 파악하는 데 사용한다.
+
+    Returns:
+        PipelineState: 복원된 상태 또는 초기 상태
+    """
     if STATE_FILE.exists():
         data = json.loads(STATE_FILE.read_text())
         return PipelineState(**data)
@@ -56,7 +64,15 @@ def _load_state() -> PipelineState:
 
 
 def _save_state(state: PipelineState) -> None:
-    """파이프라인 진행 상태를 파일에 저장한다."""
+    """
+    파이프라인 진행 상태를 JSON 파일에 저장한다.
+
+    각 단계(collect, preprocess, embed, load) 완료 시 호출되어
+    중단 시 마지막 성공 지점을 기록한다.
+
+    Args:
+        state: 현재 파이프라인 상태 (current_step, failed_ids 등)
+    """
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     state.timestamp = datetime.now().isoformat()
     STATE_FILE.write_text(state.model_dump_json(indent=2))
@@ -214,21 +230,17 @@ async def run_full_pipeline(
         state.current_step = "embed"
         _save_state(state)
 
+        # Upstage Solar embedding-passage 모델로 4096차원 벡터 생성
         texts = [doc.embedding_text for doc in documents]
         embeddings = embed_texts(texts, batch_size=embedding_batch_size)
 
-        # ── Step 4: 적재 (Qdrant + Neo4j + ES 동시) ──
+        # ── Step 4: 3개 DB 동시 적재 (Qdrant 벡터 + Neo4j 그래프 + ES BM25) ──
         logger.info("pipeline_step_4_load", count=len(documents))
         state.current_step = "load"
         _save_state(state)
 
-        # Qdrant 적재
         qdrant_count = await load_to_qdrant(documents, embeddings)
-
-        # Neo4j 적재
         await load_to_neo4j(documents)
-
-        # Elasticsearch 적재
         es_count = await load_to_elasticsearch(documents)
 
         state.total_loaded = len(documents)
@@ -241,7 +253,9 @@ async def run_full_pipeline(
             elasticsearch=es_count,
         )
 
-        # ── Step 5: CF 매트릭스 구축 (Kaggle ratings) ──
+        # ── Step 5: CF 매트릭스 구축 (Kaggle ratings → Redis 캐시) ──
+        # links.csv로 movieLens ID → TMDB ID 매핑 후,
+        # ratings.csv 26M건으로 유저 유사도 매트릭스를 구축하여 Redis에 캐싱한다.
         logger.info("pipeline_step_5_cf_matrix")
         kaggle = KaggleLoader(kaggle_data_dir)
 

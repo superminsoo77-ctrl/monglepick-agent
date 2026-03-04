@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 import structlog
@@ -57,6 +58,8 @@ async def search_qdrant(
 
     §11-1 ①: 쿼리 벡터 생성 → 코사인 유사도 Top-30 + 메타데이터 필터
     """
+    # Qdrant 검색 타이밍 측정 시작
+    qdrant_start = time.perf_counter()
     client = await get_qdrant()
 
     # 쿼리 임베딩 (multilingual-e5: "query: " 접두사)
@@ -78,6 +81,17 @@ async def search_qdrant(
 
     query_filter = Filter(must=conditions) if conditions else None
 
+    logger.info(
+        "qdrant_search_start",
+        query_preview=query[:80],
+        top_k=top_k,
+        filter_count=len(conditions),
+        genre_filter=genre_filter,
+        mood_filter=mood_filter,
+        ott_filter=ott_filter,
+        year_range=year_range,
+    )
+
     # 벡터 검색 실행 (qdrant-client v1.17+: search → query_points)
     response = await client.query_points(
         collection_name=settings.QDRANT_COLLECTION,
@@ -87,7 +101,7 @@ async def search_qdrant(
         with_payload=True,
     )
 
-    return [
+    results = [
         SearchResult(
             movie_id=str(hit.id),
             title=hit.payload.get("title", "") if hit.payload else "",
@@ -97,6 +111,22 @@ async def search_qdrant(
         )
         for hit in response.points
     ]
+
+    # Qdrant 검색 소요 시간 계산
+    qdrant_elapsed_ms = (time.perf_counter() - qdrant_start) * 1000
+
+    # 상세 검색 결과 로깅
+    logger.info(
+        "qdrant_search_results",
+        result_count=len(results),
+        elapsed_ms=round(qdrant_elapsed_ms, 1),
+        top_results=[
+            {"title": r.title, "score": round(r.score, 4), "id": r.movie_id}
+            for r in results[:5]
+        ],
+    )
+
+    return results
 
 
 # ============================================================
@@ -115,6 +145,8 @@ async def search_elasticsearch(
 
     §11-1 ②: multi_match + function_score (무드태그 부스트)
     """
+    # ES 검색 타이밍 측정 시작
+    es_start = time.perf_counter()
     client = await get_elasticsearch()
 
     # multi_match 쿼리 (title, director, overview, cast, keywords 대상)
@@ -164,10 +196,18 @@ async def search_elasticsearch(
         "size": top_k,
     }
 
+    logger.info(
+        "es_search_start",
+        query_preview=query[:80],
+        top_k=top_k,
+        genre_filter=genre_filter,
+        mood_filter=mood_filter,
+    )
+
     resp = await client.search(index=ES_INDEX_NAME, body=body)
     hits = resp["hits"]["hits"]
 
-    return [
+    results = [
         SearchResult(
             movie_id=hit["_id"],
             title=hit["_source"].get("title", ""),
@@ -177,6 +217,22 @@ async def search_elasticsearch(
         )
         for hit in hits
     ]
+
+    # ES 검색 소요 시간 계산
+    es_elapsed_ms = (time.perf_counter() - es_start) * 1000
+
+    # 상세 검색 결과 로깅
+    logger.info(
+        "es_search_results",
+        result_count=len(results),
+        elapsed_ms=round(es_elapsed_ms, 1),
+        top_results=[
+            {"title": r.title, "score": round(r.score, 4), "id": r.movie_id}
+            for r in results[:5]
+        ],
+    )
+
+    return results
 
 
 # ============================================================
@@ -199,9 +255,20 @@ async def search_neo4j(
     - SIMILAR_TO 관계로 후보 확장
     - 감독/배우 관계 탐색
     """
+    # Neo4j 검색 타이밍 측정 시작
+    neo4j_start = time.perf_counter()
     driver = await get_neo4j()
 
     results: list[SearchResult] = []
+
+    logger.info(
+        "neo4j_search_start",
+        mood_tags=mood_tags,
+        genres=genres,
+        director=director,
+        similar_to_movie_id=similar_to_movie_id,
+        top_k=top_k,
+    )
 
     async with driver.session() as session:
         # 전략 1: 무드태그 + 장르 조합 검색
@@ -258,6 +325,15 @@ async def search_neo4j(
                     metadata={"rating": record.get("rating"), "mood_match": record.get("mood_match")},
                 ))
 
+            logger.info(
+                "neo4j_mood_genre_results",
+                result_count=len(records),
+                top_results=[
+                    {"title": r.get("title", ""), "mood_match": r.get("mood_match", 0)}
+                    for r in records[:5]
+                ],
+            )
+
         # 전략 2: SIMILAR_TO 관계 확장
         if similar_to_movie_id:
             cypher = """
@@ -279,6 +355,16 @@ async def search_neo4j(
                     metadata={"rating": record.get("rating")},
                 ))
 
+            logger.info(
+                "neo4j_similar_to_results",
+                source_movie_id=similar_to_movie_id,
+                result_count=len(records),
+                top_results=[
+                    {"title": r.get("title", ""), "similarity": r.get("similarity", 0)}
+                    for r in records[:5]
+                ],
+            )
+
         # 전략 3: 감독 기반 탐색
         if director:
             cypher = """
@@ -298,6 +384,29 @@ async def search_neo4j(
                     source="neo4j",
                     metadata={"rating": record.get("rating")},
                 ))
+
+            logger.info(
+                "neo4j_director_results",
+                director=director,
+                result_count=len(records),
+                top_results=[
+                    {"title": r.get("title", ""), "rating": r.get("rating", 0)}
+                    for r in records[:5]
+                ],
+            )
+
+    # Neo4j 검색 소요 시간 계산
+    neo4j_elapsed_ms = (time.perf_counter() - neo4j_start) * 1000
+
+    logger.info(
+        "neo4j_search_completed",
+        total_result_count=len(results),
+        elapsed_ms=round(neo4j_elapsed_ms, 1),
+        top_results=[
+            {"title": r.title, "score": round(r.score, 4), "id": r.movie_id}
+            for r in results[:5]
+        ],
+    )
 
     return results
 
@@ -394,6 +503,9 @@ async def hybrid_search(
     """
     import asyncio
 
+    # 병렬 검색 전체 타이밍 측정 시작
+    search_start = time.perf_counter()
+
     # 3개 검색 엔진 동시 실행
     qdrant_task = search_qdrant(
         query=query,
@@ -424,12 +536,23 @@ async def hybrid_search(
         qdrant_task, es_task, neo4j_task,
     )
 
+    # 병렬 검색 소요 시간 계산
+    search_elapsed_ms = (time.perf_counter() - search_start) * 1000
+
     logger.info(
-        "hybrid_search_results",
-        qdrant=len(qdrant_results),
-        es=len(es_results),
-        neo4j=len(neo4j_results),
+        "hybrid_search_engine_results",
+        query_preview=query[:80],
+        qdrant_count=len(qdrant_results),
+        es_count=len(es_results),
+        neo4j_count=len(neo4j_results),
+        parallel_search_elapsed_ms=round(search_elapsed_ms, 1),
+        qdrant_top3=[r.title for r in qdrant_results[:3]],
+        es_top3=[r.title for r in es_results[:3]],
+        neo4j_top3=[r.title for r in neo4j_results[:3]],
     )
+
+    # RRF 합산 타이밍 측정 시작
+    rrf_start = time.perf_counter()
 
     # RRF 합산 (§11-1 ④)
     fused = reciprocal_rank_fusion(
@@ -439,11 +562,23 @@ async def hybrid_search(
 
     final = fused[:top_k]
 
+    # RRF 합산 소요 시간 계산
+    rrf_elapsed_ms = (time.perf_counter() - rrf_start) * 1000
+    # 전체 하이브리드 검색 소요 시간
+    total_elapsed_ms = (time.perf_counter() - search_start) * 1000
+
+    # 최종 RRF 결과 상세 로깅
     logger.info(
-        "hybrid_search_complete",
-        query=query[:50],
-        result_count=len(final),
-        top_score=final[0].score if final else 0,
+        "hybrid_search_rrf_final",
+        query_preview=query[:80],
+        total_fused=len(fused),
+        returned=len(final),
+        rrf_elapsed_ms=round(rrf_elapsed_ms, 1),
+        total_elapsed_ms=round(total_elapsed_ms, 1),
+        final_results=[
+            {"rank": i + 1, "title": r.title, "rrf_score": round(r.score, 6), "id": r.movie_id}
+            for i, r in enumerate(final)
+        ],
     )
 
     return final

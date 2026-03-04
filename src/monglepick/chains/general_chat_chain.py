@@ -12,9 +12,13 @@ EXAONE 32B (자유 텍스트, temp=0.5)로 실행한다.
 
 from __future__ import annotations
 
+import time
+import traceback
+
 import structlog
 from langchain_core.prompts import ChatPromptTemplate
 
+from monglepick.config import settings
 from monglepick.llm.factory import get_conversation_llm
 from monglepick.prompts.persona import MONGGLE_SYSTEM_PROMPT
 
@@ -56,19 +60,43 @@ async def generate_general_response(
         "recent_messages": recent_messages or "(대화 시작)",
     }
 
+    logger.info(
+        "general_chat_chain_start",
+        input_preview=current_input[:100],
+        recent_messages_preview=recent_messages[:100] if recent_messages else "(없음)",
+    )
+
     try:
         # 프롬프트 포맷 → LLM 호출 (명시적 2단계)
+        llm_start = time.perf_counter()
         prompt_value = await prompt.ainvoke(inputs)
+        logger.debug(
+            "general_chat_chain_prompt_formatted",
+            prompt_preview=str(prompt_value)[:300],
+        )
+        logger.debug(
+            "general_chat_chain_prompt_full",
+            prompt_text=str(prompt_value),
+            model=settings.CONVERSATION_MODEL,
+        )
         response = await llm.ainvoke(prompt_value)
+        elapsed_ms = (time.perf_counter() - llm_start) * 1000
 
         # LangChain BaseMessage → 문자열 추출
         text = response.content if hasattr(response, "content") else str(response)
         text = text.strip() if isinstance(text, str) else str(text).strip()
 
+        logger.debug(
+            "general_chat_chain_llm_raw_response",
+            raw_response=str(response),
+            model=settings.CONVERSATION_MODEL,
+        )
         logger.info(
             "general_response_generated",
             response_preview=text[:50],
             input_preview=current_input[:50],
+            elapsed_ms=round(elapsed_ms, 1),
+            model=settings.CONVERSATION_MODEL,
         )
         return text
 
@@ -77,5 +105,7 @@ async def generate_general_response(
             "general_response_error",
             error=str(e),
             input_preview=current_input[:50],
+            error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(),
         )
         return DEFAULT_ERROR_MESSAGE

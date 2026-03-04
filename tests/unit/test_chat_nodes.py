@@ -1,5 +1,5 @@
 """
-Chat Agent 노드 단위 테스트 (Phase 3).
+Chat Agent 노드 단위 테스트 (Phase 3 + 의도+감정 통합 + 구조화 힌트 + RAG 품질).
 
 13개 노드 함수를 개별 테스트한다.
 모든 테스트는 mock LLM + mock DB로 실행 (Ollama/DB 서버 불필요).
@@ -10,7 +10,9 @@ Chat Agent 노드 단위 테스트 (Phase 3).
 - 에러 시 기본값 반환
 - 시대 파싱 헬퍼
 - 검색 결과 → CandidateMovie 변환
-- 추천 순위 정렬 (Phase 4 스텁)
+- 추천 순위 정렬 (Phase 4 서브그래프)
+- 의도+감정 통합 분류 (intent_emotion_classifier)
+- 구조화된 후속 질문 힌트 (clarification)
 """
 
 from __future__ import annotations
@@ -22,8 +24,11 @@ import pytest
 from monglepick.agents.chat.models import (
     CandidateMovie,
     ChatAgentState,
+    ClarificationResponse,
     EmotionResult,
     ExtractedPreferences,
+    ImageAnalysisResult,
+    IntentEmotionResult,
     IntentResult,
     RankedMovie,
     ScoreDetail,
@@ -33,11 +38,10 @@ from monglepick.agents.chat.nodes import (
     _parse_era,
     _search_result_to_candidate,
     context_loader,
-    emotion_analyzer,
     error_handler,
     explanation_generator,
     general_responder,
-    intent_classifier,
+    intent_emotion_classifier,
     preference_refiner,
     query_builder,
     question_generator,
@@ -191,85 +195,107 @@ class TestContextLoader:
 
 
 # ============================================================
-# intent_classifier 테스트
+# intent_emotion_classifier 테스트 (통합 의도+감정 분류)
 # ============================================================
 
-class TestIntentClassifier:
-    """intent_classifier 노드 테스트."""
+class TestIntentEmotionClassifier:
+    """intent_emotion_classifier 통합 노드 테스트."""
 
     @pytest.mark.asyncio
-    async def test_recommend_intent(self, mock_ollama):
-        """추천 의도 분류 테스트."""
+    async def test_recommend_intent_with_emotion(self, mock_ollama):
+        """추천 의도 + 감정 동시 분류 테스트."""
         mock_ollama.set_structured_response(
-            IntentResult(intent="recommend", confidence=0.95),
+            IntentEmotionResult(
+                intent="recommend", confidence=0.95,
+                emotion="sad", mood_tags=["힐링", "감동"],
+            ),
         )
         state: ChatAgentState = {
             "current_input": "우울한데 영화 추천해줘",
             "messages": [{"role": "user", "content": "우울한데 영화 추천해줘"}],
         }
-        result = await intent_classifier(state)
+        result = await intent_emotion_classifier(state)
+        # intent와 emotion이 동시에 반환된다
         assert result["intent"].intent == "recommend"
         assert result["intent"].confidence == 0.95
+        assert result["emotion"].emotion == "sad"
+        assert "힐링" in result["emotion"].mood_tags
 
     @pytest.mark.asyncio
-    async def test_general_intent(self, mock_ollama):
-        """일반 대화 의도 분류 테스트."""
+    async def test_general_intent_no_emotion(self, mock_ollama):
+        """일반 대화: 의도=general, 감정=None."""
         mock_ollama.set_structured_response(
-            IntentResult(intent="general", confidence=0.8),
+            IntentEmotionResult(
+                intent="general", confidence=0.8,
+                emotion=None, mood_tags=[],
+            ),
         )
         state: ChatAgentState = {
             "current_input": "안녕하세요",
             "messages": [{"role": "user", "content": "안녕하세요"}],
         }
-        result = await intent_classifier(state)
+        result = await intent_emotion_classifier(state)
         assert result["intent"].intent == "general"
+        assert result["emotion"].emotion is None
+
+    @pytest.mark.asyncio
+    async def test_image_boost_general_to_recommend(self, mock_ollama):
+        """이미지 부스트: general + 이미지 분석 → recommend."""
+        mock_ollama.set_structured_response(
+            IntentEmotionResult(
+                intent="general", confidence=0.5,
+                emotion=None, mood_tags=[],
+            ),
+        )
+        state: ChatAgentState = {
+            "current_input": "이런 느낌의 영화",
+            "messages": [{"role": "user", "content": "이런 느낌의 영화"}],
+            "image_analysis": ImageAnalysisResult(
+                genre_cues=["SF"],
+                mood_cues=["웅장"],
+                analyzed=True,
+            ),
+        }
+        result = await intent_emotion_classifier(state)
+        # 이미지 분석이 있으면 general → recommend로 부스트
+        assert result["intent"].intent == "recommend"
+        assert result["intent"].confidence >= 0.7
+
+    @pytest.mark.asyncio
+    async def test_no_image_boost_for_non_general(self, mock_ollama):
+        """이미지 부스트: recommend는 그대로 유지 (general만 부스트)."""
+        mock_ollama.set_structured_response(
+            IntentEmotionResult(
+                intent="recommend", confidence=0.9,
+                emotion="excited", mood_tags=["스릴"],
+            ),
+        )
+        state: ChatAgentState = {
+            "current_input": "액션 영화 추천",
+            "messages": [],
+            "image_analysis": ImageAnalysisResult(
+                genre_cues=["액션"],
+                analyzed=True,
+            ),
+        }
+        result = await intent_emotion_classifier(state)
+        # 이미 recommend이므로 부스트 없음
+        assert result["intent"].intent == "recommend"
+        assert result["intent"].confidence == 0.9
 
     @pytest.mark.asyncio
     async def test_error_fallback(self, mock_ollama):
-        """LLM 에러 시 → general fallback."""
+        """LLM 에러 시 → general fallback + 감정 None."""
         mock_ollama.set_error(RuntimeError("LLM 에러"))
         state: ChatAgentState = {
             "current_input": "테스트",
             "messages": [],
         }
-        result = await intent_classifier(state)
+        result = await intent_emotion_classifier(state)
         assert result["intent"].intent == "general"
         assert result["intent"].confidence == 0.0
-
-
-# ============================================================
-# emotion_analyzer 테스트
-# ============================================================
-
-class TestEmotionAnalyzer:
-    """emotion_analyzer 노드 테스트."""
-
-    @pytest.mark.asyncio
-    async def test_sad_emotion(self, mock_ollama):
-        """슬픈 감정 분석 테스트."""
-        mock_ollama.set_structured_response(
-            EmotionResult(emotion="sad", mood_tags=["힐링", "감동"]),
-        )
-        state: ChatAgentState = {
-            "current_input": "우울한데 영화 추천해줘",
-            "messages": [{"role": "user", "content": "우울한데 영화 추천해줘"}],
-        }
-        result = await emotion_analyzer(state)
-        assert result["emotion"].emotion == "sad"
-        assert "힐링" in result["emotion"].mood_tags
-
-    @pytest.mark.asyncio
-    async def test_no_emotion(self, mock_ollama):
-        """감정 미감지 테스트."""
-        mock_ollama.set_structured_response(
-            EmotionResult(emotion=None, mood_tags=[]),
-        )
-        state: ChatAgentState = {
-            "current_input": "SF 영화 추천",
-            "messages": [],
-        }
-        result = await emotion_analyzer(state)
         assert result["emotion"].emotion is None
+        assert result["emotion"].mood_tags == []
 
 
 # ============================================================
@@ -324,6 +350,77 @@ class TestPreferenceRefiner:
         result = await preference_refiner(state)
         assert result["needs_clarification"] is False
 
+    @pytest.mark.asyncio
+    async def test_reference_movie_auto_enrichment(self, mock_ollama, mock_reference_lookup):
+        """참조 영화만 있으면 DB에서 장르/무드를 자동 보강하여 바로 추천 진행."""
+        # LLM이 reference_movies만 추출 (장르/무드는 빈 상태)
+        mock_ollama.set_structured_response(
+            ExtractedPreferences(
+                genre_preference=None,
+                mood=None,
+                reference_movies=["인터스텔라"],
+            ),
+        )
+        # DB 조회 결과: 인터스텔라의 장르/무드
+        mock_reference_lookup.set_result({
+            "genres": ["SF", "드라마", "모험"],
+            "mood_tags": ["웅장", "감동", "몰입"],
+        })
+        state: ChatAgentState = {
+            "current_input": "인터스텔라 같은 영화 보고 싶어",
+            "turn_count": 1,
+        }
+        result = await preference_refiner(state)
+        # reference(1.5) + genre(2.0, DB 보강) + mood(2.0, DB 보강) = 5.5 ≥ 3.0
+        assert result["needs_clarification"] is False
+        assert result["preferences"].genre_preference is not None
+        assert result["preferences"].mood is not None
+        assert "인터스텔라" in result["preferences"].reference_movies
+
+    @pytest.mark.asyncio
+    async def test_reference_movie_db_miss(self, mock_ollama, mock_reference_lookup):
+        """참조 영화가 DB에 없으면 보강 불가 → 후속 질문."""
+        mock_ollama.set_structured_response(
+            ExtractedPreferences(
+                genre_preference=None,
+                mood=None,
+                reference_movies=["존재하지않는영화"],
+            ),
+        )
+        # DB에 해당 영화 없음
+        mock_reference_lookup.set_empty()
+        state: ChatAgentState = {
+            "current_input": "존재하지않는영화 같은 영화 보고 싶어",
+            "turn_count": 1,
+        }
+        result = await preference_refiner(state)
+        # reference(1.5) + genre(0) + mood(0) = 1.5 < 3.0
+        assert result["needs_clarification"] is True
+
+    @pytest.mark.asyncio
+    async def test_reference_movie_genre_already_set(self, mock_ollama, mock_reference_lookup):
+        """장르가 이미 있으면 DB에서 무드만 보강."""
+        mock_ollama.set_structured_response(
+            ExtractedPreferences(
+                genre_preference="SF",  # 이미 추출됨
+                mood=None,
+                reference_movies=["인터스텔라"],
+            ),
+        )
+        mock_reference_lookup.set_result({
+            "genres": ["SF", "드라마", "모험"],
+            "mood_tags": ["웅장", "감동"],
+        })
+        state: ChatAgentState = {
+            "current_input": "인터스텔라 같은 SF 영화",
+            "turn_count": 1,
+        }
+        result = await preference_refiner(state)
+        # genre(2.0, 기존) + mood(2.0, DB 보강) + reference(1.5) = 5.5 ≥ 3.0
+        assert result["needs_clarification"] is False
+        assert result["preferences"].genre_preference == "SF"  # 기존 값 유지
+        assert result["preferences"].mood is not None  # DB에서 보강됨
+
 
 # ============================================================
 # question_generator 테스트
@@ -345,8 +442,55 @@ class TestQuestionGenerator:
         assert result["response"]  # response에도 질문 설정
 
     @pytest.mark.asyncio
+    async def test_generates_clarification_hints(self, mock_ollama):
+        """구조화된 힌트(ClarificationResponse) 생성 테스트."""
+        mock_ollama.set_response("어떤 장르를 좋아하세요?")
+        state: ChatAgentState = {
+            "preferences": ExtractedPreferences(),  # 빈 선호 → 모든 필드 부족
+            "turn_count": 1,
+        }
+        result = await question_generator(state)
+        # clarification 필드가 반환되어야 함
+        clarification = result.get("clarification")
+        assert clarification is not None
+        assert isinstance(clarification, ClarificationResponse)
+        assert clarification.question  # 질문 텍스트 존재
+        assert len(clarification.hints) > 0  # 힌트 1개 이상
+        assert len(clarification.hints) <= 3  # 최대 3개
+        assert clarification.primary_field  # 1순위 부족 필드 존재
+
+    @pytest.mark.asyncio
+    async def test_clarification_hints_content(self, mock_ollama):
+        """힌트 옵션이 FIELD_HINTS에서 올바르게 매핑되는지 확인."""
+        mock_ollama.set_response("테스트 질문")
+        state: ChatAgentState = {
+            "preferences": ExtractedPreferences(),  # 빈 선호
+            "turn_count": 1,
+        }
+        result = await question_generator(state)
+        clarification = result["clarification"]
+        # 각 힌트의 필드가 유효한 필드명인지 확인
+        valid_fields = {"genre_preference", "mood", "viewing_context", "platform", "era", "exclude", "reference_movies"}
+        for hint in clarification.hints:
+            assert hint.field in valid_fields
+            assert hint.label  # 레이블이 비어있지 않음
+
+    @pytest.mark.asyncio
+    async def test_retrieval_feedback_question(self, mock_ollama):
+        """검색 품질 미달 시 피드백 메시지 포함 질문 생성."""
+        state: ChatAgentState = {
+            "preferences": ExtractedPreferences(genre_preference="다큐멘터리"),
+            "turn_count": 1,
+            "retrieval_feedback": "조건에 맞는 영화를 찾지 못했어요.",
+        }
+        result = await question_generator(state)
+        # 피드백 메시지가 질문에 포함되어야 함
+        assert "찾지 못했어요" in result["follow_up_question"]
+        assert "구체적" in result["follow_up_question"]
+
+    @pytest.mark.asyncio
     async def test_error_fallback(self, mock_ollama):
-        """LLM 에러 시 → 기본 질문 반환."""
+        """LLM 에러 시 → 기본 질문 반환 (generate_question 내부 fallback)."""
         mock_ollama.set_error(RuntimeError("LLM 에러"))
         state: ChatAgentState = {
             "preferences": ExtractedPreferences(),
@@ -355,6 +499,11 @@ class TestQuestionGenerator:
         result = await question_generator(state)
         assert result["follow_up_question"]
         assert "영화" in result["follow_up_question"] or "알려" in result["follow_up_question"]
+        # generate_question 내부에서 에러를 잡고 fallback 반환하므로
+        # question_generator 노드의 try 블록은 정상 진행 → clarification 생성됨
+        clarification = result.get("clarification")
+        assert clarification is not None
+        assert len(clarification.hints) > 0
 
 
 # ============================================================

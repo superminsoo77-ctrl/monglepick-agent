@@ -19,6 +19,8 @@ LLM을 호출하지 않으며, 규칙 기반 + Redis CF 캐시로만 동작한�
 
 from __future__ import annotations
 
+import time
+import traceback
 from collections import Counter
 from typing import Any
 
@@ -78,6 +80,8 @@ async def cold_start_checker(state: RecommendationEngineState) -> dict:
     Returns:
         dict: is_cold_start(bool) 업데이트
     """
+    # 노드 실행 타이밍 측정 시작
+    node_start = time.perf_counter()
     try:
         watch_history = state.get("watch_history", [])
         history_count = len(watch_history)
@@ -85,15 +89,19 @@ async def cold_start_checker(state: RecommendationEngineState) -> dict:
         # 시청 이력이 COLD_START_THRESHOLD 미만이면 Cold Start
         is_cold_start = history_count < COLD_START_THRESHOLD
 
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
             "cold_start_checked",
             history_count=history_count,
             is_cold_start=is_cold_start,
+            elapsed_ms=round(elapsed_ms, 1),
         )
         return {"is_cold_start": is_cold_start}
 
     except Exception as e:
-        logger.error("cold_start_checker_error", error=str(e))
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error("cold_start_checker_error", error=str(e), error_type=type(e).__name__,
+                      stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1))
         # 에러 시 Cold Start로 간주 (안전한 기본값)
         return {"is_cold_start": True}
 
@@ -126,6 +134,8 @@ async def collaborative_filter(state: RecommendationEngineState) -> dict:
     Returns:
         dict: cf_scores({movie_id: float}) 업데이트
     """
+    # 노드 실행 타이밍 측정 시작
+    node_start = time.perf_counter()
     try:
         user_id = state.get("user_id", "")
         candidates = state.get("candidate_movies", [])
@@ -207,16 +217,31 @@ async def collaborative_filter(state: RecommendationEngineState) -> dict:
             logger.warning("cf_redis_error", error=str(redis_err))
             cf_scores = {c.id: CF_DEFAULT_SCORE for c in candidates}
 
+        # CF 점수 상위 5개 영화 상세 로깅
+        sorted_cf = sorted(cf_scores.items(), key=lambda x: x[1], reverse=True)
+        candidate_title_map = {c.id: c.title for c in candidates}
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
             "cf_scores_calculated",
             user_id=user_id,
             candidate_count=len(cf_scores),
-            avg_score=sum(cf_scores.values()) / max(len(cf_scores), 1),
+            avg_score=round(sum(cf_scores.values()) / max(len(cf_scores), 1), 4),
+            similar_user_count=len(similar_users_raw) if 'similar_users_raw' in dir() else 0,
+            top_cf_scores=[
+                {
+                    "title": candidate_title_map.get(mid, mid),
+                    "cf_score": round(score, 4),
+                }
+                for mid, score in sorted_cf[:5]
+            ],
+            elapsed_ms=round(elapsed_ms, 1),
         )
         return {"cf_scores": cf_scores}
 
     except Exception as e:
-        logger.error("collaborative_filter_error", error=str(e))
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error("collaborative_filter_error", error=str(e), error_type=type(e).__name__,
+                      stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1))
         candidates = state.get("candidate_movies", [])
         return {"cf_scores": {c.id: CF_DEFAULT_SCORE for c in candidates}}
 
@@ -250,6 +275,8 @@ async def content_based_filter(state: RecommendationEngineState) -> dict:
     Returns:
         dict: cbf_scores({movie_id: float}) 업데이트
     """
+    # 노드 실행 타이밍 측정 시작
+    node_start = time.perf_counter()
     try:
         candidates = state.get("candidate_movies", [])
         watch_history = state.get("watch_history", [])
@@ -339,16 +366,31 @@ async def content_based_filter(state: RecommendationEngineState) -> dict:
         # min-max 정규화 [0, 1]
         cbf_scores = _min_max_normalize(cbf_scores)
 
+        # CBF 점수 상위 5개 영화 상세 로깅
+        sorted_cbf = sorted(cbf_scores.items(), key=lambda x: x[1], reverse=True)
+        candidate_title_map = {c.id: c.title for c in candidates}
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
             "cbf_scores_calculated",
             candidate_count=len(cbf_scores),
             has_emotion=has_emotion,
             liked_genres=list(liked_genres)[:5],
+            weights={"genre": w_genre, "crew": w_crew, "mood": w_mood, "keyword": w_keyword, "rrf": w_rrf},
+            top_cbf_scores=[
+                {
+                    "title": candidate_title_map.get(mid, mid),
+                    "cbf_score": round(score, 4),
+                }
+                for mid, score in sorted_cbf[:5]
+            ],
+            elapsed_ms=round(elapsed_ms, 1),
         )
         return {"cbf_scores": cbf_scores}
 
     except Exception as e:
-        logger.error("content_based_filter_error", error=str(e))
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error("content_based_filter_error", error=str(e), error_type=type(e).__name__,
+                      stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1))
         candidates = state.get("candidate_movies", [])
         return {"cbf_scores": {c.id: 0.0 for c in candidates}}
 
@@ -384,6 +426,8 @@ async def hybrid_merger(state: RecommendationEngineState) -> dict:
     Returns:
         dict: hybrid_scores({movie_id: float}) 업데이트
     """
+    # 노드 실행 타이밍 측정 시작
+    node_start = time.perf_counter()
     try:
         cf_scores = state.get("cf_scores", {})
         cbf_scores = state.get("cbf_scores", {})
@@ -449,6 +493,10 @@ async def hybrid_merger(state: RecommendationEngineState) -> dict:
             else:
                 hybrid_scores[mid] = w_cf * cf_val + w_cbf * cbf_val
 
+        # hybrid 점수 상위 5개 영화 상세 로깅
+        sorted_hybrid = sorted(hybrid_scores.items(), key=lambda x: x[1], reverse=True)
+        candidate_title_map = {c.id: c.title for c in candidates}
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
             "hybrid_scores_merged",
             w_cf=w_cf,
@@ -456,11 +504,24 @@ async def hybrid_merger(state: RecommendationEngineState) -> dict:
             history_count=history_count,
             has_emotion=has_emotion,
             cf_is_default=cf_is_default,
+            cbf_all_zero=cbf_all_zero,
+            top_hybrid_scores=[
+                {
+                    "title": candidate_title_map.get(mid, mid),
+                    "hybrid": round(score, 4),
+                    "cf": round(cf_scores.get(mid, 0.0), 4),
+                    "cbf": round(cbf_scores.get(mid, 0.0), 4),
+                }
+                for mid, score in sorted_hybrid[:5]
+            ],
+            elapsed_ms=round(elapsed_ms, 1),
         )
         return {"hybrid_scores": hybrid_scores}
 
     except Exception as e:
-        logger.error("hybrid_merger_error", error=str(e))
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error("hybrid_merger_error", error=str(e), error_type=type(e).__name__,
+                      stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1))
         # fallback: RRF 점수를 hybrid_score로 사용
         candidates = state.get("candidate_movies", [])
         max_rrf = max((c.rrf_score for c in candidates), default=1.0) or 1.0
@@ -497,6 +558,8 @@ async def popularity_fallback(state: RecommendationEngineState) -> dict:
     Returns:
         dict: hybrid_scores({movie_id: float}), cf_scores, cbf_scores 업데이트
     """
+    # 노드 실행 타이밍 측정 시작
+    node_start = time.perf_counter()
     try:
         candidates = state.get("candidate_movies", [])
         preferences = state.get("preferences")
@@ -549,10 +612,12 @@ async def popularity_fallback(state: RecommendationEngineState) -> dict:
         # min-max 정규화
         hybrid_scores = _min_max_normalize(hybrid_scores)
 
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
             "popularity_fallback_calculated",
             candidate_count=len(hybrid_scores),
             pref_genres=list(pref_genres),
+            elapsed_ms=round(elapsed_ms, 1),
         )
         return {
             "hybrid_scores": hybrid_scores,
@@ -562,7 +627,9 @@ async def popularity_fallback(state: RecommendationEngineState) -> dict:
         }
 
     except Exception as e:
-        logger.error("popularity_fallback_error", error=str(e))
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error("popularity_fallback_error", error=str(e), error_type=type(e).__name__,
+                      stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1))
         candidates = state.get("candidate_movies", [])
         return {
             "hybrid_scores": {c.id: c.rrf_score for c in candidates},
@@ -600,6 +667,8 @@ async def diversity_reranker(state: RecommendationEngineState) -> dict:
     Returns:
         dict: candidate_movies(재정렬된 list[CandidateMovie]) 업데이트
     """
+    # 노드 실행 타이밍 측정 시작
+    node_start = time.perf_counter()
     try:
         hybrid_scores = state.get("hybrid_scores", {})
         candidates = state.get("candidate_movies", [])
@@ -650,16 +719,20 @@ async def diversity_reranker(state: RecommendationEngineState) -> dict:
                 selected.append(candidate_map[best_id])
                 remaining.discard(best_id)
 
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
             "diversity_reranked",
             original_count=len(candidates),
             selected_count=len(selected),
             selected_titles=[m.title for m in selected],
+            elapsed_ms=round(elapsed_ms, 1),
         )
         return {"candidate_movies": selected}
 
     except Exception as e:
-        logger.error("diversity_reranker_error", error=str(e))
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error("diversity_reranker_error", error=str(e), error_type=type(e).__name__,
+                      stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1))
         # fallback: hybrid_score 내림차순으로 상위 TOP_K편 선택
         candidates = state.get("candidate_movies", [])
         hybrid_scores = state.get("hybrid_scores", {})
@@ -699,6 +772,8 @@ async def score_finalizer(state: RecommendationEngineState) -> dict:
     Returns:
         dict: ranked_movies(list[RankedMovie]) 업데이트
     """
+    # 노드 실행 타이밍 측정 시작
+    node_start = time.perf_counter()
     try:
         candidates = state.get("candidate_movies", [])
         cf_scores = state.get("cf_scores", {})
@@ -772,16 +847,33 @@ async def score_finalizer(state: RecommendationEngineState) -> dict:
             )
             ranked_movies.append(ranked_movie)
 
+        # 최종 랭킹 전체 영화 상세 로깅
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
             "score_finalized",
             ranked_count=len(ranked_movies),
-            top_title=ranked_movies[0].title if ranked_movies else "",
-            top_hybrid=ranked_movies[0].score_detail.hybrid_score if ranked_movies else 0.0,
+            ranked_details=[
+                {
+                    "rank": m.rank,
+                    "title": m.title,
+                    "genres": m.genres[:3],
+                    "cf_score": round(m.score_detail.cf_score, 4),
+                    "cbf_score": round(m.score_detail.cbf_score, 4),
+                    "hybrid_score": round(m.score_detail.hybrid_score, 4),
+                    "genre_match": round(m.score_detail.genre_match, 4),
+                    "mood_match": round(m.score_detail.mood_match, 4),
+                    "similar_to": m.score_detail.similar_to,
+                }
+                for m in ranked_movies
+            ],
+            elapsed_ms=round(elapsed_ms, 1),
         )
         return {"ranked_movies": ranked_movies}
 
     except Exception as e:
-        logger.error("score_finalizer_error", error=str(e))
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error("score_finalizer_error", error=str(e), error_type=type(e).__name__,
+                      stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1))
         # fallback: CandidateMovie를 RankedMovie로 최소 변환
         candidates = state.get("candidate_movies", [])
         ranked = [

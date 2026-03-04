@@ -176,7 +176,9 @@ def kobis_list_to_movie_document(
         for d in directors_raw
     ]
 
-    # ── 상세 API 보강 데이터 ──
+    # ── 상세 API(searchMovieInfo) 보강 데이터 ──
+    # 목록 API만으로는 배우/런타임/관람등급 정보가 없으므로,
+    # 상세 API 응답(detail_data)이 있을 때만 보강한다.
     cast: list[str] = []
     cast_characters: list[dict] = []
     runtime = 0
@@ -286,6 +288,7 @@ def kobis_list_to_movie_document(
     )
 
     # ── KOBIS 장르 (원본 보존) ──
+    # 상세 API 장르가 있으면 우선 사용, 없으면 목록 API의 genreAlt를 파싱
     kobis_genres = kobis_genres_detail if kobis_genres_detail else (
         [g.strip() for g in genre_alt.split(",") if g.strip()] if genre_alt else []
     )
@@ -385,7 +388,7 @@ def dedup_kobis_movies(
         list[dict]: 중복이 제거된 KOBIS 영화 리스트 (DB에 없는 영화만)
     """
     # ── DB 영화 인덱스 구축 ──
-    # (정규화된_제목, 연도) → True 매핑으로 O(1) 검색
+    # set으로 (정규화된_제목, 연도) 쌍을 저장하여 O(1) 중복 검사 수행
     db_index_kr: set[tuple[str, int]] = set()
     db_index_en: set[tuple[str, int]] = set()
 
@@ -411,7 +414,8 @@ def dedup_kobis_movies(
         db_movies_total=len(db_movies),
     )
 
-    # ── KOBIS 영화 중복 검사 ──
+    # ── KOBIS 영화 3단계 중복 검사 ──
+    # 1단계: ID 기반 제외 → 2단계: 한국어 제목+연도 매칭 → 3단계: 영문 제목+연도 매칭
     exclude = set(str(x) for x in (exclude_ids or set()))
     deduped: list[dict] = []
     id_excluded = 0

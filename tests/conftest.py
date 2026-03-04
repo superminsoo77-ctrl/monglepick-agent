@@ -1,13 +1,16 @@
 """
-테스트 공통 Fixture (Phase 2 LLM 체인 + Phase 3 Chat Agent 테스트용).
+테스트 공통 Fixture (Phase 2 LLM 체인 + Phase 3 Chat Agent + 의도+감정 통합 테스트용).
 
 모든 테스트는 Ollama/DB 서버 없이 mock 기반으로 실행된다.
-ChatOllama, MySQL, hybrid_search를 패치하여 사전 정의된 응답을 반환한다.
+ChatOllama, MySQL, hybrid_search, image_analysis, classify_intent_and_emotion을
+패치하여 사전 정의된 응답을 반환한다.
 
 Fixture 목록:
 - mock_ollama: ChatOllama 패치 (ainvoke가 preset 응답 반환)
 - mock_mysql: aiomysql Pool/Connection/Cursor mock (get_mysql 패치)
 - mock_hybrid_search: hybrid_search 함수 mock (기본 빈 결과)
+- mock_image_analysis: analyze_image 함수 mock (이미지 분석 결과)
+- mock_intent_emotion: classify_intent_and_emotion 함수 mock (통합 의도+감정)
 - sample_preferences: 미리 채워진 ExtractedPreferences
 - sample_candidate_movie: CandidateMovie 인스턴스
 - sample_ranked_movie: RankedMovie 인스턴스
@@ -410,5 +413,215 @@ def mock_redis_cf():
     with patch(
         "monglepick.agents.recommendation.nodes.get_redis",
         return_value=mock_redis,
+    ):
+        yield controller
+
+
+# ============================================================
+# 참조 영화 DB 조회 Mock Fixture
+# ============================================================
+
+@pytest.fixture
+def mock_reference_lookup():
+    """
+    _lookup_reference_movie_info 함수를 mock하여 ES 서버 없이 참조 영화 조회를 테스트한다.
+
+    기본 동작: 인터스텔라의 장르(SF, 드라마, 모험)와 무드태그(웅장, 감동, 몰입) 반환
+
+    사용법:
+        def test_something(mock_reference_lookup):
+            mock_reference_lookup.set_result({"genres": ["로맨스"], "mood_tags": ["로맨틱"]})
+    """
+
+    class MockReferenceLookupController:
+        """Mock 참조 영화 DB 조회 컨트롤러."""
+
+        def __init__(self):
+            # 기본값: 인터스텔라 기준
+            self._result: dict[str, list[str]] = {
+                "genres": ["SF", "드라마", "모험"],
+                "mood_tags": ["웅장", "감동", "몰입"],
+            }
+
+        def set_result(self, result: dict[str, list[str]]):
+            """조회 결과를 설정한다."""
+            self._result = result
+
+        def set_empty(self):
+            """빈 결과를 설정한다 (DB에 영화 없음)."""
+            self._result = {"genres": [], "mood_tags": []}
+
+    controller = MockReferenceLookupController()
+
+    async def mock_lookup(movie_titles: list[str]) -> dict[str, list[str]]:
+        return controller._result
+
+    with patch(
+        "monglepick.agents.chat.nodes._lookup_reference_movie_info",
+        side_effect=mock_lookup,
+    ):
+        yield controller
+
+
+# ============================================================
+# 이미지 분석 Mock Fixture
+# ============================================================
+
+@pytest.fixture
+def mock_image_analysis():
+    """
+    analyze_image 함수를 mock하여 VLM 서버 없이 이미지 분석을 테스트한다.
+
+    기본 동작: SF 장르 + 웅장 무드 + 영화 포스터 분석 결과 반환
+
+    사용법:
+        def test_something(mock_image_analysis):
+            mock_image_analysis.set_result(ImageAnalysisResult(
+                genre_cues=["로맨스"],
+                mood_cues=["로맨틱"],
+                analyzed=True,
+            ))
+    """
+    from monglepick.agents.chat.models import ImageAnalysisResult
+
+    class MockImageAnalysisController:
+        """Mock 이미지 분석 컨트롤러."""
+
+        def __init__(self):
+            # 기본값: SF 영화 포스터 분석 결과
+            self._result = ImageAnalysisResult(
+                genre_cues=["SF", "모험"],
+                mood_cues=["웅장", "몰입"],
+                visual_elements=["우주선", "별", "행성"],
+                search_keywords=["우주", "탐험"],
+                description="우주를 배경으로 한 SF 영화 포스터입니다.",
+                is_movie_poster=True,
+                detected_movie_title="인터스텔라",
+                analyzed=True,
+            )
+
+        def set_result(self, result: ImageAnalysisResult):
+            """분석 결과를 설정한다."""
+            self._result = result
+
+    controller = MockImageAnalysisController()
+
+    async def mock_analyze(*args, **kwargs):
+        return controller._result
+
+    with patch("monglepick.agents.chat.nodes.analyze_image", side_effect=mock_analyze):
+        yield controller
+
+
+# ============================================================
+# 의도+감정 통합 Mock Fixture
+# ============================================================
+
+@pytest.fixture
+def mock_intent_emotion():
+    """
+    classify_intent_and_emotion 함수를 mock하여 Ollama 서버 없이 통합 분류를 테스트한다.
+
+    기본 동작: recommend 의도 + happy 감정 + 유쾌 무드 태그
+
+    사용법:
+        def test_something(mock_intent_emotion):
+            from monglepick.agents.chat.models import IntentEmotionResult
+            mock_intent_emotion.set_result(IntentEmotionResult(
+                intent="general", confidence=0.8,
+                emotion=None, mood_tags=[],
+            ))
+    """
+    from monglepick.agents.chat.models import IntentEmotionResult
+
+    class MockIntentEmotionController:
+        """Mock 의도+감정 통합 컨트롤러."""
+
+        def __init__(self):
+            # 기본값: 추천 의도 + happy 감정
+            self._result = IntentEmotionResult(
+                intent="recommend",
+                confidence=0.9,
+                emotion="happy",
+                mood_tags=["유쾌", "따뜻"],
+            )
+
+        def set_result(self, result: IntentEmotionResult):
+            """분류 결과를 설정한다."""
+            self._result = result
+
+    controller = MockIntentEmotionController()
+
+    async def mock_classify(*args, **kwargs):
+        return controller._result
+
+    with patch(
+        "monglepick.agents.chat.nodes.classify_intent_and_emotion",
+        side_effect=mock_classify,
+    ):
+        yield controller
+
+
+# ============================================================
+# 세션 저장소 Mock Fixture
+# ============================================================
+
+@pytest.fixture
+def mock_session_store():
+    """
+    Redis 세션 저장소를 mock하여 Redis 서버 없이 세션 영속화를 테스트한다.
+
+    기본 동작:
+    - load_session() → None (신규 세션)
+    - save_session() → no-op
+
+    사용법:
+        def test_something(mock_session_store):
+            mock_session_store.set_session({
+                "messages": [{"role": "user", "content": "안녕"}],
+                "preferences": None,
+                "emotion": None,
+                "turn_count": 1,
+                "user_profile": {},
+                "watch_history": [],
+            })
+    """
+
+    class MockSessionStoreController:
+        """Mock 세션 저장소 컨트롤러."""
+
+        def __init__(self):
+            self._session_data: dict | None = None
+            self._saved_sessions: dict[str, dict] = {}
+
+        def set_session(self, data: dict | None):
+            """세션 로드 시 반환할 데이터를 설정한다."""
+            self._session_data = data
+
+        def get_saved(self, session_id: str) -> dict | None:
+            """저장된 세션 데이터를 조회한다 (테스트 검증용)."""
+            return self._saved_sessions.get(session_id)
+
+    controller = MockSessionStoreController()
+
+    async def mock_load(session_id: str):
+        return controller._session_data
+
+    async def mock_save(session_id: str, state: dict):
+        # Pydantic 모델을 dict로 변환하여 저장
+        save_data = {}
+        for key, val in state.items():
+            if hasattr(val, "model_dump"):
+                save_data[key] = val.model_dump()
+            else:
+                save_data[key] = val
+        controller._saved_sessions[session_id] = save_data
+
+    with patch(
+        "monglepick.agents.chat.graph.load_session",
+        side_effect=mock_load,
+    ), patch(
+        "monglepick.agents.chat.graph.save_session",
+        side_effect=mock_save,
     ):
         yield controller

@@ -49,7 +49,15 @@ _upsert_semaphore = asyncio.Semaphore(4)
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=4))
 async def _upsert_batch(points: list[PointStruct]) -> None:
-    """단일 배치를 Qdrant에 upsert한다. 최대 3회 재시도."""
+    """
+    단일 배치를 Qdrant에 upsert한다.
+
+    Semaphore(4)로 동시 upsert를 제한하고, 실패 시 지수 백오프로 최대 3회 재시도한다.
+    wait=True 옵션으로 서버 측 인덱싱 완료를 보장한다.
+
+    Args:
+        points: upsert할 PointStruct 리스트 (최대 100건)
+    """
     async with _upsert_semaphore:
         client = await get_qdrant()
         await client.upsert(
@@ -60,7 +68,19 @@ async def _upsert_batch(points: list[PointStruct]) -> None:
 
 
 def _movie_to_point(doc: MovieDocument, vector: np.ndarray) -> PointStruct:
-    """MovieDocument + 임베딩 벡터를 Qdrant PointStruct로 변환한다."""
+    """
+    MovieDocument + 임베딩 벡터를 Qdrant PointStruct로 변환한다.
+
+    payload에 모든 메타데이터 필드를 포함하여 Qdrant에서 직접 필터/조회가 가능하도록 한다.
+    Qdrant payload 인덱스 대상 필드는 db/clients.py에서 설정한다.
+
+    Args:
+        doc: 영화 문서 모델
+        vector: 임베딩 벡터 (4096차원)
+
+    Returns:
+        Qdrant에 적재할 PointStruct
+    """
     return PointStruct(
         id=_to_point_id(doc.id),  # TMDB ID → int, KOBIS 코드 → uuid5
         vector=vector.tolist(),
@@ -190,7 +210,7 @@ async def load_to_qdrant(
         for i, doc in enumerate(documents)
     ]
 
-    # 배치 분할 및 병렬 upsert
+    # 배치 분할 후 Semaphore(4)로 병렬 upsert 실행
     tasks = []
     for i in range(0, len(points), batch_size):
         batch = points[i : i + batch_size]

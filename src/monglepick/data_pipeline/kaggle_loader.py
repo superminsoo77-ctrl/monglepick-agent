@@ -39,9 +39,14 @@ class KaggleLoader:
     """
 
     def __init__(self, data_dir: str | Path = DEFAULT_DATA_DIR) -> None:
+        """
+        Args:
+            data_dir: Kaggle CSV 파일들이 위치한 디렉토리 경로
+        """
         self.data_dir = Path(data_dir)
 
     def _path(self, filename: str) -> Path:
+        """데이터 디렉토리 내 파일의 전체 경로를 반환한다."""
         return self.data_dir / filename
 
     # ── links.csv: ID 매핑 테이블 ──
@@ -312,18 +317,26 @@ class KaggleLoader:
         cast JSON에서 상위 N명 배우의 상세 정보를 추출한다.
 
         Phase C 확장: id, profile_path, gender 추가.
+        Kaggle 데이터에는 popularity/original_name이 없으므로 기본값으로 채운다.
+
+        Args:
+            cast_str: JSON/Python 리터럴 형태의 cast 문자열
+            top_n: 추출할 최대 배우 수 (기본 5)
+
+        Returns:
+            배우 상세 정보 딕셔너리 리스트
         """
         cast = KaggleLoader._parse_json_column(cast_str)
         return [
             {
-                "id": p.get("id", 0),  # Phase C: TMDB person ID
+                "id": p.get("id", 0),
                 "name": p.get("name", ""),
                 "character": p.get("character", ""),
-                "profile_path": p.get("profile_path") or "",  # Phase C: 프로필 사진
-                "gender": p.get("gender", 0),  # Phase C: 성별
+                "profile_path": p.get("profile_path") or "",
+                "gender": p.get("gender", 0),
                 "popularity": 0.0,  # Kaggle에는 인기도 없음
                 "original_name": "",  # Kaggle에는 원어 이름 없음
-                "order": p.get("order", i),  # Phase C: 빌링 순서
+                "order": p.get("order", i),
             }
             for i, p in enumerate(cast[:top_n])
             if p.get("name")
@@ -331,7 +344,16 @@ class KaggleLoader:
 
     @staticmethod
     def _extract_crew_by_job(crew_str: str, job: str) -> str:
-        """crew JSON에서 특정 job의 첫 번째 사람 이름을 추출한다."""
+        """
+        crew JSON에서 특정 job의 첫 번째 사람 이름을 추출한다.
+
+        Args:
+            crew_str: JSON/Python 리터럴 형태의 crew 문자열
+            job: 추출할 직군명 (예: "Director of Photography")
+
+        Returns:
+            매칭된 사람 이름 또는 빈 문자열
+        """
         crew = KaggleLoader._parse_json_column(crew_str)
         for person in crew:
             if person.get("job") == job:
@@ -340,7 +362,16 @@ class KaggleLoader:
 
     @staticmethod
     def _extract_crew_list_by_jobs(crew_str: str, jobs: list[str]) -> list[str]:
-        """crew JSON에서 특정 job 목록에 해당하는 모든 사람 이름을 추출한다."""
+        """
+        crew JSON에서 특정 job 목록에 해당하는 모든 사람 이름을 추출한다.
+
+        Args:
+            crew_str: JSON/Python 리터럴 형태의 crew 문자열
+            jobs: 추출할 직군명 리스트 (예: ["Screenplay", "Writer"])
+
+        Returns:
+            중복 제거된 이름 리스트
+        """
         crew = KaggleLoader._parse_json_column(crew_str)
         names: list[str] = []
         for person in crew:
@@ -352,7 +383,16 @@ class KaggleLoader:
 
     @staticmethod
     def _extract_crew_by_jobs(crew_str: str, jobs: list[str]) -> str:
-        """crew JSON에서 특정 job 목록 중 첫 번째 매칭하는 사람 이름을 추출한다."""
+        """
+        crew JSON에서 특정 job 목록 중 첫 번째 매칭하는 사람 이름을 추출한다.
+
+        Args:
+            crew_str: JSON/Python 리터럴 형태의 crew 문자열
+            jobs: 우선순위별 직군명 리스트 (예: ["Costume Design", "Costume Designer"])
+
+        Returns:
+            첫 번째 매칭된 사람 이름 또는 빈 문자열
+        """
         crew = KaggleLoader._parse_json_column(crew_str)
         for person in crew:
             if person.get("job") in jobs and person.get("name"):
@@ -361,7 +401,16 @@ class KaggleLoader:
 
     @staticmethod
     def _extract_director_details(crew_str: str) -> dict:
-        """crew JSON에서 감독의 상세 정보 (id, profile_path)를 추출한다."""
+        """
+        crew JSON에서 감독의 상세 정보를 추출한다.
+
+        Args:
+            crew_str: JSON/Python 리터럴 형태의 crew 문자열
+
+        Returns:
+            {"id": int, "profile_path": str, "original_name": str}
+            (Kaggle에는 original_name이 없으므로 빈 문자열)
+        """
         crew = KaggleLoader._parse_json_column(crew_str)
         for person in crew:
             if person.get("job") == "Director":
@@ -374,7 +423,17 @@ class KaggleLoader:
 
     @staticmethod
     def _parse_json_single(value: str) -> dict | None:
-        """문자열로 저장된 단일 JSON 객체를 파싱한다 (belongs_to_collection용)."""
+        """
+        문자열로 저장된 단일 JSON 객체를 파싱한다.
+
+        belongs_to_collection 컬럼 전용. json.loads 실패 시 ast.literal_eval로 재시도한다.
+
+        Args:
+            value: JSON/Python 리터럴 형태의 문자열
+
+        Returns:
+            파싱된 딕셔너리 또는 None (파싱 실패 시)
+        """
         if pd.isna(value) or not value:
             return None
         try:

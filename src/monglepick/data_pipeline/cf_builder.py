@@ -62,14 +62,15 @@ async def build_cf_matrix(
     """
     logger.info("cf_matrix_build_started", ratings_count=len(ratings_df))
 
-    # 유저/영화 인덱스 매핑 생성
+    # 유저/영화를 연속 정수 인덱스로 매핑 (스파스 매트릭스 좌표용)
     user_ids = ratings_df["userId"].unique()
     movie_ids = ratings_df["tmdbId"].unique()
 
     user_to_idx = {uid: idx for idx, uid in enumerate(user_ids)}
     movie_to_idx = {mid: idx for idx, mid in enumerate(movie_ids)}
 
-    # §11-7-3 [2]: 스파스 매트릭스 구축
+    # §11-7-3 [2]: CSR(Compressed Sparse Row) 매트릭스 구축
+    # (user_idx, movie_idx) → rating 형태의 희소 행렬
     row = ratings_df["userId"].map(user_to_idx).values
     col = ratings_df["tmdbId"].map(movie_to_idx).values
     data = ratings_df["rating"].values
@@ -82,7 +83,8 @@ async def build_cf_matrix(
     logger.info("cf_sparse_matrix_built", shape=matrix.shape, nnz=matrix.nnz)
 
     # §11-7-3 [3]: 유저별 코사인 유사도 계산
-    # 메모리 절약을 위해 청크 단위로 계산
+    # 전체 유저를 한번에 계산하면 O(N^2) 메모리가 필요하므로
+    # 1,000명 단위 청크로 분할하여 메모리 사용량을 제한한다.
     similar_users: dict[int, list[tuple[int, float]]] = {}
     chunk_size = 1000
 
@@ -90,22 +92,22 @@ async def build_cf_matrix(
         end = min(start + chunk_size, len(user_ids))
         chunk_matrix = matrix[start:end]
 
-        # 해당 청크의 유저 vs 전체 유저 유사도 계산
+        # 청크 유저(1,000명) × 전체 유저(270K명) 코사인 유사도 행렬 계산
         sim = cosine_similarity(chunk_matrix, matrix)
 
         for local_idx in range(end - start):
             global_idx = start + local_idx
             uid = int(user_ids[global_idx])
 
-            # 자기 자신 제외, Top-K 추출
             sim_scores = sim[local_idx]
-            sim_scores[global_idx] = -1  # 자기 자신 제외
+            sim_scores[global_idx] = -1  # 자기 자신과의 유사도를 -1로 설정하여 제외
 
+            # 유사도 상위 Top-K 유저 인덱스를 내림차순으로 추출
             top_indices = np.argsort(sim_scores)[-top_k:][::-1]
             top_users = [
                 (int(user_ids[idx]), float(sim_scores[idx]))
                 for idx in top_indices
-                if sim_scores[idx] > 0
+                if sim_scores[idx] > 0  # 유사도 0 이하인 유저는 제외
             ]
 
             similar_users[uid] = top_users
@@ -113,7 +115,7 @@ async def build_cf_matrix(
         if (end) % 10000 == 0 or end == len(user_ids):
             logger.info("cf_similarity_progress", completed=end, total=len(user_ids))
 
-    # 유저별 평점 딕셔너리
+    # 유저별 평점 딕셔너리: CF 예측 시 유사 유저의 실제 평점을 조회하는 데 사용
     user_ratings: dict[int, dict[int, float]] = {}
     for _, row_data in ratings_df.iterrows():
         uid = int(row_data["userId"])
@@ -123,7 +125,7 @@ async def build_cf_matrix(
             user_ratings[uid] = {}
         user_ratings[uid][mid] = rating
 
-    # 영화별 평균 평점
+    # 영화별 평균 평점: Cold Start 유저에게 인기 영화 추천 시 사용
     movie_avg_ratings: dict[int, float] = (
         ratings_df.groupby("tmdbId")["rating"]
         .mean()
@@ -159,19 +161,20 @@ async def cache_cf_to_redis(
 
     logger.info("cf_redis_cache_started")
 
-    # 배치 크기 (메모리 안전을 위해 분할 실행)
+    # Redis pipeline은 커맨드를 모아서 한번에 전송하므로 네트워크 왕복을 줄인다.
+    # 270K 유저를 한 pipeline에 넣으면 Redis OOM이 발생하므로 5,000건씩 분할한다.
     batch_size = 5000
 
-    # 1. 유사 유저 Sorted Set (배치 분할)
+    # 1. 유사 유저 Sorted Set 캐싱
+    # 각 유저에 대해 Top-50 유사 유저를 Sorted Set으로 저장 (score=유사도)
     user_items = list(similar_users.items())
     for i in range(0, len(user_items), batch_size):
         batch = user_items[i : i + batch_size]
         pipe = redis.pipeline()
         for uid, sim_list in batch:
             key = KEY_SIMILAR_USERS.format(user_id=uid)
-            pipe.delete(key)
+            pipe.delete(key)  # 기존 데이터 삭제 후 재적재 (갱신 보장)
             if sim_list:
-                # zadd: {member: score} 형식
                 mapping = {str(sim_uid): score for sim_uid, score in sim_list}
                 pipe.zadd(key, mapping)
                 pipe.expire(key, CF_TTL_SECONDS)
@@ -179,7 +182,8 @@ async def cache_cf_to_redis(
 
     logger.info("cf_similar_users_cached", count=len(similar_users))
 
-    # 2. 유저별 평점 Hash (배치 분할)
+    # 2. 유저별 평점 Hash 캐싱
+    # Hash 구조: {movie_id: rating} — CF 점수 계산 시 유사 유저의 평점 조회에 사용
     rating_items = list(user_ratings.items())
     for i in range(0, len(rating_items), batch_size):
         batch = rating_items[i : i + batch_size]
@@ -195,7 +199,7 @@ async def cache_cf_to_redis(
 
     logger.info("cf_user_ratings_cached", count=len(user_ratings))
 
-    # 3. 영화 평균 평점 String
+    # 3. 영화 평균 평점 String 캐싱 (Cold Start 추천 시 인기도 지표로 활용)
     pipe = redis.pipeline()
     for mid, avg in movie_avg_ratings.items():
         key = KEY_MOVIE_AVG_RATING.format(movie_id=mid)

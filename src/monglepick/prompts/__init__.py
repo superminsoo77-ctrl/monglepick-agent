@@ -29,6 +29,14 @@ from monglepick.prompts.question import (
     QUESTION_HUMAN_PROMPT,
     QUESTION_SYSTEM_PROMPT,
 )
+from monglepick.prompts.image_analysis import (
+    IMAGE_ANALYSIS_HUMAN_PROMPT,
+    IMAGE_ANALYSIS_SYSTEM_PROMPT,
+)
+from monglepick.prompts.intent_emotion import (
+    INTENT_EMOTION_HUMAN_PROMPT,
+    INTENT_EMOTION_SYSTEM_PROMPT,
+)
 from monglepick.prompts.tool_executor import TOOL_EXECUTOR_SYSTEM_PROMPT
 
 __all__ = [
@@ -51,6 +59,12 @@ __all__ = [
     # 추천 이유
     "EXPLANATION_SYSTEM_PROMPT",
     "EXPLANATION_HUMAN_PROMPT",
+    # 이미지 분석
+    "IMAGE_ANALYSIS_SYSTEM_PROMPT",
+    "IMAGE_ANALYSIS_HUMAN_PROMPT",
+    # 의도+감정 통합
+    "INTENT_EMOTION_SYSTEM_PROMPT",
+    "INTENT_EMOTION_HUMAN_PROMPT",
     # 도구 실행
     "TOOL_EXECUTOR_SYSTEM_PROMPT",
 ]
