@@ -118,12 +118,12 @@ async def test_insufficient_prefs_generate_question(mock_ollama):
 
 
 def test_turn_count_override():
-    """선호 비어있어도 turn_count≥3 → is_sufficient=True."""
+    """선호 비어있어도 turn_count≥2 → is_sufficient=True (TURN_COUNT_OVERRIDE=2)."""
     prefs = ExtractedPreferences()  # 모두 None
-    # turn_count=2 → 아직 부족
-    assert is_sufficient(prefs, turn_count=2) is False
-    # turn_count=3 → 오버라이드
-    assert is_sufficient(prefs, turn_count=3) is True
+    # turn_count=1 → 아직 부족
+    assert is_sufficient(prefs, turn_count=1) is False
+    # turn_count=2 → 오버라이드 (2턴째부터 추천 진행)
+    assert is_sufficient(prefs, turn_count=2) is True
 
 
 # ============================================================

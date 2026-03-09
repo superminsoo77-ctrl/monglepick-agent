@@ -47,6 +47,70 @@ TMDB_CACHE_DIR = Path("data/tmdb")
 TMDB_RAW_CACHE = TMDB_CACHE_DIR / "tmdb_raw_movies.json"
 
 
+# ── Phase D: TMDB 전체 수집 JSONL 파일 경로 ──
+# collect_full_details_with_checkpoint()가 생성하는 JSONL 파일
+TMDB_FULL_JSONL = Path("data/tmdb_full/tmdb_full_movies.jsonl")
+
+
+def load_tmdb_jsonl(jsonl_path: Path | None = None) -> list[TMDBRawMovie] | None:
+    """
+    TMDB 전체 수집 JSONL 파일에서 TMDBRawMovie 리스트를 로드한다.
+
+    Phase D collect_full_details_with_checkpoint()가 생성한 JSONL 파일을 읽어
+    기존 파이프라인(전처리 → 임베딩 → 적재)에 연동한다.
+    각 라인이 하나의 TMDBRawMovie JSON이며, 메모리 효율적으로 한 줄씩 파싱한다.
+
+    Args:
+        jsonl_path: JSONL 파일 경로 (None이면 기본 경로 사용)
+
+    Returns:
+        TMDBRawMovie 리스트 또는 None (파일 없음/오류 시)
+    """
+    path = jsonl_path or TMDB_FULL_JSONL
+    if not path.exists():
+        logger.warning("tmdb_jsonl_not_found", path=str(path))
+        return None
+
+    try:
+        raw_movies: list[TMDBRawMovie] = []
+        parse_errors = 0
+        with open(path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    # 하위 호환: recommendations가 list[int]인 경우 list[dict]로 변환
+                    recs = data.get("recommendations", [])
+                    if recs and isinstance(recs[0], int):
+                        data["recommendations"] = [{"id": r} for r in recs]
+                    # 삭제된 필드 제거 (기존 캐시/JSONL에 남아있을 수 있음)
+                    data.pop("recommendation_ids_raw", None)
+                    data.pop("similar_movies_full", None)
+                    data.pop("changes", None)
+                    raw_movies.append(TMDBRawMovie(**data))
+                except (json.JSONDecodeError, Exception) as e:
+                    parse_errors += 1
+                    if parse_errors <= 10:  # 처음 10개만 로그
+                        logger.warning(
+                            "tmdb_jsonl_parse_error",
+                            line_no=line_no,
+                            error=str(e),
+                        )
+
+        logger.info(
+            "tmdb_jsonl_loaded",
+            path=str(path),
+            count=len(raw_movies),
+            parse_errors=parse_errors,
+        )
+        return raw_movies
+    except Exception as e:
+        logger.warning("tmdb_jsonl_load_failed", path=str(path), error=str(e))
+        return None
+
+
 def _load_state() -> PipelineState:
     """
     파이프라인 진행 상태를 JSON 파일에서 로드한다.
@@ -120,7 +184,17 @@ def load_tmdb_cache() -> list[TMDBRawMovie] | None:
     try:
         with open(TMDB_RAW_CACHE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        raw_movies = [TMDBRawMovie(**item) for item in data]
+        raw_movies: list[TMDBRawMovie] = []
+        for item in data:
+            # 하위 호환: 기존 캐시의 recommendations가 list[int]인 경우 list[dict]로 변환
+            recs = item.get("recommendations", [])
+            if recs and isinstance(recs[0], int):
+                item["recommendations"] = [{"id": r} for r in recs]
+            # 삭제된 필드 제거 (기존 캐시에 남아있을 수 있음)
+            item.pop("recommendation_ids_raw", None)
+            item.pop("similar_movies_full", None)
+            item.pop("changes", None)
+            raw_movies.append(TMDBRawMovie(**item))
         logger.info(
             "tmdb_cache_loaded",
             path=str(TMDB_RAW_CACHE),
@@ -138,13 +212,15 @@ async def run_full_pipeline(
     kaggle_data_dir: str = "data/kaggle_movies",
     embedding_batch_size: int = 32,
     use_cache: bool = False,
+    use_jsonl: bool = False,
+    jsonl_path: str | None = None,
 ) -> None:
     """
     전체 데이터 파이프라인을 실행한다.
 
     §11-1 전체 흐름:
     1. DB 클라이언트 초기화 (Qdrant 컬렉션, Neo4j 인덱스, ES 인덱스)
-    2. TMDB 수집 (10,000편 영화 ID + 상세/OTT) — 캐시 사용 가능
+    2. TMDB 수집 (10,000편 영화 ID + 상세/OTT) — 캐시/JSONL 사용 가능
     3. 전처리 (장르 변환, 무드태그 생성, 임베딩 텍스트 구성)
     4. 임베딩 (multilingual-e5-large, 1024차원)
     5. 적재 (Qdrant, Neo4j, Elasticsearch 동시)
@@ -156,6 +232,8 @@ async def run_full_pipeline(
         kaggle_data_dir: Kaggle 데이터 디렉토리 경로
         embedding_batch_size: 임베딩 배치 크기 (CPU: 32, GPU: 128)
         use_cache: True이면 TMDB API 대신 캐시 파일에서 로드 (data/tmdb/tmdb_raw_movies.json)
+        use_jsonl: True이면 Phase D 전체 수집 JSONL 파일에서 로드 (data/tmdb_full/tmdb_full_movies.jsonl)
+        jsonl_path: JSONL 파일 경로 (None이면 기본 경로 사용, use_jsonl=True일 때만 유효)
     """
     state = _load_state()
 
@@ -169,8 +247,14 @@ async def run_full_pipeline(
         raw_movies: list[TMDBRawMovie] | None = None
 
         if not skip_collect:
+            # use_jsonl=True: Phase D 전체 수집 JSONL에서 로드 (최우선)
+            if use_jsonl:
+                logger.info("pipeline_step_1_tmdb_load_from_jsonl")
+                jsonl_file = Path(jsonl_path) if jsonl_path else None
+                raw_movies = load_tmdb_jsonl(jsonl_file)
+
             # use_cache=True: 캐시 파일에서 로드 시도 → 실패 시 API 수집 fallback
-            if use_cache:
+            elif use_cache:
                 logger.info("pipeline_step_1_tmdb_load_from_cache")
                 raw_movies = load_tmdb_cache()
 

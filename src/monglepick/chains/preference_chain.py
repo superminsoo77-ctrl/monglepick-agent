@@ -25,7 +25,7 @@ from monglepick.agents.chat.models import (
     merge_preferences,
 )
 from monglepick.config import settings
-from monglepick.llm.factory import get_preference_llm
+from monglepick.llm.factory import get_preference_llm, guarded_ainvoke
 from monglepick.prompts.preference import (
     PREFERENCE_HUMAN_PROMPT,
     PREFERENCE_SYSTEM_PROMPT,
@@ -124,7 +124,10 @@ async def extract_preferences(
             prompt_text=str(prompt_value),
             model=settings.PREFERENCE_MODEL,
         )
-        extracted: ExtractedPreferences = await llm.ainvoke(prompt_value)
+        # 모델별 세마포어로 동시 호출 제한 (Ollama 큐 점유 방지)
+        extracted: ExtractedPreferences = await guarded_ainvoke(
+            llm, prompt_value, model=settings.PREFERENCE_MODEL,
+        )
 
         # LLM 응답 시간 계산 (밀리초 단위)
         elapsed_ms = (time.perf_counter() - llm_start) * 1000

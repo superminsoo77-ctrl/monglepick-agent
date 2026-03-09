@@ -13,7 +13,6 @@ EXAONE 32B (자유 텍스트)로 실행한다.
 
 from __future__ import annotations
 
-import asyncio
 import time
 import traceback
 
@@ -27,7 +26,7 @@ from monglepick.agents.chat.models import (
     ScoreDetail,
 )
 from monglepick.config import settings
-from monglepick.llm.factory import get_explanation_llm
+from monglepick.llm.factory import get_explanation_llm, guarded_ainvoke
 from monglepick.prompts.explanation import (
     EXPLANATION_HUMAN_PROMPT,
     EXPLANATION_SYSTEM_PROMPT,
@@ -177,7 +176,10 @@ async def generate_explanation(
             prompt_text=str(prompt_value),
             model=settings.EXPLANATION_MODEL,
         )
-        response = await llm.ainvoke(prompt_value)
+        # 모델별 세마포어로 동시 호출 제한 (Ollama 큐 점유 방지)
+        response = await guarded_ainvoke(
+            llm, prompt_value, model=settings.EXPLANATION_MODEL,
+        )
         elapsed_ms = (time.perf_counter() - llm_start) * 1000
 
         # LangChain BaseMessage → 문자열 추출
@@ -217,9 +219,14 @@ async def generate_explanations_batch(
     watch_history_titles: list[str] | None = None,
 ) -> list[str]:
     """
-    여러 영화에 대해 추천 이유를 병렬로 생성한다.
+    여러 영화에 대해 추천 이유를 순차 생성한다.
 
-    asyncio.gather로 3~5편을 동시에 생성하여 응답 시간을 단축한다.
+    Ollama는 GPU 추론을 모델당 직렬 처리하므로, asyncio.gather 병렬 호출은
+    Ollama 큐만 점유하고 실질적 병렬성은 없다. 따라서 순차 실행으로 변경하여
+    다른 요청이 Ollama에 접근할 수 있도록 공정하게 배분한다.
+
+    MAX_EXPLANATION_MOVIES(기본 3)편까지만 LLM으로 생성하고,
+    초과 영화는 _build_fallback_explanation() 템플릿을 사용한다.
 
     Args:
         movies: 추천 영화 목록 (3~5편)
@@ -232,51 +239,59 @@ async def generate_explanations_batch(
     """
     # 배치 전체 소요시간 측정 시작
     batch_start = time.perf_counter()
+    max_llm = settings.MAX_EXPLANATION_MOVIES
 
-    # 각 영화의 score_detail 추출 (RankedMovie만 해당)
-    tasks = []
-    for movie in movies:
+    explanations: list[str] = []
+
+    for i, movie in enumerate(movies):
+        movie_dict = _movie_to_dict(movie)
+
+        # MAX_EXPLANATION_MOVIES 초과 → 템플릿 fallback (LLM 호출 생략)
+        if i >= max_llm:
+            logger.info(
+                "explanation_fallback_over_limit",
+                title=movie_dict.get("title", ""),
+                index=i,
+                max_llm=max_llm,
+            )
+            explanations.append(_build_fallback_explanation(movie_dict))
+            continue
+
+        # score_detail 추출 (RankedMovie만 해당)
         score_detail = None
         if isinstance(movie, RankedMovie):
             score_detail = movie.score_detail
         elif isinstance(movie, dict) and "score_detail" in movie:
             score_detail = movie["score_detail"]
 
-        tasks.append(
-            generate_explanation(
+        # 순차 LLM 호출 (세마포어는 generate_explanation 내부에서 적용)
+        try:
+            explanation = await generate_explanation(
                 movie=movie,
                 emotion=emotion,
                 preferences=preferences,
                 watch_history_titles=watch_history_titles,
                 score_detail=score_detail,
             )
-        )
+            explanations.append(explanation)
+        except Exception as e:
+            logger.error(
+                "batch_explanation_error",
+                title=movie_dict.get("title", ""),
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            explanations.append(_build_fallback_explanation(movie_dict))
 
-    # 병렬 실행
-    results = await asyncio.gather(*tasks, return_exceptions=True)
     batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000
 
     logger.info(
         "explanations_batch_completed",
         movie_count=len(movies),
+        llm_count=min(len(movies), max_llm),
+        fallback_count=max(0, len(movies) - max_llm),
         elapsed_ms=round(batch_elapsed_ms, 1),
         model=settings.EXPLANATION_MODEL,
     )
-
-    # 예외 → fallback 변환
-    explanations = []
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            movie_dict = _movie_to_dict(movies[i])
-            logger.error(
-                "batch_explanation_error",
-                title=movie_dict.get("title", ""),
-                error=str(result),
-                error_type=type(result).__name__,
-                stack_trace=str(result),
-            )
-            explanations.append(_build_fallback_explanation(movie_dict))
-        else:
-            explanations.append(result)
 
     return explanations

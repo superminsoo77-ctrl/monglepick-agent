@@ -62,3 +62,12 @@ coverage.xml
 .ipynb_checkpoints/
 
 scripts/
+
+*.xlsx
+*.csv
+*.tsv
+*.parquet
+*.pickle
+*.pkl
+
+*.md

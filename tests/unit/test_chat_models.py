@@ -237,34 +237,34 @@ class TestIsSufficient:
     """추천 진행 가능 여부 판정 테스트."""
 
     def test_sufficient_by_score(self):
-        """가중치 합산 >= 3.0이면 충분."""
+        """가중치 합산 >= 2.5이면 충분."""
         prefs = ExtractedPreferences(genre_preference="SF", mood="웅장한")
-        # 4.0 >= 3.0 → True
+        # 4.0 >= 2.5 → True
         assert is_sufficient(prefs) is True
 
     def test_insufficient_by_score(self):
-        """가중치 합산 < 3.0이면 불충분."""
+        """가중치 합산 < 2.5이면 불충분."""
         prefs = ExtractedPreferences(genre_preference="SF")
-        # 2.0 < 3.0 → False
+        # 2.0 < 2.5 → False
         assert is_sufficient(prefs) is False
 
     def test_turn_count_override(self):
-        """turn_count >= 3이면 선호 부족해도 충분."""
+        """turn_count >= 2이면 선호 부족해도 충분 (TURN_COUNT_OVERRIDE=2)."""
         prefs = ExtractedPreferences()  # 0.0
-        assert is_sufficient(prefs, turn_count=3) is True
+        assert is_sufficient(prefs, turn_count=2) is True
         assert is_sufficient(prefs, turn_count=5) is True
 
     def test_turn_count_below_threshold(self):
-        """turn_count < 3이고 점수 부족이면 불충분."""
+        """turn_count < 2이고 점수 부족이면 불충분."""
         prefs = ExtractedPreferences()
-        assert is_sufficient(prefs, turn_count=2) is False
+        assert is_sufficient(prefs, turn_count=1) is False
 
     def test_emotion_contributes_to_sufficiency(self):
         """감정이 감지되면 mood 가중치가 추가되어 충분해질 수 있다."""
         prefs = ExtractedPreferences(genre_preference="SF")
-        # 2.0 < 3.0 → False (emotion 없이)
+        # 2.0 < 2.5 → False (emotion 없이)
         assert is_sufficient(prefs) is False
-        # 2.0 + 2.0(emotion→mood) = 4.0 >= 3.0 → True
+        # 2.0 + 2.0(emotion→mood) = 4.0 >= 2.5 → True
         assert is_sufficient(prefs, has_emotion=True) is True
 
 

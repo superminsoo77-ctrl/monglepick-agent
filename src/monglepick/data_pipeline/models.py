@@ -219,6 +219,23 @@ class MovieDocument(BaseModel):
     kobis_open_dt: str = Field(default="", description="KOBIS 개봉일 (YYYYMMDD)")
     kobis_type_nm: str = Field(default="", description="KOBIS 영화 유형 (예: '장편', '단편', '애니메이션')")
 
+    # ── Phase D: TMDB 전체 수집 보강 필드 ──
+    # translations에서 추출한 다국어 줄거리 (overview 빈값 보강용)
+    overview_en: str = Field(default="", description="영문 줄거리 (translations에서 추출)")
+    overview_ja: str = Field(default="", description="일본어 줄거리 (translations에서 추출)")
+    # 외부 서비스 ID (소셜 미디어 연동, 외부 DB 크로스레퍼런스)
+    facebook_id: str = Field(default="", description="Facebook 페이지 ID")
+    instagram_id: str = Field(default="", description="Instagram 계정 ID")
+    twitter_id: str = Field(default="", description="Twitter/X 계정 ID")
+    wikidata_id: str = Field(default="", description="Wikidata 항목 ID (예: 'Q12345')")
+    # TMDB 사용자 리스트 포함 수 (인기도 보조 지표)
+    tmdb_list_count: int = Field(default=0, description="이 영화가 포함된 TMDB 사용자 리스트 수")
+    # 로고 이미지 (UI 표시용)
+    images_logos: list[str] = Field(
+        default_factory=list,
+        description="로고 이미지 경로 목록",
+    )
+
     # ── 데이터 출처 추적 ──
     source: str = Field(default="tmdb", description="데이터 출처 ('tmdb', 'kobis', 'kaggle', 'kmdb', 'merged')")
 
@@ -241,6 +258,8 @@ class TMDBRawMovie(BaseModel):
     popularity: float = 0.0
     poster_path: str | None = None
     runtime: int | None = None
+    # Phase D: video 플래그 (TMDB 기본 상세에 포함, 비극장 개봉 콘텐츠 식별)
+    video: bool = False
 
     # 장르 (TMDB genre 객체 배열)
     genres: list[dict] = Field(default_factory=list, description="[{'id': 28, 'name': 'Action'}, ...]")
@@ -255,9 +274,10 @@ class TMDBRawMovie(BaseModel):
     watch_providers: dict = Field(default_factory=dict, description="{'KR': {'flatrate': [...]}}")
 
     # ── Phase A: TMDB append_to_response 보강 필드 ──
+    # Phase D: reviews 전체 dict 저장 (기존 3개 필드만 → 원본 응답 전체 보존)
     reviews: list[dict] = Field(
         default_factory=list,
-        description="[{'author': '...', 'content': '...', 'rating': 8.0}]",
+        description="리뷰 원본 전체 [{'author': '...', 'content': '...', 'author_details': {...}, 'created_at': '...', 'updated_at': '...', 'url': '...', 'id': '...'}]",
     )
     videos: list[dict] = Field(
         default_factory=list,
@@ -265,7 +285,7 @@ class TMDBRawMovie(BaseModel):
     )
     similar_movie_ids: list[int] = Field(
         default_factory=list,
-        description="TMDB 유사 영화 ID 목록",
+        description="TMDB 유사 영화 ID 목록 (하위 호환용)",
     )
     release_dates: list[dict] = Field(
         default_factory=list,
@@ -308,13 +328,31 @@ class TMDBRawMovie(BaseModel):
         default_factory=list,
         description="대체 제목 [{'iso_3166_1': 'KR', 'title': '겨울왕국', 'type': ''}, ...]",
     )
-    recommendations: list[int] = Field(
+    # Phase D: recommendations 전체 메타데이터 (기존 ID만 추출 → dict 전체 저장)
+    recommendations: list[dict] = Field(
         default_factory=list,
-        description="TMDB 추천 영화 ID 목록 (similar와 다른 알고리즘)",
+        description="TMDB 추천 영화 전체 메타데이터 [{'id': 123, 'title': '...', 'overview': '...', 'poster_path': '...'}, ...]",
     )
     images: dict = Field(
         default_factory=dict,
         description="다중 이미지 {'posters': [...], 'backdrops': [...], 'logos': [...]}",
+    )
+
+    # ── Phase D: TMDB 전체 데이터 수집 (Full Collection) ──
+    # Phase D: translations 전체 dict 저장 (기존 5개 필드만 → data dict 전체 보존)
+    translations: list[dict] = Field(
+        default_factory=list,
+        description="다국어 번역 원본 전체 [{'iso_3166_1': 'KR', 'iso_639_1': 'ko', 'name': '...', 'english_name': '...', 'data': {'title': '...', 'overview': '...', 'tagline': '...', 'homepage': '...', 'runtime': 0}}]",
+    )
+    # Phase D: external_ids raw dict 전체 저장 (기존 5개만 → 모든 외부 ID 보존)
+    external_ids: dict = Field(
+        default_factory=dict,
+        description="외부 ID 원본 전체 (TMDB 응답 그대로) {'imdb_id': 'tt...', 'facebook_id': '...', 'instagram_id': '...', 'twitter_id': '...', 'wikidata_id': 'Q...', ...}",
+    )
+    # lists: 이 영화가 포함된 TMDB 사용자 리스트
+    lists: dict = Field(
+        default_factory=dict,
+        description="포함된 리스트 {'total_results': 100, 'results': [{'id': 1, 'name': '...'}]}",
     )
 
 

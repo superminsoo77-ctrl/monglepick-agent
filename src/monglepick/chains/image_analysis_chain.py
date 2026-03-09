@@ -24,7 +24,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from monglepick.agents.chat.models import ImageAnalysisResult
 from monglepick.config import settings
-from monglepick.llm.factory import get_vision_llm
+from monglepick.llm.factory import get_vision_llm, guarded_ainvoke
 from monglepick.prompts.image_analysis import (
     IMAGE_ANALYSIS_HUMAN_PROMPT,
     IMAGE_ANALYSIS_SYSTEM_PROMPT,
@@ -107,7 +107,11 @@ async def analyze_image(
         llm_start = time.perf_counter()
         timeout_sec = getattr(settings, "VISION_TIMEOUT_SEC", 180)
         try:
-            response = await asyncio.wait_for(llm.ainvoke(messages), timeout=float(timeout_sec))
+            # 모델별 세마포어로 동시 호출 제한 (Ollama 큐 점유 방지)
+            response = await asyncio.wait_for(
+                guarded_ainvoke(llm, messages, model=settings.VISION_MODEL),
+                timeout=float(timeout_sec),
+            )
         except asyncio.TimeoutError:
             elapsed_ms = (time.perf_counter() - llm_start) * 1000
             logger.warning(

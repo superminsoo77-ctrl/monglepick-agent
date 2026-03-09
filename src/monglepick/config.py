@@ -113,5 +113,18 @@ class Settings(BaseSettings):
     # Pillow DecompressionBomb 방어: 최대 허용 픽셀 수 (25MP)
     IMAGE_MAX_PIXELS: int = 25_000_000
 
+    # ── Concurrency Control (동시 요청 성능 최적화) ──
+    # API 레벨: 동시 실행 가능한 최대 Chat Agent 그래프 수.
+    # 초과 요청은 큐에 대기하며 SSE로 "대기 중" 알림을 전송한다.
+    MAX_CONCURRENT_REQUESTS: int = 3
+    # Ollama 모델별 동시 LLM 호출 제한.
+    # Ollama는 GPU 추론을 모델당 직렬 처리하므로, 2 이상이면 큐 점유만 증가.
+    # 1 = 활성 추론 1개 + 대기 1개 허용 (모델 스왑 방지)
+    LLM_PER_MODEL_CONCURRENCY: int = 2
+    # 추천 이유를 LLM으로 생성할 최대 영화 수.
+    # 초과 영화는 메타데이터 기반 템플릿(_build_fallback_explanation)으로 대체하여
+    # Ollama 큐 점유를 줄인다.
+    MAX_EXPLANATION_MOVIES: int = 3
+
 
 settings = Settings()

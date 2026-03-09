@@ -56,6 +56,11 @@ _ALLOWED_MIMES: set[str] = set(settings.ALLOWED_IMAGE_MIMES.split(","))
 # VLM 동시 처리 세마포어 — GPU 메모리 보호
 _vlm_semaphore = asyncio.Semaphore(settings.VLM_CONCURRENCY_LIMIT)
 
+# Chat Agent 그래프 동시 실행 세마포어 — Ollama 과부하 방지.
+# MAX_CONCURRENT_REQUESTS(기본 3)개를 초과하는 요청은 큐에 대기하며
+# SSE로 "대기 중" 알림을 전송한다.
+_graph_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_REQUESTS)
+
 # IP당 업로드 타임스탬프 기록 (인메모리, Rate Limiting용)
 _upload_timestamps: defaultdict[str, list[float]] = defaultdict(list)
 
@@ -440,10 +445,38 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
     )
 
     async def event_generator():
-        """SSE 이벤트 생성기 — VLM 세마포어로 동시 처리 제한 후 relay."""
-        # VLM 세마포어 — 이미지가 있으면 동시 처리 수를 제한
-        if image_data:
-            async with _vlm_semaphore:
+        """SSE 이벤트 생성기 — 글로벌 + VLM 세마포어로 동시 처리 제한 후 relay."""
+        import json as _json
+
+        # 글로벌 그래프 세마포어 — 동시 실행 요청 수 제한
+        # 슬롯이 없으면 대기 중 SSE 알림을 먼저 전송
+        if _graph_semaphore.locked():
+            # 대기 중임을 사용자에게 SSE로 알림
+            yield {
+                "event": "status",
+                "data": _json.dumps(
+                    {"phase": "queued", "message": "요청이 많아 잠시 대기 중이에요..."},
+                    ensure_ascii=False,
+                ),
+            }
+            logger.info(
+                "chat_sse_queued",
+                user_id=request.user_id or "(anonymous)",
+                session_id=request.session_id,
+            )
+
+        async with _graph_semaphore:
+            # VLM 세마포어 — 이미지가 있으면 동시 처리 수를 제한
+            if image_data:
+                async with _vlm_semaphore:
+                    async for sse_event in run_chat_agent(
+                        user_id=request.user_id,
+                        session_id=request.session_id,
+                        message=request.message,
+                        image_data=image_data,
+                    ):
+                        yield sse_event
+            else:
                 async for sse_event in run_chat_agent(
                     user_id=request.user_id,
                     session_id=request.session_id,
@@ -451,14 +484,7 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
                     image_data=image_data,
                 ):
                     yield sse_event
-        else:
-            async for sse_event in run_chat_agent(
-                user_id=request.user_id,
-                session_id=request.session_id,
-                message=request.message,
-                image_data=image_data,
-            ):
-                yield sse_event
+
         # SSE 스트리밍 완료 시 타이밍 로깅
         elapsed_ms = (time.perf_counter() - request_start) * 1000
         logger.info(
@@ -538,22 +564,23 @@ async def chat_sync(request: ChatRequest):
         has_image=image_for_agent is not None,
     )
 
-    # VLM 세마포어 — 이미지가 있으면 동시 처리 수를 제한
-    if image_for_agent:
-        async with _vlm_semaphore:
+    # 글로벌 그래프 세마포어 + VLM 세마포어로 동시 처리 제한
+    async with _graph_semaphore:
+        if image_for_agent:
+            async with _vlm_semaphore:
+                state = await run_chat_agent_sync(
+                    user_id=request.user_id,
+                    session_id=request.session_id,
+                    message=request.message,
+                    image_data=image_for_agent,
+                )
+        else:
             state = await run_chat_agent_sync(
                 user_id=request.user_id,
                 session_id=request.session_id,
                 message=request.message,
                 image_data=image_for_agent,
             )
-    else:
-        state = await run_chat_agent_sync(
-            user_id=request.user_id,
-            session_id=request.session_id,
-            message=request.message,
-            image_data=image_for_agent,
-        )
 
     # State에서 응답 정보 추출
     # session_id는 graph.py에서 자동 생성되어 state에 포함됨
@@ -709,10 +736,36 @@ async def chat_upload(
     )
 
     async def event_generator():
-        """SSE 이벤트 생성기 — VLM 세마포어로 동시 처리 제한 후 relay."""
-        # VLM 세마포어 — 이미지가 있으면 동시 처리 수를 제한
-        if image_data:
-            async with _vlm_semaphore:
+        """SSE 이벤트 생성기 — 글로벌 + VLM 세마포어로 동시 처리 제한 후 relay."""
+        import json as _json
+
+        # 글로벌 그래프 세마포어 — 동시 실행 요청 수 제한
+        if _graph_semaphore.locked():
+            yield {
+                "event": "status",
+                "data": _json.dumps(
+                    {"phase": "queued", "message": "요청이 많아 잠시 대기 중이에요..."},
+                    ensure_ascii=False,
+                ),
+            }
+            logger.info(
+                "chat_upload_queued",
+                user_id=user_id or "(anonymous)",
+                session_id=session_id,
+            )
+
+        async with _graph_semaphore:
+            # VLM 세마포어 — 이미지가 있으면 동시 처리 수를 제한
+            if image_data:
+                async with _vlm_semaphore:
+                    async for sse_event in run_chat_agent(
+                        user_id=user_id,
+                        session_id=session_id,
+                        message=message,
+                        image_data=image_data,
+                    ):
+                        yield sse_event
+            else:
                 async for sse_event in run_chat_agent(
                     user_id=user_id,
                     session_id=session_id,
@@ -720,14 +773,7 @@ async def chat_upload(
                     image_data=image_data,
                 ):
                     yield sse_event
-        else:
-            async for sse_event in run_chat_agent(
-                user_id=user_id,
-                session_id=session_id,
-                message=message,
-                image_data=image_data,
-            ):
-                yield sse_event
+
         # 업로드 요청 완료 타이밍 로깅
         elapsed_ms = (time.perf_counter() - upload_start) * 1000
         logger.info(

@@ -125,6 +125,14 @@ async def load_movie_nodes(documents: list[MovieDocument]) -> None:
             "kobis_watch_grade": doc.kobis_watch_grade,
             "kobis_open_dt": doc.kobis_open_dt,
             "kobis_type_nm": doc.kobis_type_nm,
+            # Phase D: 전체 수집 보강 필드
+            "overview_en": doc.overview_en,
+            "overview_ja": doc.overview_ja,
+            "facebook_id": doc.facebook_id,
+            "instagram_id": doc.instagram_id,
+            "twitter_id": doc.twitter_id,
+            "wikidata_id": doc.wikidata_id,
+            "tmdb_list_count": doc.tmdb_list_count,
             # 데이터 출처 추적
             "source": doc.source,
         }
@@ -174,6 +182,13 @@ async def load_movie_nodes(documents: list[MovieDocument]) -> None:
         movie.kobis_watch_grade = m.kobis_watch_grade,
         movie.kobis_open_dt = m.kobis_open_dt,
         movie.kobis_type_nm = m.kobis_type_nm,
+        movie.overview_en = m.overview_en,
+        movie.overview_ja = m.overview_ja,
+        movie.facebook_id = m.facebook_id,
+        movie.instagram_id = m.instagram_id,
+        movie.twitter_id = m.twitter_id,
+        movie.wikidata_id = m.wikidata_id,
+        movie.tmdb_list_count = m.tmdb_list_count,
         movie.source = m.source
     """
     await _batch_execute(cypher, data, NODE_BATCH_SIZE, "movie_nodes")

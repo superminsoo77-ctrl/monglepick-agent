@@ -24,7 +24,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from monglepick.agents.chat.models import IntentEmotionResult
 from monglepick.config import settings
 from monglepick.data_pipeline.preprocessor import MOOD_WHITELIST
-from monglepick.llm.factory import get_intent_emotion_llm
+from monglepick.llm.factory import get_intent_emotion_llm, guarded_ainvoke
 from monglepick.prompts.emotion import EMOTION_TO_MOOD_MAP
 from monglepick.prompts.intent_emotion import (
     INTENT_EMOTION_HUMAN_PROMPT,
@@ -116,7 +116,10 @@ async def classify_intent_and_emotion(
                 "intent_emotion_chain_prompt_formatted",
                 prompt_preview=str(prompt_value)[:300],
             )
-            result: IntentEmotionResult = await llm.ainvoke(prompt_value)
+            # 모델별 세마포어로 동시 호출 제한 (Ollama 큐 점유 방지)
+            result: IntentEmotionResult = await guarded_ainvoke(
+                llm, prompt_value, model=settings.INTENT_MODEL,
+            )
 
             # LLM 응답 시간 (밀리초)
             elapsed_ms = (time.perf_counter() - llm_start) * 1000

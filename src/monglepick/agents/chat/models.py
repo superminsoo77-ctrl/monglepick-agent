@@ -226,10 +226,12 @@ PREFERENCE_WEIGHTS: dict[str, float] = {
     "exclude": 0.5,
 }
 
-# 충분성 판정 임계값
-SUFFICIENCY_THRESHOLD: float = 3.0
-# 턴 카운트 오버라이드 임계값 (선호 부족해도 3턴 이상이면 추천 진행)
-TURN_COUNT_OVERRIDE: int = 3
+# 충분성 판정 임계값 (기존 3.0 → 2.5로 하향)
+# 장르+감정(4.0), 참조영화+감정(3.5) 등 2개 이상 정보가 있으면 바로 추천 진행
+# 감정만 있으면(2.0 < 2.5) 추가 질문, 턴2 오버라이드(TURN_COUNT_OVERRIDE=2)로 보완
+SUFFICIENCY_THRESHOLD: float = 2.5
+# 턴 카운트 오버라이드 임계값 (2턴째부터는 선호 부족해도 추천 진행)
+TURN_COUNT_OVERRIDE: int = 2
 
 
 # ============================================================
@@ -579,8 +581,8 @@ def is_sufficient(
     추천 진행 가능 여부를 판정한다 (§6-2 Node 4).
 
     판정 기준 (OR 조건):
-    1. 가중치 합산 >= 3.0 (SUFFICIENCY_THRESHOLD)
-    2. turn_count >= 3 (TURN_COUNT_OVERRIDE)
+    1. 가중치 합산 >= 2.5 (SUFFICIENCY_THRESHOLD) — 장르+감정 등 2개 이상 정보로 추천 가능
+    2. turn_count >= 2 (TURN_COUNT_OVERRIDE) — 2턴째부터 추천 진행
 
     Args:
         prefs: 현재까지 파악된 사용자 선호 조건

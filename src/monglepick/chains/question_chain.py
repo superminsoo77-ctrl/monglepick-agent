@@ -24,7 +24,7 @@ from monglepick.agents.chat.models import (
     ExtractedPreferences,
 )
 from monglepick.config import settings
-from monglepick.llm.factory import get_question_llm
+from monglepick.llm.factory import get_question_llm, guarded_ainvoke
 from monglepick.prompts.question import QUESTION_HUMAN_PROMPT, QUESTION_SYSTEM_PROMPT
 
 logger = structlog.get_logger()
@@ -179,7 +179,10 @@ async def generate_question(
             prompt_text=str(prompt_value),
             model=settings.QUESTION_MODEL,
         )
-        response = await llm.ainvoke(prompt_value)
+        # 모델별 세마포어로 동시 호출 제한 (Ollama 큐 점유 방지)
+        response = await guarded_ainvoke(
+            llm, prompt_value, model=settings.QUESTION_MODEL,
+        )
 
         # LLM 응답 시간 계산 (밀리초 단위)
         elapsed_ms = (time.perf_counter() - llm_start) * 1000

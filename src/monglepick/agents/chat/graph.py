@@ -52,6 +52,7 @@ from monglepick.agents.chat.models import (
     RETRIEVAL_MIN_CANDIDATES,
     RETRIEVAL_MIN_TOP_SCORE,
     RETRIEVAL_QUALITY_MIN_AVG,
+    TURN_COUNT_OVERRIDE,
     ChatAgentState,
 )
 from monglepick.memory.session_store import load_session, save_session
@@ -181,8 +182,8 @@ def route_after_retrieval(state: ChatAgentState) -> str:
     2. Top-1 RRF 점수 ≥ RETRIEVAL_MIN_TOP_SCORE (0.02)
     3. 상위 5개 평균 ≥ RETRIEVAL_QUALITY_MIN_AVG (0.015)
 
-    품질 미달 + turn_count < 3 → question_generator (추가 질문)
-    품질 미달 + turn_count ≥ 3 → recommendation_ranker (있는 결과로 진행)
+    품질 미달 + turn_count < TURN_COUNT_OVERRIDE(2) → question_generator (추가 질문)
+    품질 미달 + turn_count ≥ TURN_COUNT_OVERRIDE(2) → recommendation_ranker (있는 결과로 진행)
     품질 충족 → recommendation_ranker
 
     Args:
@@ -217,8 +218,8 @@ def route_after_retrieval(state: ChatAgentState) -> str:
         turn_count=turn_count,
     )
 
-    if quality_passed or turn_count >= 3:
-        # 품질 통과 또는 3턴 이상이면 추천 진행 (무한 루프 방지)
+    if quality_passed or turn_count >= TURN_COUNT_OVERRIDE:
+        # 품질 통과 또는 TURN_COUNT_OVERRIDE(2)턴 이상이면 추천 진행 (무한 루프 방지)
         return "recommendation_ranker"
     else:
         # 품질 미달: state에 피드백 메시지 설정 (question_generator에서 활용)

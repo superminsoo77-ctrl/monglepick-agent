@@ -19,7 +19,7 @@ import structlog
 from langchain_core.prompts import ChatPromptTemplate
 
 from monglepick.config import settings
-from monglepick.llm.factory import get_conversation_llm
+from monglepick.llm.factory import get_conversation_llm, guarded_ainvoke
 from monglepick.prompts.persona import MONGGLE_SYSTEM_PROMPT
 
 logger = structlog.get_logger()
@@ -79,7 +79,10 @@ async def generate_general_response(
             prompt_text=str(prompt_value),
             model=settings.CONVERSATION_MODEL,
         )
-        response = await llm.ainvoke(prompt_value)
+        # 모델별 세마포어로 동시 호출 제한 (Ollama 큐 점유 방지)
+        response = await guarded_ainvoke(
+            llm, prompt_value, model=settings.CONVERSATION_MODEL,
+        )
         elapsed_ms = (time.perf_counter() - llm_start) * 1000
 
         # LangChain BaseMessage → 문자열 추출

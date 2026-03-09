@@ -133,6 +133,15 @@ def _movie_to_es_doc(doc: MovieDocument) -> dict:
                 f"{s.get('peopleNm', '')}({s.get('staffRoleNm', '')})"
                 for s in doc.kobis_staffs
             ),
+            # ── Phase D: 전체 수집 보강 필드 ──
+            "overview_en": doc.overview_en,
+            "overview_ja": doc.overview_ja,
+            "facebook_id": doc.facebook_id,
+            "instagram_id": doc.instagram_id,
+            "twitter_id": doc.twitter_id,
+            "wikidata_id": doc.wikidata_id,
+            "tmdb_list_count": doc.tmdb_list_count,
+            "images_logos": doc.images_logos,
             # ── 데이터 출처 ──
             "source": doc.source,
         },

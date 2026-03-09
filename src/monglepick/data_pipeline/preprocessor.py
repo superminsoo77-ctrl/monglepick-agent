@@ -379,6 +379,97 @@ def extract_spoken_language_names(raw_languages: list[dict]) -> list[str]:
 
 
 # ============================================================
+# Phase D: translations / external_ids / images_logos 추출
+# ============================================================
+
+
+def extract_overview_from_translations(
+    translations: list[dict],
+    current_overview: str,
+) -> tuple[str, str, str]:
+    """
+    translations에서 영문/일본어 줄거리를 추출하고, overview가 빈 경우 보강한다.
+
+    Phase D: overview 빈 영화에 대해 영어/일본어 번역에서 보강.
+
+    Args:
+        translations: TMDBRawMovie.translations (전체 dict 리스트)
+        current_overview: 현재 한국어 overview (비어있을 수 있음)
+
+    Returns:
+        (보강된 overview, overview_en, overview_ja) 튜플
+    """
+    overview_en = ""
+    overview_ja = ""
+
+    for t in translations:
+        lang = t.get("iso_639_1", "")
+        data = t.get("data", {})
+        overview_text = data.get("overview", "") if isinstance(data, dict) else ""
+
+        if lang == "en" and overview_text and not overview_en:
+            overview_en = overview_text
+        elif lang == "ja" and overview_text and not overview_ja:
+            overview_ja = overview_text
+
+    # overview가 비어있으면 영어 → 일본어 순으로 fallback
+    boosted_overview = current_overview
+    if not boosted_overview or len(boosted_overview) < 10:
+        if overview_en:
+            boosted_overview = overview_en
+        elif overview_ja:
+            boosted_overview = overview_ja
+
+    return boosted_overview, overview_en, overview_ja
+
+
+def extract_external_ids_full(external_ids: dict) -> dict:
+    """
+    external_ids raw dict에서 소셜 미디어 / 외부 DB ID를 추출한다.
+
+    Phase D: 기존 5개만 → raw dict 전체에서 필요한 ID를 추출.
+
+    Args:
+        external_ids: TMDBRawMovie.external_ids (raw dict 전체)
+
+    Returns:
+        {"facebook_id": "...", "instagram_id": "...", "twitter_id": "...", "wikidata_id": "..."}
+    """
+    return {
+        "facebook_id": external_ids.get("facebook_id") or "",
+        "instagram_id": external_ids.get("instagram_id") or "",
+        "twitter_id": external_ids.get("twitter_id") or "",
+        "wikidata_id": external_ids.get("wikidata_id") or "",
+    }
+
+
+def extract_images_logos(raw_images: dict) -> list[str]:
+    """
+    TMDB images에서 로고 이미지 경로를 추출한다.
+
+    Args:
+        raw_images: TMDBRawMovie.images dict
+
+    Returns:
+        로고 이미지 경로 리스트
+    """
+    return raw_images.get("logos", [])
+
+
+def extract_tmdb_list_count(lists_data: dict) -> int:
+    """
+    TMDB lists에서 이 영화가 포함된 리스트 총 수를 추출한다.
+
+    Args:
+        lists_data: TMDBRawMovie.lists dict
+
+    Returns:
+        총 리스트 수 (total_results)
+    """
+    return lists_data.get("total_results", 0)
+
+
+# ============================================================
 # Phase B: 컬렉션/제작사/국가/언어 추출 함수
 # ============================================================
 
@@ -463,7 +554,7 @@ def extract_reviews(raw_reviews: list[dict], max_count: int = 5, max_len: int = 
     # rating 높은 순 정렬 (None → 0으로 처리)
     sorted_reviews = sorted(
         raw_reviews,
-        key=lambda r: r.get("rating") or 0,
+        key=lambda r: (r.get("author_details") or {}).get("rating") or r.get("rating") or 0,
         reverse=True,
     )
 
@@ -856,14 +947,33 @@ async def process_raw_movie(raw: TMDBRawMovie, generate_mood: bool = True) -> Mo
     collection_poster, collection_backdrop = extract_collection_images(raw.belongs_to_collection)
     images_posters, images_backdrops = extract_images(raw.images)
     kr_release_date = extract_kr_release_date(raw.release_dates)
-    recommendation_ids = [str(mid) for mid in raw.recommendations]
+    # Phase D: recommendations가 list[dict]로 변경 → ID 추출 시 dict에서 "id" 키 사용
+    recommendation_ids = [
+        str(m.get("id") if isinstance(m, dict) else m)
+        for m in raw.recommendations
+        if (m.get("id") if isinstance(m, dict) else m)
+    ]
+
+    # Phase D: translations에서 다국어 줄거리 추출 + overview 보강
+    boosted_overview, overview_en, overview_ja = extract_overview_from_translations(
+        raw.translations, raw.overview,
+    )
+
+    # Phase D: external_ids에서 소셜 미디어 ID 추출
+    ext_ids = extract_external_ids_full(raw.external_ids)
+
+    # Phase D: images.logos 추출
+    images_logos = extract_images_logos(raw.images)
+
+    # Phase D: TMDB 사용자 리스트 수
+    tmdb_list_count = extract_tmdb_list_count(raw.lists)
 
     # MovieDocument 생성 (무드태그/임베딩텍스트 제외)
     doc = MovieDocument(
         id=str(raw.id),
         title=raw.title or raw.original_title,
         title_en=raw.original_title,
-        overview=raw.overview,
+        overview=boosted_overview,  # Phase D: translations에서 보강된 overview
         release_year=release_year,
         runtime=raw.runtime or 0,
         rating=raw.vote_average,
@@ -922,6 +1032,16 @@ async def process_raw_movie(raw: TMDBRawMovie, generate_mood: bool = True) -> Mo
         source_author=src_author,
         production_country_names=production_country_names,
         spoken_language_names=spoken_language_names,
+        # Phase D: 전체 수집 보강 필드
+        video_flag=raw.video,
+        overview_en=overview_en,
+        overview_ja=overview_ja,
+        facebook_id=ext_ids["facebook_id"],
+        instagram_id=ext_ids["instagram_id"],
+        twitter_id=ext_ids["twitter_id"],
+        wikidata_id=ext_ids["wikidata_id"],
+        tmdb_list_count=tmdb_list_count,
+        images_logos=images_logos,
         source="tmdb",
     )
 

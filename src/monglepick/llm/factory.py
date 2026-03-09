@@ -24,6 +24,7 @@ from langchain_ollama import ChatOllama
 from pydantic import BaseModel
 
 from monglepick.config import settings
+from monglepick.llm.concurrency import acquire_model_slot, release_model_slot
 
 logger = structlog.get_logger()
 
@@ -273,3 +274,36 @@ def get_vision_llm() -> ChatOllama:
         model=settings.VISION_MODEL,
         temperature=0.2,
     )
+
+
+# ============================================================
+# 동시성 제어 래퍼
+# ============================================================
+
+async def guarded_ainvoke(
+    llm: Runnable | ChatOllama,
+    prompt_value: Any,
+    model: str,
+    request_id: str = "",
+) -> Any:
+    """
+    모델별 세마포어로 감싼 LLM ainvoke.
+
+    Ollama는 GPU 추론을 모델당 직렬 처리하므로,
+    동일 모델에 대한 동시 호출 수를 제한하여 Ollama 큐 점유를 방지한다.
+    세마포어 획득 → ainvoke → 세마포어 반환의 안전한 흐름을 보장한다.
+
+    Args:
+        llm: LangChain Runnable 또는 ChatOllama 인스턴스
+        prompt_value: LLM에 전달할 프롬프트 (포맷 완료된 PromptValue 또는 메시지 리스트)
+        model: Ollama 모델명 (세마포어 키로 사용)
+        request_id: 요청 식별자 (로깅용, 빈 문자열이면 생략)
+
+    Returns:
+        LLM 응답 (BaseMessage 또는 구조화 출력 Pydantic 모델)
+    """
+    await acquire_model_slot(model, request_id)
+    try:
+        return await llm.ainvoke(prompt_value)
+    finally:
+        release_model_slot(model)

@@ -59,6 +59,17 @@ def main() -> None:
         default=32,
         help="임베딩 배치 크기 (CPU: 32, GPU: 128)",
     )
+    parser.add_argument(
+        "--use-jsonl",
+        action="store_true",
+        help="Phase D 전체 수집 JSONL 파일에서 로드합니다 (data/tmdb_full/tmdb_full_movies.jsonl)",
+    )
+    parser.add_argument(
+        "--jsonl-path",
+        type=str,
+        default=None,
+        help="JSONL 파일 경로를 지정합니다 (--use-jsonl과 함께 사용)",
+    )
 
     args = parser.parse_args()
 
@@ -69,6 +80,8 @@ def main() -> None:
             kaggle_data_dir=args.kaggle_dir,
             embedding_batch_size=args.batch_size,
             use_cache=args.use_cache,
+            use_jsonl=args.use_jsonl,
+            jsonl_path=args.jsonl_path,
         )
     )
 

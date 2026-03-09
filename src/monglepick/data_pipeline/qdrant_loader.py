@@ -156,6 +156,15 @@ def _movie_to_point(doc: MovieDocument, vector: np.ndarray) -> PointStruct:
             "source_author": doc.source_author,
             "production_country_names": doc.production_country_names,
             "spoken_language_names": doc.spoken_language_names,
+            # ── Phase D: 전체 수집 보강 필드 ──
+            "overview_en": doc.overview_en,
+            "overview_ja": doc.overview_ja,
+            "facebook_id": doc.facebook_id,
+            "instagram_id": doc.instagram_id,
+            "twitter_id": doc.twitter_id,
+            "wikidata_id": doc.wikidata_id,
+            "tmdb_list_count": doc.tmdb_list_count,
+            "images_logos": doc.images_logos,
             # ── 임베딩 텍스트 (감사 추적용) ──
             "embedding_text": doc.embedding_text,
             # ── KMDb 보강 필드 ──
