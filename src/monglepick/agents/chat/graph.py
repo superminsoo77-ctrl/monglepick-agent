@@ -452,6 +452,7 @@ async def run_chat_agent(
     session_id: str,
     message: str,
     image_data: str | None = None,
+    effective_cost: int = 0,
 ) -> AsyncGenerator[str, None]:
     """
     Chat Agent를 SSE 스트리밍 모드로 실행한다.
@@ -482,6 +483,8 @@ async def run_chat_agent(
         session_id: 세션 ID (빈 문자열이면 자동 생성)
         message: 사용자 입력 메시지
         image_data: base64 인코딩된 이미지 데이터 (None이면 이미지 없음)
+        effective_cost: 실제 차감 포인트 (chat.py에서 쿼터 체크 후 전달).
+            무료 잔여가 있으면 0이 전달되어 deduct 호출을 스킵한다.
 
     Yields:
         SSE 이벤트 JSON 문자열 (줄바꿈 포함)
@@ -624,29 +627,31 @@ async def run_chat_agent(
                 # recommendation_ranker 완료 시: 포인트 차감 → movie_card 이벤트 발행
                 # 과금 단위: "추천 완료" (movie_card 발행 시점에만 1회 차감)
                 # AI의 후속 질문(clarification) 턴은 과금하지 않음
+                # effective_cost=0이면 무료 잔여로 커버된 요청이므로 차감 스킵
                 if node_name == "recommendation_ranker":
                     ranked_movies = updates.get("ranked_movies", [])
                     if ranked_movies:
-                        # ── 포인트 차감 (추천 결과가 있을 때만) ──
+                        # ── 포인트 차감 (추천 결과가 있고, effective_cost > 0일 때만) ──
                         from monglepick.config import settings
-                        if settings.POINT_CHECK_ENABLED and user_id:
+                        if settings.POINT_CHECK_ENABLED and user_id and effective_cost > 0:
                             from monglepick.api.point_client import deduct_point
                             deduct_result = await deduct_point(
                                 user_id=user_id,
                                 session_id=session_id,
-                                amount=settings.POINT_COST_PER_RECOMMENDATION,
+                                amount=effective_cost,
                                 description="AI 추천 사용",
                             )
                             if deduct_result.success:
                                 # 차감 성공: 잔여 포인트 정보를 SSE로 전달
                                 yield _format_sse_event("point_update", {
                                     "balance": deduct_result.balance_after,
-                                    "deducted": settings.POINT_COST_PER_RECOMMENDATION,
+                                    "deducted": effective_cost,
                                 })
                                 logger.info(
                                     "point_deducted",
                                     user_id=user_id,
                                     session_id=session_id,
+                                    deducted=effective_cost,
                                     balance_after=deduct_result.balance_after,
                                 )
                             else:
@@ -655,7 +660,20 @@ async def run_chat_agent(
                                     "point_deduct_failed_graceful",
                                     user_id=user_id,
                                     session_id=session_id,
+                                    effective_cost=effective_cost,
                                 )
+                        elif settings.POINT_CHECK_ENABLED and user_id and effective_cost == 0:
+                            # 무료 잔여로 커버된 요청 → 차감 없이 point_update 발행
+                            logger.info(
+                                "point_free_usage",
+                                user_id=user_id,
+                                session_id=session_id,
+                            )
+                            yield _format_sse_event("point_update", {
+                                "balance": -1,  # 무료 사용 시 잔액 미변동 (-1은 미조회)
+                                "deducted": 0,
+                                "free_usage": True,
+                            })
 
                         # movie_card 이벤트 발행
                         for movie in ranked_movies:
@@ -714,6 +732,7 @@ async def run_chat_agent_sync(
     session_id: str,
     message: str,
     image_data: str | None = None,
+    effective_cost: int = 0,
 ) -> ChatAgentState:
     """
     Chat Agent를 동기 모드로 실행하여 최종 State를 반환한다 (테스트/디버그용).
@@ -726,6 +745,7 @@ async def run_chat_agent_sync(
         session_id: 세션 ID (빈 문자열이면 자동 생성)
         message: 사용자 입력 메시지
         image_data: base64 인코딩된 이미지 데이터 (None이면 이미지 없음)
+        effective_cost: 실제 차감 포인트 (동기 엔드포인트는 디버그용이므로 기본값 0)
 
     Returns:
         실행 완료된 ChatAgentState (session_id 포함)

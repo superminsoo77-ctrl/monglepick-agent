@@ -23,12 +23,29 @@ logger = structlog.get_logger(__name__)
 
 
 class PointCheckResult(BaseModel):
-    """포인트 사전 체크 결과. Agent가 그래프 실행 여부를 결정할 때 사용한다."""
+    """
+    포인트 사전 체크 결과. Agent가 그래프 실행 여부를 결정할 때 사용한다.
+
+    Phase R-3에서 Backend에 추가된 등급별 쿼터 필드를 포함한다.
+    - max_input_length: 등급별 사용자 입력 글자수 제한 (BRONZE=200, SILVER=300, ...)
+    - daily_used / daily_limit: 일일 AI 추천 사용 횟수 / 한도 (-1이면 무제한)
+    - monthly_used / monthly_limit: 월간 AI 추천 사용 횟수 / 한도
+    - free_remaining: 오늘 무료 잔여 횟수 (등급별 무료 횟수 - daily_used)
+    - effective_cost: 실제 차감 포인트 (무료 잔여가 있으면 0, 없으면 cost)
+    """
 
     allowed: bool       # 진행 가능 여부 (잔액 >= cost)
     balance: int        # 현재 잔액
     cost: int           # 필요 포인트
     message: str = ""   # 부족 시 사용자 안내 메시지
+    # ── 쿼터 필드 (Phase R-3 Backend에서 추가됨) ──
+    max_input_length: int = 200       # 등급별 사용자 입력 글자수 제한
+    daily_used: int = 0               # 오늘 AI 추천 사용 횟수
+    daily_limit: int = 3              # 일일 한도 (-1이면 무제한)
+    monthly_used: int = 0             # 이번 달 사용 횟수
+    monthly_limit: int = 30           # 월간 한도
+    free_remaining: int = 0           # 오늘 무료 잔여 횟수
+    effective_cost: int = 0           # 실제 차감 포인트 (무료면 0)
 
 
 class PointDeductResult(BaseModel):
@@ -87,11 +104,21 @@ async def check_point(user_id: str, cost: int = 1) -> PointCheckResult:
 
         if resp.status_code == 200:
             data = resp.json()
+            # Backend JSON 응답은 camelCase → Python snake_case로 매핑.
+            # data.get()으로 안전하게 읽어 Backend가 아직 쿼터 필드를
+            # 반환하지 않는 경우에도 기본값으로 정상 동작한다.
             return PointCheckResult(
                 allowed=data.get("allowed", False),
                 balance=data.get("balance", 0),
                 cost=data.get("cost", cost),
                 message=data.get("message", ""),
+                max_input_length=data.get("maxInputLength", 200),
+                daily_used=data.get("dailyUsed", 0),
+                daily_limit=data.get("dailyLimit", 3),
+                monthly_used=data.get("monthlyUsed", 0),
+                monthly_limit=data.get("monthlyLimit", 30),
+                free_remaining=data.get("freeRemaining", 0),
+                effective_cost=data.get("effectiveCost", 0),
             )
 
         # 4xx/5xx 응답: 로그 후 graceful degradation

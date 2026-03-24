@@ -938,6 +938,67 @@ async def rag_retriever(state: ChatAgentState) -> dict:
 
 
 # ============================================================
+# 7.5. retrieval_quality_checker — 검색 결과 품질 판정
+# ============================================================
+
+@traceable(name="retrieval_quality_checker", run_type="chain", metadata={"node": "7.5/14"})
+async def retrieval_quality_checker(state: ChatAgentState) -> dict:
+    """
+    RAG 검색 결과의 품질을 판정하여 state에 기록한다.
+
+    검색 결과(candidate_movies)의 건수와 점수를 분석하여
+    retrieval_quality 필드를 설정한다.
+    - "good": 후보 3편 이상 + 최고 RRF 점수 >= 0.01
+    - "poor": 후보 부족 또는 점수가 너무 낮음
+    - "empty": 후보 0편
+
+    품질이 "poor" 또는 "empty"이면 route_after_retrieval 분기에서
+    question_generator로 전환하여 사용자에게 추가 정보를 요청한다.
+
+    Args:
+        state: ChatAgentState (candidate_movies 필요)
+
+    Returns:
+        dict: retrieval_quality(str) 업데이트
+    """
+    node_start = time.perf_counter()
+    session_id = state.get("session_id", "")
+    try:
+        candidates = state.get("candidate_movies", [])
+
+        if not candidates:
+            quality = "empty"
+        elif len(candidates) < 3:
+            quality = "poor"
+        else:
+            # 최고 RRF 점수 기준 판정
+            max_score = max(c.rrf_score for c in candidates) if candidates else 0
+            quality = "good" if max_score >= 0.01 else "poor"
+
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.info(
+            "retrieval_quality_checked",
+            quality=quality,
+            candidate_count=len(candidates),
+            max_score=round(max((c.rrf_score for c in candidates), default=0), 6),
+            elapsed_ms=round(elapsed_ms, 1),
+            session_id=session_id,
+        )
+        return {"retrieval_quality": quality}
+
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error(
+            "retrieval_quality_checker_error",
+            error=str(e),
+            elapsed_ms=round(elapsed_ms, 1),
+            session_id=session_id,
+        )
+        # 에러 시 기본적으로 "good"으로 설정하여 추천 흐름 계속 진행
+        return {"retrieval_quality": "good"}
+
+
+# ============================================================
 # 8. recommendation_ranker — 추천 엔진 서브그래프 호출 (Phase 4)
 # ============================================================
 

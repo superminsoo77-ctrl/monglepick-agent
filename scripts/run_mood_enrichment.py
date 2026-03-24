@@ -1,51 +1,42 @@
 """
-무드태그 보강 스크립트 (외부 LLM API).
+무드태그 보강 스크립트 (Upstage Solar / OpenAI 호환 API).
 
-기존 DB에 적재된 영화의 무드태그를 GPT-4o-mini로 정밀 분석하여 갱신한다.
+기존 DB에 적재된 영화의 무드태그를 LLM으로 정밀 분석하여 갱신한다.
 장르 기반 fallback(단순 매핑) 대신, 제목+장르+키워드+줄거리를 종합 분석하여
 25개 무드태그 중 3~5개를 선택한다.
 
-비용 추정 (GPT-4o-mini, ~1,036,000건, 배치 10건/요청):
-    - API 호출: ~103,600회
-    - 입력: ~98M 토큰 × $0.15/1M = ~$15
-    - 출력: ~21M 토큰 × $0.60/1M = ~$13
-    - 총합: ~$28 (약 3.8만원) — 10만원 예산 내
+기본 Provider: Upstage Solar Pro 3 (OpenAI 호환 API)
+
+비용 추정 (Solar Pro 3, ~910,000건, 배치 10건/요청):
+    - API 호출: ~91,000회
+    - 입력: ~86.5M 토큰 × $0.15/1M = ~$13
+    - 출력: ~18.2M 토큰 × $0.60/1M = ~$11
+    - 총합: ~$24 (약 3.3만원)
 
 사용법:
-    # 기본 실행 (ES에서 읽기, GPT-4o-mini)
-    PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --api-key sk-xxx
-
-    # 환경변수로 API 키 설정
-    export OPENAI_API_KEY=sk-xxx
+    # Upstage Solar Pro 3으로 실행 (기본, .env의 UPSTAGE_API_KEY 사용)
     PYTHONPATH=src uv run python scripts/run_mood_enrichment.py
 
-    # 이전 중단점에서 재개
+    # API 키 직접 지정
+    PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --api-key up_xxx
+
+    # 이전 중단점에서 재개 (API 키 교체 가능)
     PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --resume
+    PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --resume --api-key up_새키
 
-    # API 키 교체 후 재개 (크레딧 소진 시)
-    PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --resume --api-key sk-새키
-
-    # 동시 요청 수 조정 (기본 20, Tier 1은 10 권장)
-    PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --concurrency 10
-
-    # 배치 크기 조정 (기본 10영화/요청)
-    PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --batch-size 15
-
-    # 모델 변경 (gpt-4.1-nano 등 더 저렴한 모델)
-    PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --model gpt-4.1-nano
-
-    # RPM 제한 조정 (기본 400, Tier 2+는 높게 설정 가능)
-    PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --rpm 2000
-
-    # JSONL에서 읽기 (DB 미적재 상태에서도 사용 가능)
-    PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --source jsonl
+    # OpenAI GPT-4o-mini로 실행
+    PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --provider openai --api-key sk-xxx
 
     # 비용 추정만 (API 호출 없이 예상 비용 출력)
     PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --estimate-only
 
+    # JSONL에서 읽기 (DB 미적재 상태에서도 사용 가능)
+    PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --source jsonl
+
 소요 시간 추정:
-    - Tier 1 (500 RPM), concurrency=10: ~4시간
-    - Tier 2 (5,000 RPM), concurrency=50: ~30분
+    - Upstage Solar Pro 3 (RPM ~100): ~2~4시간
+    - OpenAI Tier 1 (500 RPM), concurrency=10: ~4시간
+    - OpenAI Tier 2 (5,000 RPM), concurrency=50: ~30분
     - DB 갱신: ~30분 (Qdrant + Neo4j + ES 동시)
 """
 
@@ -60,8 +51,18 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# ── 프로젝트 루트를 sys.path에 추가 ──
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# ── 프로젝트 루트를 sys.path에 추가 + .env 로드 ──
+_project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_project_root / "src"))
+
+# .env 파일에서 환경변수 로드 (UPSTAGE_API_KEY 등)
+_env_file = _project_root / ".env"
+if _env_file.exists():
+    for line in _env_file.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
 
 import structlog  # noqa: E402
 from openai import AsyncOpenAI  # noqa: E402
@@ -106,11 +107,29 @@ CHECKPOINT_FILE = Path("data/mood_checkpoint.json")
 DEFAULT_JSONL_PATH = Path("data/tmdb_full/tmdb_full_movies.jsonl")
 
 # 기본 설정
-DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_CONCURRENCY = 20
 DEFAULT_BATCH_SIZE = 10  # 1회 API 호출당 영화 수
 DEFAULT_RPM = 400         # 분당 최대 요청 수 (Tier 1: 500 RPM, 여유 확보)
 MEGA_CHUNK_SIZE = 1000    # DB 갱신 및 체크포인트 저장 단위
+
+# ── Provider별 기본 설정 ──
+# Upstage Solar: OpenAI 호환 API, base_url만 변경하면 동일 AsyncOpenAI 클라이언트 사용 가능
+PROVIDER_CONFIGS: dict[str, dict] = {
+    "upstage": {
+        "base_url": "https://api.upstage.ai/v1",
+        "model": "solar-pro3",       # 102B MoE, 한국어 최적, 구조화 출력 지원
+        "rpm": 30,                    # Upstage RPM (429 방지, 보수적)
+        "concurrency": 3,
+        "env_key": "UPSTAGE_API_KEY",
+    },
+    "openai": {
+        "base_url": None,             # OpenAI 기본 URL
+        "model": "gpt-4o-mini",
+        "rpm": 400,
+        "concurrency": 20,
+        "env_key": "OPENAI_API_KEY",
+    },
+}
 
 # ── LLM 프롬프트 ──
 # 시스템 프롬프트: 무드태그 분석 전문가 역할 정의 + 25개 태그 목록 + 규칙
@@ -232,40 +251,63 @@ async def generate_mood_batch(
     rpm_limiter: RPMLimiter,
 ) -> dict[str, list[str]]:
     """
-    GPT-4o-mini로 배치 영화의 무드태그를 생성한다.
+    LLM으로 배치 영화의 무드태그를 생성한다.
 
-    10개 영화를 하나의 API 호출로 처리하여 비용을 최소화한다.
-    response_format=json_object로 유효한 JSON 응답을 보장한다.
+    N개 영화를 하나의 API 호출로 처리하여 비용을 최소화한다.
+    response_format=json_object를 시도하고, 미지원 모델이면 텍스트에서 JSON 추출한다.
     실패 시 3회 재시도 후 장르 기반 fallback을 사용한다.
 
     Args:
-        client: AsyncOpenAI 클라이언트
+        client: AsyncOpenAI 클라이언트 (Upstage/OpenAI 호환)
         movies: [{"movie_id": 123, "title": "...", "genres": [...], ...}, ...]
-        model: 사용할 모델명 (기본: gpt-4o-mini)
+        model: 사용할 모델명 (solar-pro3, gpt-4o-mini 등)
         rpm_limiter: RPM 제한기
 
     Returns:
         {doc_id(str): ["몰입", "감동", ...], ...}
     """
+    import re
+
     user_prompt = build_user_prompt(movies)
 
-    for attempt in range(3):  # 최대 3회 시도
+    for attempt in range(5):  # 최대 5회 시도 (429 대응)
         try:
             # RPM 제한 적용
             await rpm_limiter.acquire()
 
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-                max_tokens=500,
-                response_format={"type": "json_object"},
-            )
+            # API 호출 — response_format=json_object 시도, 미지원 시 일반 호출
+            try:
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.3,
+                    max_tokens=500,
+                    response_format={"type": "json_object"},
+                )
+            except Exception as inner_e:
+                # response_format 미지원 에러만 fallback (429 등은 외부 except에서 처리)
+                if "response_format" in str(inner_e).lower() or "json" in str(inner_e).lower():
+                    response = await client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=0.3,
+                        max_tokens=500,
+                    )
+                else:
+                    raise  # 429 등 다른 에러는 외부 except로 전파
 
             content = response.choices[0].message.content or "{}"
+
+            # JSON 추출: 텍스트에 JSON이 포함된 경우 { } 블록만 추출
+            json_match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", content, re.DOTALL)
+            if json_match:
+                content = json_match.group()
             parsed = json.loads(content)
 
             # 결과 매핑: 영화 번호(1-indexed) → movie_id (문자열 ID)
@@ -285,10 +327,17 @@ async def generate_mood_batch(
         except json.JSONDecodeError as e:
             logger.warning("mood_json_parse_error", attempt=attempt + 1, error=str(e))
         except Exception as e:
-            logger.warning("mood_api_error", attempt=attempt + 1, error=str(e))
-            if attempt < 2:
-                # 재시도 전 지수 백오프 대기 (2s, 4s)
-                await asyncio.sleep(2 ** (attempt + 1))
+            error_str = str(e)
+            is_rate_limit = "429" in error_str or "too_many_requests" in error_str
+            if is_rate_limit:
+                # 429 Rate Limit → 긴 대기 (30s, 60s, 90s, 120s, 150s)
+                wait = 30 * (attempt + 1)
+                logger.warning("rate_limit_backoff", attempt=attempt + 1, wait_seconds=wait)
+                await asyncio.sleep(wait)
+            else:
+                logger.warning("mood_api_error", attempt=attempt + 1, error=error_str)
+                if attempt < 4:
+                    await asyncio.sleep(2 ** (attempt + 1))
 
     # 모든 시도 실패 → 장르 기반 fallback
     logger.warning("mood_batch_all_attempts_failed", movie_ids=[m["movie_id"] for m in movies])
@@ -324,7 +373,7 @@ async def update_qdrant_moods(updates: dict[str, list[str]]) -> int:
     Returns:
         성공적으로 갱신된 건수
     """
-    qdrant = get_qdrant()
+    qdrant = await get_qdrant()
     updated = 0
     for doc_id, mood_tags in updates.items():
         try:
@@ -336,7 +385,7 @@ async def update_qdrant_moods(updates: dict[str, list[str]]) -> int:
                 import uuid
                 point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"kobis:{doc_id}"))
 
-            qdrant.set_payload(
+            await qdrant.set_payload(
                 collection_name="movies",
                 payload={"mood_tags": mood_tags},
                 points=[point_id],
@@ -365,7 +414,7 @@ async def update_neo4j_moods(updates: dict[str, list[str]]) -> int:
     Returns:
         성공적으로 갱신된 건수
     """
-    driver = get_neo4j()
+    driver = await get_neo4j()
 
     # Cypher 1: 기존 HAS_MOOD 관계 삭제
     # ⚠️ Movie 노드 식별자는 `id` 속성 (neo4j_loader.py: MERGE (movie:Movie {id: m.id}))
@@ -428,7 +477,7 @@ async def update_es_moods(updates: dict[str, list[str]]) -> int:
     """
     from elasticsearch.helpers import async_bulk as es_async_bulk
 
-    es = get_elasticsearch()
+    es = await get_elasticsearch()
 
     # bulk update 액션 생성
     actions = [
@@ -479,7 +528,7 @@ async def read_movies_from_es() -> list[dict]:
     Returns:
         [{"movie_id": "157336", "title": "...", "genres": [...], ...}, ...]
     """
-    es = get_elasticsearch()
+    es = await get_elasticsearch()
     movies: list[dict] = []
 
     # 초기 검색 (scroll 시작)
@@ -603,8 +652,13 @@ def estimate_cost(
 
     모델별 토큰 단가 기준으로 입력/출력 토큰을 추정한다.
     """
-    # 모델별 단가 ($/1M tokens) — 2025년 기준
+    # 모델별 단가 ($/1M tokens) — (입력, 출력)
     pricing: dict[str, tuple[float, float]] = {
+        # Upstage Solar 모델
+        "solar-pro3": (0.15, 0.60),
+        "solar-pro2": (0.15, 0.60),
+        "solar-mini": (0.15, 0.15),
+        # OpenAI 모델
         "gpt-4o-mini": (0.15, 0.60),
         "gpt-4.1-nano": (0.10, 0.40),
         "gpt-4.1-mini": (0.40, 1.60),
@@ -641,10 +695,12 @@ def estimate_cost(
 
 async def run_mood_enrichment(
     api_key: str,
-    model: str = DEFAULT_MODEL,
-    concurrency: int = DEFAULT_CONCURRENCY,
+    provider: str = "upstage",
+    model: str | None = None,
+    base_url: str | None = None,
+    concurrency: int | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
-    rpm: int = DEFAULT_RPM,
+    rpm: int | None = None,
     source: str = "es",
     jsonl_path: Path | None = None,
     resume: bool = False,
@@ -662,16 +718,24 @@ async def run_mood_enrichment(
     4. 완료 요약 출력
 
     Args:
-        api_key: OpenAI API 키
-        model: 사용할 모델 (기본: gpt-4o-mini)
-        concurrency: 동시 LLM 요청 수 (기본: 20)
+        api_key: LLM API 키 (Upstage/OpenAI)
+        provider: API 제공자 ("upstage" 또는 "openai")
+        model: 사용할 모델 (미지정 시 provider별 기본값)
+        base_url: 커스텀 API 엔드포인트 (미지정 시 provider별 기본값)
+        concurrency: 동시 LLM 요청 수 (미지정 시 provider별 기본값)
         batch_size: 1회 API 호출당 영화 수 (기본: 10)
-        rpm: 분당 최대 요청 수 (기본: 400)
+        rpm: 분당 최대 요청 수 (미지정 시 provider별 기본값)
         source: 데이터 소스 ("es" 또는 "jsonl")
         jsonl_path: JSONL 파일 경로 (source="jsonl" 시)
         resume: 이전 체크포인트에서 재개 여부
         estimate_only: 비용 추정만 출력 (API 호출 없음)
     """
+    # ── Provider별 기본값 적용 ──
+    prov_cfg = PROVIDER_CONFIGS.get(provider, PROVIDER_CONFIGS["upstage"])
+    model = model or prov_cfg["model"]
+    base_url = base_url or prov_cfg["base_url"]
+    rpm = rpm or prov_cfg["rpm"]
+    concurrency = concurrency or prov_cfg["concurrency"]
     # ── 1. 체크포인트 로드 ──
     checkpoint = load_checkpoint() if resume else {}
     offset = checkpoint.get("total_processed", 0) if resume else 0
@@ -710,8 +774,12 @@ async def run_mood_enrichment(
         await close_all_clients()
         return
 
-    # ── 4. OpenAI 클라이언트 초기화 ──
-    client = AsyncOpenAI(api_key=api_key)
+    # ── 4. LLM 클라이언트 초기화 (Upstage/OpenAI 호환) ──
+    client_kwargs: dict = {"api_key": api_key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    client = AsyncOpenAI(**client_kwargs)
+    print(f"         provider={provider} | base_url={base_url or 'default'}")
     semaphore = asyncio.Semaphore(concurrency)
     rpm_limiter = RPMLimiter(rpm)
 
@@ -830,39 +898,53 @@ async def run_mood_enrichment(
 def parse_args() -> argparse.Namespace:
     """커맨드라인 인수를 파싱한다."""
     parser = argparse.ArgumentParser(
-        description="무드태그 보강 스크립트 (외부 LLM API)",
+        description="무드태그 보강 스크립트 (Upstage Solar / OpenAI 호환 API)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 예시:
-  # 기본 실행
-  PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --api-key sk-xxx
+  # Upstage Solar Pro 3으로 실행 (기본, .env의 UPSTAGE_API_KEY 사용)
+  PYTHONPATH=src uv run python scripts/run_mood_enrichment.py
 
-  # 이전 중단점에서 재개
-  PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --resume --api-key sk-xxx
+  # API 키 직접 지정
+  PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --api-key up_xxx
+
+  # 이전 중단점에서 재개 (API 키 교체 가능)
+  PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --resume --api-key up_새키
+
+  # OpenAI GPT-4o-mini로 실행
+  PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --provider openai --api-key sk-xxx
 
   # 비용 추정만
   PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --estimate-only
         """,
     )
     parser.add_argument(
+        "--provider", choices=["upstage", "openai"], default="upstage",
+        help="API 제공자 (기본: upstage)",
+    )
+    parser.add_argument(
         "--api-key", default=None,
-        help="OpenAI API 키 (없으면 OPENAI_API_KEY 환경변수 사용)",
+        help="API 키 (미지정 시 .env에서 provider별 환경변수 사용)",
     )
     parser.add_argument(
-        "--model", default=DEFAULT_MODEL,
-        help=f"사용할 모델 (기본: {DEFAULT_MODEL})",
+        "--model", default=None,
+        help="사용할 모델 (미지정 시 provider별 기본값: upstage=solar-pro3, openai=gpt-4o-mini)",
     )
     parser.add_argument(
-        "--concurrency", type=int, default=DEFAULT_CONCURRENCY,
-        help=f"동시 요청 수 (기본: {DEFAULT_CONCURRENCY})",
+        "--base-url", default=None,
+        help="커스텀 API 엔드포인트 (미지정 시 provider별 기본값)",
+    )
+    parser.add_argument(
+        "--concurrency", type=int, default=None,
+        help="동시 요청 수 (미지정 시 provider별 기본값: upstage=10, openai=20)",
     )
     parser.add_argument(
         "--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
         help=f"1회 API 호출당 영화 수 (기본: {DEFAULT_BATCH_SIZE})",
     )
     parser.add_argument(
-        "--rpm", type=int, default=DEFAULT_RPM,
-        help=f"분당 최대 요청 수 (기본: {DEFAULT_RPM})",
+        "--rpm", type=int, default=None,
+        help="분당 최대 요청 수 (미지정 시 provider별 기본값: upstage=100, openai=400)",
     )
     parser.add_argument(
         "--source", choices=["es", "jsonl"], default="es",
@@ -886,16 +968,22 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
 
-    # API 키 확인 (estimate-only 모드에서는 불필요)
-    api_key = args.api_key or os.environ.get("OPENAI_API_KEY", "")
+    # Provider별 환경변수에서 API 키 로드
+    provider = args.provider
+    prov_cfg = PROVIDER_CONFIGS.get(provider, PROVIDER_CONFIGS["upstage"])
+    api_key = args.api_key or os.environ.get(prov_cfg["env_key"], "")
+
     if not api_key and not args.estimate_only:
-        print("ERROR: --api-key 또는 OPENAI_API_KEY 환경변수를 설정해주세요.")
-        print("  예: PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --api-key sk-xxx")
+        env_key = prov_cfg["env_key"]
+        print(f"ERROR: --api-key 또는 {env_key} 환경변수를 설정해주세요.")
+        print(f"  예: PYTHONPATH=src uv run python scripts/run_mood_enrichment.py --api-key up_xxx")
         sys.exit(1)
 
     asyncio.run(run_mood_enrichment(
         api_key=api_key,
+        provider=provider,
         model=args.model,
+        base_url=args.base_url,
         concurrency=args.concurrency,
         batch_size=args.batch_size,
         rpm=args.rpm,

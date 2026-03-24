@@ -102,8 +102,8 @@ class Settings(BaseSettings):
     # ── Point (포인트 시스템) ──
     # Spring Boot Backend 내부 URL (포인트 API 호출용)
     BACKEND_BASE_URL: str = "http://localhost:8080"
-    # AI 추천 1회당 차감할 포인트 수
-    POINT_COST_PER_RECOMMENDATION: int = 1
+    # AI 추천 1회당 차감할 포인트 수 (init.sql point_items 기준 100P)
+    POINT_COST_PER_RECOMMENDATION: int = 100
     # 포인트 체크 활성화 여부 (False이면 포인트 체크 생략 — 개발/테스트 환경)
     POINT_CHECK_ENABLED: bool = True
     # 회원가입 시 무료 포인트 지급 수

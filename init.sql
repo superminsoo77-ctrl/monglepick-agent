@@ -1,5 +1,5 @@
 -- ============================================================
--- 몽글픽 MySQL 전체 스키마 (36개 테이블)
+-- 몽글픽 MySQL 전체 스키마 (39개 테이블)
 -- ============================================================
 --
 -- v4_t2 최종 개발문서 기준 + 설계서 §4-8 + Qdrant/Neo4j/ES 미러링.
@@ -57,7 +57,12 @@
 --  35. point_items           — 포인트 교환 아이템 (AI 추천 이용권 포함)
 --  36. user_attendance       — 출석 체크
 --
--- ※ 크레딧/구독/결제 5개 테이블 삭제 → 포인트로 통합 (v4_t2 기준)
+-- ── 결제/구독 (3개) ─────────────────────────────────────
+--  37. subscription_plans   — 구독 상품 마스터
+--  38. user_subscriptions   — 사용자 구독 현황
+--  39. payment_orders       — 결제 주문 (Toss Payments)
+--
+-- ※ 기존 크레딧 5개 테이블 삭제 → 포인트+구독+결제로 재구성
 -- ============================================================
 
 CREATE DATABASE IF NOT EXISTS monglepick
@@ -863,14 +868,75 @@ CREATE TABLE IF NOT EXISTS user_attendance (
 
 
 -- ============================================================
--- (삭제됨) 크레딧/구독/결제 시스템 → 포인트로 통합
+-- 37. subscription_plans — 구독 상품 마스터
 -- ============================================================
--- v4_t2 최종 개발문서 기준, 크레딧/구독/결제는 포인트 시스템으로 통합.
--- user_credits, credit_transactions, subscription_plans,
--- user_subscriptions, payment_orders 5개 테이블을 삭제하고
--- user_points, points_history, point_items, user_attendance로 대체.
--- AI 추천 과금도 포인트로 차감 (point_items에 "AI 추천 1회" 아이템).
+-- Toss Payments 연동. 운영팀이 관리하는 구독 상품 정의.
+-- 삭제 대신 is_active=FALSE로 비활성화 (기존 FK 참조 보존).
 -- ============================================================
+CREATE TABLE IF NOT EXISTS subscription_plans (
+    plan_id         BIGINT       AUTO_INCREMENT PRIMARY KEY,
+    plan_code       VARCHAR(50)  NOT NULL UNIQUE       COMMENT '상품 코드 (monthly_basic 등)',
+    name            VARCHAR(100) NOT NULL              COMMENT '상품명',
+    period_type     ENUM('MONTHLY','YEARLY') NOT NULL  COMMENT '구독 주기',
+    price           INT          NOT NULL              COMMENT '가격 (KRW)',
+    points_per_period INT        NOT NULL              COMMENT '주기당 지급 포인트',
+    description     VARCHAR(500) DEFAULT NULL           COMMENT '상품 설명',
+    is_active       BOOLEAN      DEFAULT TRUE          COMMENT '판매 활성화 여부',
+    created_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ============================================================
+-- 38. user_subscriptions — 사용자 구독 현황
+-- ============================================================
+-- 사용자의 구독 상태를 관리한다. active/cancelled/expired 3가지 상태.
+-- 한 사용자가 active 구독을 동시에 2개 이상 가질 수 없다 (서비스 레이어 검증).
+-- auto_renew=TRUE이면 만료일에 자동 결제 시도.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS user_subscriptions (
+    subscription_id BIGINT       AUTO_INCREMENT PRIMARY KEY,
+    user_id         VARCHAR(50)  NOT NULL              COMMENT '구독자 ID',
+    plan_id         BIGINT       NOT NULL              COMMENT '구독 상품 ID',
+    status          ENUM('ACTIVE','CANCELLED','EXPIRED') NOT NULL DEFAULT 'ACTIVE' COMMENT '구독 상태',
+    started_at      TIMESTAMP    NOT NULL              COMMENT '구독 시작일',
+    expires_at      TIMESTAMP    NOT NULL              COMMENT '만료 예정일',
+    cancelled_at    TIMESTAMP    DEFAULT NULL           COMMENT '취소 시각',
+    auto_renew      BOOLEAN      DEFAULT TRUE          COMMENT '자동 갱신 여부',
+    created_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_sub_user (user_id),
+    INDEX idx_sub_status (status),
+    INDEX idx_sub_expires (expires_at),
+    CONSTRAINT fk_sub_plan FOREIGN KEY (plan_id) REFERENCES subscription_plans(plan_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- ============================================================
+-- 39. payment_orders — 결제 주문
+-- ============================================================
+-- Toss Payments 결제를 추적하는 테이블.
+-- order_id는 UUID로 PG에 전달되며, PK로 사용한다.
+-- pending→completed/failed 전이, 환불 시 refunded.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS payment_orders (
+    order_id        VARCHAR(50)  NOT NULL PRIMARY KEY   COMMENT '주문 UUID (PG에 전달)',
+    user_id         VARCHAR(50)  NOT NULL              COMMENT '주문자 ID',
+    order_type      ENUM('POINT_PACK','SUBSCRIPTION') NOT NULL COMMENT '주문 유형',
+    amount          INT          NOT NULL              COMMENT '결제 금액 (KRW)',
+    points_amount   INT          DEFAULT NULL           COMMENT '지급될 포인트 (포인트팩인 경우)',
+    plan_id         BIGINT       DEFAULT NULL           COMMENT '구독 상품 ID (구독인 경우)',
+    status          ENUM('PENDING','COMPLETED','FAILED','REFUNDED') NOT NULL DEFAULT 'PENDING' COMMENT '주문 상태',
+    pg_transaction_id VARCHAR(100) DEFAULT NULL         COMMENT 'PG사 거래 ID',
+    pg_provider     VARCHAR(50)  DEFAULT NULL           COMMENT 'PG사 이름',
+    failed_reason   VARCHAR(500) DEFAULT NULL           COMMENT '실패 사유',
+    completed_at    TIMESTAMP    DEFAULT NULL           COMMENT '결제 완료 시각',
+    created_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_order_user (user_id),
+    INDEX idx_order_status (status),
+    INDEX idx_order_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
 -- ============================================================
@@ -885,3 +951,16 @@ VALUES
     ('프로필 테마',     '프로필 커스텀 테마 적용',       200, 'profile'),
     ('칭호 변경',       '커뮤니티 닉네임 칭호 변경',     150, 'profile'),
     ('도장깨기 힌트',   '퀴즈 힌트 1회 사용',            50, 'roadmap');
+
+
+-- ============================================================
+-- 구독 상품 초기 시드 데이터
+-- ============================================================
+-- 월간/연간 기본/프리미엄 4종. 구독 시 주기마다 포인트 자동 지급.
+-- ============================================================
+INSERT IGNORE INTO subscription_plans (plan_code, name, period_type, price, points_per_period, description)
+VALUES
+    ('monthly_basic',   '월간 기본',     'monthly',  3900,  3000,   '매월 3,000 포인트 지급 (AI 추천 30회)'),
+    ('monthly_premium', '월간 프리미엄',  'monthly',  7900,  8000,   '매월 8,000 포인트 지급 (AI 추천 80회)'),
+    ('yearly_basic',    '연간 기본',     'yearly',   39000, 40000,  '연간 40,000 포인트 지급 (AI 추천 400회)'),
+    ('yearly_premium',  '연간 프리미엄',  'yearly',   79000, 100000, '연간 100,000 포인트 지급 (AI 추천 1,000회)');
