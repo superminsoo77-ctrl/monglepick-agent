@@ -1,6 +1,5 @@
 # ============================================================
 # 몽글픽 AI Agent .gitignore
-# ⚠️  PUBLIC 레포지토리 — 시크릿/키 커밋 절대 금지
 # ============================================================
 
 # ── 환경 변수 / 시크릿 (최우선 차단) ──
@@ -33,6 +32,7 @@ data/
 *.parquet
 *.pickle
 *.pkl
+*.xlsx
 
 # ── IDE / 에디터 ──
 .idea/
@@ -46,7 +46,7 @@ data/
 Thumbs.db
 Desktop.ini
 
-# ── Claude Code 세션 ──
+# ── Claude Code ──
 .claude/
 
 # ── Docker ──
@@ -61,14 +61,5 @@ coverage.xml
 # ── Jupyter ──
 .ipynb_checkpoints/
 
-# scripts/ 디렉토리는 추적 (적재 스크립트 포함)
-# scripts/
-
-*.xlsx
-*.csv
-*.tsv
-*.parquet
-*.pickle
-*.pkl
-
-*.md
+# ── Logs ──
+*.log
