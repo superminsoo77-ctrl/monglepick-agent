@@ -175,14 +175,11 @@ def _row_to_movie_document(row: pd.Series) -> MovieDocument | None:
 
     # ── Phase B: 제작사 ──
     # KaggleLoader에서 production_companies를 파싱한 결과 (list[dict])
+    # Phase C에서 logo_path/origin_country를 포함한 production_companies_full로 확장하므로
+    # 여기서는 파싱 원본(production_companies_parsed)만 보존한다.
     production_companies_parsed = row.get("production_companies_parsed", [])
     if not isinstance(production_companies_parsed, list):
         production_companies_parsed = []
-    production_companies = [
-        {"id": int(c.get("id", 0) or 0), "name": str(c.get("name", ""))}
-        for c in production_companies_parsed
-        if c.get("name")
-    ]
 
     # ── Phase B: 제작 국가 ──
     production_countries_parsed = row.get("production_countries_parsed", [])

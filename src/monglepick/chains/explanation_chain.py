@@ -53,8 +53,8 @@ def _build_fallback_explanation(movie: dict) -> str:
     # 장르 텍스트
     genre_text = ", ".join(genres[:3]) if genres else "다양한 장르"
 
-    # 기본 템플릿
-    parts = [f"{genre_text} 장르의 인기 영화예요."]
+    # 기본 템플릿: 영화 제목을 문두에 포함해 맥락 있는 폴백 문구를 만든다
+    parts = [f"<{title}>은(는) {genre_text} 장르의 인기 영화예요."]
 
     if rating > 0:
         parts.append(f"평점 {rating:.1f}점으로 많은 분들이 좋아하는 작품이에요.")
