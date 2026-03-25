@@ -5,7 +5,12 @@
 .env 파일에서 환경 변수를 로드한다.
 """
 
+import logging
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_config_logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -49,14 +54,14 @@ class Settings(BaseSettings):
     # ── Neo4j ──
     NEO4J_URI: str = "bolt://localhost:7687"
     NEO4J_USER: str = "neo4j"
-    NEO4J_PASSWORD: str = "monglepick_dev"
+    NEO4J_PASSWORD: str = ""  # .env 또는 환경변수로 설정 필수
 
     # ── MySQL ──
     MYSQL_HOST: str = "localhost"
     MYSQL_PORT: int = 3306
     MYSQL_DATABASE: str = "monglepick"
     MYSQL_USER: str = "monglepick"
-    MYSQL_PASSWORD: str = "monglepick_dev"
+    MYSQL_PASSWORD: str = ""  # .env 또는 환경변수로 설정 필수
 
     # ── Embedding (Upstage Solar) ──
     EMBEDDING_MODEL: str = "Upstage/solar-embedding-1-large"
@@ -139,6 +144,16 @@ class Settings(BaseSettings):
     # 초과 영화는 메타데이터 기반 템플릿(_build_fallback_explanation)으로 대체하여
     # Ollama 큐 점유를 줄인다.
     MAX_EXPLANATION_MOVIES: int = 3
+
+
+    @model_validator(mode='after')
+    def _warn_empty_passwords(self):
+        """비밀번호가 비어있으면 경고 로그를 출력한다. (W-1)"""
+        if not self.NEO4J_PASSWORD:
+            _config_logger.warning("NEO4J_PASSWORD가 설정되지 않았습니다. .env 파일을 확인하세요.")
+        if not self.MYSQL_PASSWORD:
+            _config_logger.warning("MYSQL_PASSWORD가 설정되지 않았습니다. .env 파일을 확인하세요.")
+        return self
 
 
 settings = Settings()

@@ -141,9 +141,9 @@ async def context_loader(state: ChatAgentState) -> dict:
             pool = await get_mysql()
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cursor:
-                    # 유저 프로필 조회
+                    # 유저 프로필 조회 — 필요 컬럼만 명시 (W-4: password_hash 노출 방지)
                     await cursor.execute(
-                        "SELECT * FROM users WHERE user_id = %s LIMIT 1",
+                        "SELECT user_id, nickname, email, profile_image, user_role, user_birth FROM users WHERE user_id = %s LIMIT 1",
                         (user_id,),
                     )
                     row = await cursor.fetchone()
@@ -694,8 +694,9 @@ def _parse_era(era: str) -> tuple[int, int] | None:
     if match:
         year_str = match.group(1)
         if len(year_str) == 2:
-            # "90년대" → 1990
-            base = 1900 + int(year_str)
+            # "10년대" → 2010, "90년대" → 1990 (W-2: 50 기준으로 세기 판별)
+            year_val = int(year_str)
+            base = (2000 if year_val < 50 else 1900) + year_val
         else:
             # "2020년대" → 2020
             base = int(year_str)

@@ -164,6 +164,9 @@ async def lifespan(app: FastAPI):
     # ── Shutdown ──
     shutdown_start = time.perf_counter()
     logger.info("app_shutdown")
+    # httpx 클라이언트 정리 (C-2: 리소스 누수 방지)
+    from monglepick.api.point_client import close_client
+    await close_client()
     await close_all_clients()
     shutdown_elapsed_ms = (time.perf_counter() - shutdown_start) * 1000
     logger.info("app_shutdown_complete", elapsed_ms=round(shutdown_elapsed_ms, 1))

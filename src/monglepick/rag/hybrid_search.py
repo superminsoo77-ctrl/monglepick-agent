@@ -20,7 +20,7 @@ from langsmith import traceable
 from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
 from monglepick.config import settings
-from monglepick.data_pipeline.embedder import embed_query
+from monglepick.data_pipeline.embedder import embed_query_async
 from monglepick.db.clients import ES_INDEX_NAME, get_elasticsearch, get_neo4j, get_qdrant
 
 logger = structlog.get_logger()
@@ -62,8 +62,8 @@ async def search_qdrant(
     qdrant_start = time.perf_counter()
     client = await get_qdrant()
 
-    # 쿼리 임베딩 (multilingual-e5: "query: " 접두사)
-    query_vector = embed_query(query).tolist()
+    # 쿼리 임베딩 — 비동기 래퍼로 event loop 블로킹 방지 (C-1)
+    query_vector = (await embed_query_async(query)).tolist()
 
     # 필터 조건 구성 (§10-2-1 payload 인덱스 활용)
     conditions = []
@@ -506,34 +506,56 @@ async def hybrid_search(
     # 병렬 검색 전체 타이밍 측정 시작
     search_start = time.perf_counter()
 
-    # 3개 검색 엔진 동시 실행
-    qdrant_task = search_qdrant(
-        query=query,
-        top_k=30,
-        genre_filter=genre_filter,
-        mood_filter=mood_tags,
-        ott_filter=ott_filter,
-        min_rating=min_rating,
-        year_range=year_range,
-    )
+    # 3개 검색 엔진 동시 실행 — 개별 장애 시 해당 소스만 건너뜀 (W-6)
+    qdrant_results: list[SearchResult] = []
+    es_results: list[SearchResult] = []
+    neo4j_results: list[SearchResult] = []
 
-    es_task = search_elasticsearch(
-        query=query,
-        top_k=20,
-        genre_filter=genre_filter,
-        mood_filter=mood_tags,
-    )
+    async def _safe_search_qdrant() -> list[SearchResult]:
+        """Qdrant 검색 래퍼. 실패 시 빈 리스트 반환."""
+        try:
+            return await search_qdrant(
+                query=query,
+                top_k=30,
+                genre_filter=genre_filter,
+                mood_filter=mood_tags,
+                ott_filter=ott_filter,
+                min_rating=min_rating,
+                year_range=year_range,
+            )
+        except Exception as e:
+            logger.warning("qdrant_search_failed_skipping", error=str(e), error_type=type(e).__name__)
+            return []
 
-    neo4j_task = search_neo4j(
-        mood_tags=mood_tags,
-        genres=genre_filter,
-        director=director,
-        similar_to_movie_id=similar_to_movie_id,
-        top_k=15,
-    )
+    async def _safe_search_es() -> list[SearchResult]:
+        """ES 검색 래퍼. 실패 시 빈 리스트 반환."""
+        try:
+            return await search_elasticsearch(
+                query=query,
+                top_k=20,
+                genre_filter=genre_filter,
+                mood_filter=mood_tags,
+            )
+        except Exception as e:
+            logger.warning("es_search_failed_skipping", error=str(e), error_type=type(e).__name__)
+            return []
+
+    async def _safe_search_neo4j() -> list[SearchResult]:
+        """Neo4j 검색 래퍼. 실패 시 빈 리스트 반환."""
+        try:
+            return await search_neo4j(
+                mood_tags=mood_tags,
+                genres=genre_filter,
+                director=director,
+                similar_to_movie_id=similar_to_movie_id,
+                top_k=15,
+            )
+        except Exception as e:
+            logger.warning("neo4j_search_failed_skipping", error=str(e), error_type=type(e).__name__)
+            return []
 
     qdrant_results, es_results, neo4j_results = await asyncio.gather(
-        qdrant_task, es_task, neo4j_task,
+        _safe_search_qdrant(), _safe_search_es(), _safe_search_neo4j(),
     )
 
     # 병렬 검색 소요 시간 계산

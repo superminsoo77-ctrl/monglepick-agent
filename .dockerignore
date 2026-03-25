@@ -1,0 +1,45 @@
+# =========================================
+# AI Agent Docker 빌드 제외 파일
+# =========================================
+
+# Python 가상환경 (Docker 내부에서 별도 설치)
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 테스트/개발 도구
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# 문서/설정
+*.md
+CLAUDE.md
+.claude/
+docs/
+
+# 환경변수 (Docker Compose에서 주입)
+.env
+.env.*
+
+# 데이터 파일 (볼륨으로 마운트)
+data/
+*.jsonl
+*.json.gz
+
+# Docker 관련
+docker-compose*.yml
+Dockerfile*
+.dockerignore

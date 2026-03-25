@@ -14,6 +14,8 @@ Backend 통신: httpx.AsyncClient (내부 HTTP, 같은 VM/네트워크)
 
 from __future__ import annotations
 
+import asyncio
+
 import structlog
 from pydantic import BaseModel
 
@@ -60,21 +62,35 @@ class PointDeductResult(BaseModel):
 
 # httpx.AsyncClient는 앱 수명 동안 한 번만 생성하여 커넥션 풀을 재사용한다.
 _client = None
+# 싱글턴 동시 생성 방지용 Lock (W-5)
+_client_lock = asyncio.Lock()
 
 
 async def _get_http_client():
-    """httpx.AsyncClient 싱글턴을 반환한다. 최초 호출 시 생성."""
+    """httpx.AsyncClient 싱글턴을 반환한다. Lock으로 동시 생성을 방지한다."""
     global _client
-    if _client is None:
-        import httpx
-        from monglepick.config import settings
+    if _client is not None:
+        return _client
+    async with _client_lock:
+        # double-check: Lock 대기 중 다른 코루틴이 이미 생성했을 수 있음
+        if _client is None:
+            import httpx
+            from monglepick.config import settings
 
-        _client = httpx.AsyncClient(
-            base_url=settings.BACKEND_BASE_URL,
-            timeout=httpx.Timeout(5.0),  # 내부 통신 5초 타임아웃
-            headers={"X-Service-Key": settings.SERVICE_API_KEY},
-        )
+            _client = httpx.AsyncClient(
+                base_url=settings.BACKEND_BASE_URL,
+                timeout=httpx.Timeout(5.0),  # 내부 통신 5초 타임아웃
+                headers={"X-Service-Key": settings.SERVICE_API_KEY},
+            )
     return _client
+
+
+async def close_client():
+    """앱 종료 시 httpx 클라이언트를 정리한다. (C-2)"""
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None
 
 
 async def check_point(user_id: str, cost: int = 1) -> PointCheckResult:

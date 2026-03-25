@@ -224,9 +224,8 @@ def route_after_retrieval(state: ChatAgentState) -> str:
         return "recommendation_ranker"
     else:
         # 품질 미달: state에 피드백 메시지 설정 (question_generator에서 활용)
-        # Note: LangGraph에서 라우터는 state를 수정할 수 없으므로
-        # rag_retriever에서 미리 설정하거나, 별도 노드가 필요하다.
-        # 여기서는 state.retrieval_feedback이 이미 rag_retriever에서 설정된다고 가정.
+        # retrieval_quality_checker 노드가 retrieval_feedback을 설정한 후
+        # 이 라우터가 호출된다. quality_ok/quality_low 분기를 결정한다. (W-3)
         return "question_generator"
 
 

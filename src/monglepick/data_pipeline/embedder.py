@@ -127,3 +127,20 @@ def embed_query(query: str) -> np.ndarray:
     )
 
     return np.array(response.data[0].embedding)
+
+
+async def embed_query_async(query: str) -> np.ndarray:
+    """
+    embed_query의 비동기 래퍼. event loop 블로킹을 방지한다.
+
+    embed_query()는 동기 HTTP 호출(Upstage API)을 수행하므로
+    async 함수 내에서 직접 호출하면 event loop가 수백ms 동안 블로킹된다.
+    asyncio.to_thread()로 별도 스레드에서 실행하여 블로킹을 방지한다.
+
+    Args:
+        query: 검색 쿼리 텍스트
+
+    Returns:
+        np.ndarray: shape (embedding_dimension,) — 4096차원 벡터
+    """
+    return await asyncio.to_thread(embed_query, query)
