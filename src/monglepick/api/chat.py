@@ -26,14 +26,13 @@ import io
 import re
 import time
 
+import jwt
 import structlog
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
-
-import jwt
 
 from monglepick.agents.chat.graph import run_chat_agent, run_chat_agent_sync
 from monglepick.config import settings
@@ -72,99 +71,6 @@ _DATA_URL_RE = re.compile(r"^data:[^;]+;base64,", re.IGNORECASE)
 
 # Pillow DecompressionBomb 방어: 모듈 로드 시 1회만 설정 (C-4)
 Image.MAX_IMAGE_PIXELS = settings.IMAGE_MAX_PIXELS
-
-
-# ============================================================
-# JWT 검증 (Client → Agent 요청의 user_id 위조 방지)
-# ============================================================
-
-def _extract_user_id_from_jwt(raw_request: Request) -> str | None:
-    """
-    Authorization 헤더에서 JWT를 추출하고 user_id를 반환한다.
-
-    JWT_SECRET이 미설정이면 검증을 건너뛴다 (개발 환경 호환).
-    JWT가 유효하면 subject(user_id)를 반환하고, 유효하지 않으면 None을 반환한다.
-
-    Args:
-        raw_request: FastAPI Request 객체
-
-    Returns:
-        JWT에서 추출한 user_id 또는 None (JWT 없음/무효/미설정)
-    """
-    # JWT_SECRET 미설정 → 검증 건너뜀 (개발 환경)
-    if not settings.JWT_SECRET:
-        return None
-
-    # Authorization 헤더 추출
-    auth_header = raw_request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return None
-
-    token = auth_header[7:]  # "Bearer " 이후
-
-    try:
-        # Backend와 동일한 HS256 알고리즘으로 검증
-        payload = jwt.decode(
-            token,
-            settings.JWT_SECRET,
-            algorithms=["HS256"],
-        )
-        # Refresh Token은 거부 (access token만 허용)
-        if payload.get("type") == "refresh":
-            logger.warning("jwt_refresh_token_rejected")
-            return None
-        # subject = user_id
-        user_id = payload.get("sub", "")
-        if user_id:
-            return user_id
-        return None
-    except jwt.ExpiredSignatureError:
-        logger.debug("jwt_expired")
-        return None
-    except jwt.InvalidTokenError as e:
-        logger.debug("jwt_invalid", error=str(e))
-        return None
-
-
-def _resolve_user_id(request_user_id: str, raw_request: Request) -> str:
-    """
-    JWT와 요청 body의 user_id를 비교하여 최종 user_id를 결정한다.
-
-    우선순위:
-    1. JWT가 유효하면 JWT의 user_id를 사용 (body의 user_id 무시)
-    2. JWT가 없거나 무효하고 JWT_SECRET이 설정되어 있으면 body의 user_id도 거부 → 익명
-    3. JWT_SECRET이 미설정이면 body의 user_id를 그대로 사용 (개발 환경 호환)
-
-    Args:
-        request_user_id: 요청 body의 user_id
-        raw_request: FastAPI Request 객체
-
-    Returns:
-        검증된 user_id (빈 문자열이면 익명)
-    """
-    jwt_user_id = _extract_user_id_from_jwt(raw_request)
-
-    if jwt_user_id:
-        # JWT 유효 → JWT의 user_id 사용
-        if request_user_id and request_user_id != jwt_user_id:
-            logger.warning(
-                "user_id_mismatch_jwt_overrides",
-                body_user_id=request_user_id,
-                jwt_user_id=jwt_user_id,
-            )
-        return jwt_user_id
-
-    if settings.JWT_SECRET:
-        # JWT_SECRET 설정됨 + JWT 없음/무효 → body의 user_id 무시 (스푸핑 방지)
-        if request_user_id:
-            logger.warning(
-                "no_valid_jwt_body_user_id_ignored",
-                body_user_id=request_user_id,
-            )
-        return ""  # 익명 처리
-
-    # JWT_SECRET 미설정 → 개발 환경, body의 user_id 그대로 사용
-    return request_user_id
 
 
 # ============================================================

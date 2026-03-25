@@ -35,7 +35,7 @@ from monglepick.data_pipeline.neo4j_loader import load_to_neo4j
 from monglepick.data_pipeline.preprocessor import process_raw_movie
 from monglepick.data_pipeline.qdrant_loader import load_to_qdrant
 from monglepick.data_pipeline.tmdb_collector import TMDBCollector
-from monglepick.db.clients import init_all_clients, close_all_clients
+from monglepick.db.clients import close_all_clients, init_all_clients
 
 logger = structlog.get_logger()
 

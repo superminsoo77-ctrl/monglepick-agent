@@ -20,7 +20,6 @@ KOBIS는 TMDB와 달리 줄거리(overview), 키워드(keywords), 무드태그, 
 
 from __future__ import annotations
 
-import re
 import structlog
 
 from monglepick.data_pipeline.kobis_collector import _normalize_title

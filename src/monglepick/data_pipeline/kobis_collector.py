@@ -27,10 +27,10 @@ from typing import Any
 
 import httpx
 import structlog
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from monglepick.config import settings
-from monglepick.data_pipeline.models import KOBISRawMovie, KOBISBoxOffice
+from monglepick.data_pipeline.models import KOBISBoxOffice, KOBISRawMovie
 
 logger = structlog.get_logger()
 

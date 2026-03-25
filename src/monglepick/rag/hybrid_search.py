@@ -12,12 +12,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 
 import structlog
 from langsmith import traceable
-from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+from qdrant_client.models import FieldCondition, Filter, MatchAny
 
 from monglepick.config import settings
 from monglepick.data_pipeline.embedder import embed_query_async
@@ -25,8 +26,8 @@ from monglepick.db.clients import ES_INDEX_NAME, get_elasticsearch, get_neo4j, g
 
 logger = structlog.get_logger()
 
-# RRF 상수 (§11-1: k=60)
-RRF_K = 60
+# RRF 상수 (§11-1: k=60) — config.py에서 환경변수로 설정 가능
+RRF_K = settings.RRF_K
 
 
 @dataclass
@@ -63,7 +64,15 @@ async def search_qdrant(
     client = await get_qdrant()
 
     # 쿼리 임베딩 — 비동기 래퍼로 event loop 블로킹 방지 (C-1)
-    query_vector = (await embed_query_async(query)).tolist()
+    # Upstage API 장애 시 무한 대기 방지를 위해 30초 타임아웃 적용
+    try:
+        query_vector = (await asyncio.wait_for(
+            embed_query_async(query),
+            timeout=30.0,
+        )).tolist()
+    except asyncio.TimeoutError:
+        logger.error("embedding_api_timeout", query_preview=query[:80], timeout_sec=30)
+        return []  # 임베딩 실패 시 빈 결과 반환 (RRF에서 다른 엔진 결과만 사용)
 
     # 필터 조건 구성 (§10-2-1 payload 인덱스 활용)
     conditions = []

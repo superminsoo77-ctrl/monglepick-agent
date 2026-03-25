@@ -13,7 +13,7 @@ import traceback
 import aiomysql
 import structlog
 from elasticsearch import AsyncElasticsearch
-from neo4j import AsyncGraphDatabase, AsyncDriver
+from neo4j import AsyncDriver, AsyncGraphDatabase
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
     Distance,

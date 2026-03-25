@@ -17,14 +17,14 @@ Kaggle에서 제공되지 않는 필드:
 
 from __future__ import annotations
 
-import structlog
 import pandas as pd
+import structlog
 
 from monglepick.data_pipeline.kaggle_loader import KaggleLoader
 from monglepick.data_pipeline.models import MovieDocument
 from monglepick.data_pipeline.preprocessor import (
-    convert_genres,
     build_embedding_text,
+    convert_genres,
     get_fallback_mood_tags,
     validate_movie,
 )

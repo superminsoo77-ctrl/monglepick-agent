@@ -387,23 +387,39 @@ async def _lookup_reference_movie_info(movie_titles: list[str]) -> dict[str, lis
     all_mood_tags: list[str] = []
 
     # 최대 3개 영화만 조회 (과다 조회 방지)
-    for title in movie_titles[:3]:
-        try:
-            resp = await es.search(
-                index=ES_INDEX_NAME,
-                body={
-                    "query": {
-                        "match": {
-                            "title": {
-                                "query": title,
-                                "analyzer": "korean_analyzer",
-                            }
+    titles_to_search = movie_titles[:3]
+    if not titles_to_search:
+        return {"genres": [], "mood_tags": []}
+
+    try:
+        # ES msearch API로 배치 조회 (N+1 → 1회 요청으로 개선)
+        search_body: list[dict] = []
+        for title in titles_to_search:
+            # msearch 헤더: 인덱스 지정
+            search_body.append({"index": ES_INDEX_NAME})
+            # msearch 본문: 개별 쿼리
+            search_body.append({
+                "query": {
+                    "match": {
+                        "title": {
+                            "query": title,
+                            "analyzer": "korean_analyzer",
                         }
-                    },
-                    "size": 1,
+                    }
                 },
-            )
-            hits = resp["hits"]["hits"]
+                "size": 1,
+            })
+
+        resp = await es.msearch(body=search_body)
+
+        # msearch 응답에서 각 영화의 장르/무드 추출
+        for i, sub_resp in enumerate(resp["responses"]):
+            title = titles_to_search[i]
+            if "error" in sub_resp:
+                logger.warning("reference_movie_lookup_error", query_title=title, error=str(sub_resp["error"]))
+                continue
+
+            hits = sub_resp.get("hits", {}).get("hits", [])
             if hits:
                 source = hits[0]["_source"]
                 genres = source.get("genres", [])
@@ -421,9 +437,10 @@ async def _lookup_reference_movie_info(movie_titles: list[str]) -> dict[str, lis
                 )
             else:
                 logger.info("reference_movie_lookup_miss", query_title=title)
-        except Exception as e:
-            logger.warning("reference_movie_lookup_error", query_title=title, error=str(e))
-            continue
+
+    except Exception as e:
+        # msearch 실패 시 빈 결과 반환 (기존 개별 호출도 에러 시 continue였으므로 동일한 graceful degradation)
+        logger.warning("reference_movie_msearch_error", error=str(e))
 
     # 중복 제거 (순서 유지)
     return {
@@ -689,26 +706,30 @@ def _parse_era(era: str) -> tuple[int, int] | None:
     if not era:
         return None
 
-    # "2020년대", "90년대" 패턴
-    match = re.match(r"(\d{2,4})년대", era)
-    if match:
-        year_str = match.group(1)
-        if len(year_str) == 2:
-            # "10년대" → 2010, "90년대" → 1990 (W-2: 50 기준으로 세기 판별)
-            year_val = int(year_str)
-            base = (2000 if year_val < 50 else 1900) + year_val
-        else:
-            # "2020년대" → 2020
-            base = int(year_str)
-        return (base, base + 9)
+    try:
+        # "2020년대", "90년대" 패턴
+        match = re.match(r"(\d{2,4})년대", era)
+        if match:
+            year_str = match.group(1)
+            if len(year_str) == 2:
+                # "10년대" → 2010, "90년대" → 1990 (W-2: 50 기준으로 세기 판별)
+                year_val = int(year_str)
+                base = (2000 if year_val < 50 else 1900) + year_val
+            else:
+                # "2020년대" → 2020
+                base = int(year_str)
+            return (base, base + 9)
 
-    # 단순 연도 "2020"
-    match = re.match(r"(\d{4})", era)
-    if match:
-        year = int(match.group(1))
-        return (year, year)
+        # 단순 연도 "2020"
+        match = re.match(r"(\d{4})", era)
+        if match:
+            year = int(match.group(1))
+            return (year, year)
 
-    return None
+        return None
+    except (ValueError, OverflowError):
+        # 방어적 처리: 정규식이 digits를 보장하지만, 예상치 못한 변환 실패 시 None 반환
+        return None
 
 
 @traceable(name="query_builder", run_type="chain", metadata={"node": "6/13", "llm": "none"})

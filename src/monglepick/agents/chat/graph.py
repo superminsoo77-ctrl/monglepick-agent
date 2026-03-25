@@ -55,7 +55,6 @@ from monglepick.agents.chat.models import (
     TURN_COUNT_OVERRIDE,
     ChatAgentState,
 )
-from monglepick.memory.session_store import load_session, save_session
 from monglepick.agents.chat.nodes import (
     context_loader,
     error_handler,
@@ -72,6 +71,7 @@ from monglepick.agents.chat.nodes import (
     retrieval_quality_checker,
     tool_executor_node,
 )
+from monglepick.memory.session_store import load_session, save_session
 
 logger = structlog.get_logger()
 
@@ -180,8 +180,8 @@ def route_after_retrieval(state: ChatAgentState) -> str:
 
     품질 기준 (모두 충족해야 PASS):
     1. 후보 수 ≥ RETRIEVAL_MIN_CANDIDATES (3개)
-    2. Top-1 RRF 점수 ≥ RETRIEVAL_MIN_TOP_SCORE (0.02)
-    3. 상위 5개 평균 ≥ RETRIEVAL_QUALITY_MIN_AVG (0.015)
+    2. Top-1 RRF 점수 ≥ RETRIEVAL_MIN_TOP_SCORE (0.015)
+    3. 상위 5개 평균 ≥ RETRIEVAL_QUALITY_MIN_AVG (0.01)
 
     품질 미달 + turn_count < TURN_COUNT_OVERRIDE(2) → question_generator (추가 질문)
     품질 미달 + turn_count ≥ TURN_COUNT_OVERRIDE(2) → recommendation_ranker (있는 결과로 진행)

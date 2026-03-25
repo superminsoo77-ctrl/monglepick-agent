@@ -151,6 +151,14 @@ async def lifespan(app: FastAPI):
             stack_trace=traceback.format_exc(), elapsed_ms=round(db_elapsed_ms, 1),
         )
 
+    # ── [2.5] 보안 설정 점검 ──
+    # JWT_SECRET 미설정 시 경고: 프로덕션에서는 JWT 검증이 비활성화됨
+    if not settings.JWT_SECRET:
+        logger.warning(
+            "jwt_secret_not_configured",
+            message="JWT_SECRET이 설정되지 않았습니다. JWT 검증이 비활성화됩니다. (개발 환경 전용)",
+        )
+
     # ── [3] Ollama 모델 사전 로드 (warmup) ──
     # 앱 시작 시 두 모델에 dummy 호출을 수행하여 GPU에 미리 로드한다.
     # 이를 통해 사용자 첫 요청에서 cold start(30~90초)를 제거한다.

@@ -27,10 +27,10 @@ import structlog
 
 from monglepick.data_pipeline.models import KMDbRawMovie, MovieDocument
 from monglepick.data_pipeline.preprocessor import (
+    GENRE_EN_TO_KR,
     build_embedding_text,
     get_fallback_mood_tags,
     validate_movie,
-    GENRE_EN_TO_KR,
 )
 
 logger = structlog.get_logger()

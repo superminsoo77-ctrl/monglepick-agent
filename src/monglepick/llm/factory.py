@@ -16,6 +16,7 @@ LLM 팩토리 — ChatOllama 인스턴스 생성 및 캐싱.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import structlog
@@ -36,6 +37,10 @@ _llm_cache: dict[tuple[str, float, str | None], ChatOllama] = {}
 
 # 구조화 출력 캐시: (model, temperature, schema_name) → Runnable
 _structured_cache: dict[tuple[str, float, str], Runnable] = {}
+
+# 캐시 접근 보호용 락 — 동시 호출 시 중복 인스턴스 생성 방지
+# RLock: get_structured_llm이 내부에서 get_llm을 호출하므로 재진입 허용
+_cache_lock = threading.RLock()
 
 
 def get_llm(
@@ -66,38 +71,40 @@ def get_llm(
     # 캐시 키 생성
     cache_key = (model, temperature, format)
 
-    if cache_key not in _llm_cache:
-        # ChatOllama 인스턴스 생성
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "temperature": temperature,
-            "base_url": settings.OLLAMA_BASE_URL,
-        }
-        if format is not None:
-            kwargs["format"] = format
-        if num_predict is not None:
-            kwargs["num_predict"] = num_predict
+    # RLock으로 동시 호출 시 중복 인스턴스 생성 방지
+    with _cache_lock:
+        if cache_key not in _llm_cache:
+            # ChatOllama 인스턴스 생성
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "temperature": temperature,
+                "base_url": settings.OLLAMA_BASE_URL,
+            }
+            if format is not None:
+                kwargs["format"] = format
+            if num_predict is not None:
+                kwargs["num_predict"] = num_predict
 
-        _llm_cache[cache_key] = ChatOllama(**kwargs)
-        # 캐시 미스: 새 인스턴스 생성 로깅
-        logger.info(
-            "llm_instance_created",
-            model=model,
-            temperature=temperature,
-            format=format,
-            num_predict=num_predict,
-            base_url=settings.OLLAMA_BASE_URL,
-        )
-    else:
-        # 캐시 히트: 기존 인스턴스 재사용 로깅 (DEBUG 레벨, 과다 로깅 방지)
-        logger.debug(
-            "llm_cache_hit",
-            model=model,
-            temperature=temperature,
-            format=format,
-        )
+            _llm_cache[cache_key] = ChatOllama(**kwargs)
+            # 캐시 미스: 새 인스턴스 생성 로깅
+            logger.info(
+                "llm_instance_created",
+                model=model,
+                temperature=temperature,
+                format=format,
+                num_predict=num_predict,
+                base_url=settings.OLLAMA_BASE_URL,
+            )
+        else:
+            # 캐시 히트: 기존 인스턴스 재사용 로깅 (DEBUG 레벨, 과다 로깅 방지)
+            logger.debug(
+                "llm_cache_hit",
+                model=model,
+                temperature=temperature,
+                format=format,
+            )
 
-    return _llm_cache[cache_key]
+        return _llm_cache[cache_key]
 
 
 def get_structured_llm(
@@ -125,30 +132,33 @@ def get_structured_llm(
     # 구조화 출력 캐시 키
     cache_key = (model, temperature, schema.__name__)
 
-    if cache_key not in _structured_cache:
-        # 기본 ChatOllama 인스턴스 가져오기
-        llm = get_llm(model=model, temperature=temperature, format="json")
-        # 구조화 출력 적용
-        _structured_cache[cache_key] = llm.with_structured_output(
-            schema, method="json_schema",
-        )
-        # 캐시 미스: 새 구조화 출력 인스턴스 생성 로깅
-        logger.info(
-            "structured_llm_created",
-            model=model,
-            temperature=temperature,
-            schema=schema.__name__,
-        )
-    else:
-        # 캐시 히트 로깅 (DEBUG 레벨)
-        logger.debug(
-            "structured_llm_cache_hit",
-            model=model,
-            temperature=temperature,
-            schema=schema.__name__,
-        )
+    # RLock으로 동시 호출 시 중복 인스턴스 생성 방지
+    # (내부 get_llm 호출도 같은 락을 사용하므로 RLock 필수)
+    with _cache_lock:
+        if cache_key not in _structured_cache:
+            # 기본 ChatOllama 인스턴스 가져오기
+            llm = get_llm(model=model, temperature=temperature, format="json")
+            # 구조화 출력 적용
+            _structured_cache[cache_key] = llm.with_structured_output(
+                schema, method="json_schema",
+            )
+            # 캐시 미스: 새 구조화 출력 인스턴스 생성 로깅
+            logger.info(
+                "structured_llm_created",
+                model=model,
+                temperature=temperature,
+                schema=schema.__name__,
+            )
+        else:
+            # 캐시 히트 로깅 (DEBUG 레벨)
+            logger.debug(
+                "structured_llm_cache_hit",
+                model=model,
+                temperature=temperature,
+                schema=schema.__name__,
+            )
 
-    return _structured_cache[cache_key]
+        return _structured_cache[cache_key]
 
 
 # ============================================================

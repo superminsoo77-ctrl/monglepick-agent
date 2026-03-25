@@ -30,6 +30,7 @@ from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field
 
+from monglepick.config import settings as _settings
 
 # ============================================================
 # 의도 분류 결과
@@ -226,12 +227,12 @@ PREFERENCE_WEIGHTS: dict[str, float] = {
     "exclude": 0.5,
 }
 
-# 충분성 판정 임계값 (기존 3.0 → 2.5로 하향)
+# 충분성 판정 임계값 — config.py에서 환경변수로 설정 가능 (기본값 2.5)
 # 장르+감정(4.0), 참조영화+감정(3.5) 등 2개 이상 정보가 있으면 바로 추천 진행
 # 감정만 있으면(2.0 < 2.5) 추가 질문, 턴2 오버라이드(TURN_COUNT_OVERRIDE=2)로 보완
-SUFFICIENCY_THRESHOLD: float = 2.5
+SUFFICIENCY_THRESHOLD: float = _settings.SUFFICIENCY_THRESHOLD
 # 턴 카운트 오버라이드 임계값 (2턴째부터는 선호 부족해도 추천 진행)
-TURN_COUNT_OVERRIDE: int = 2
+TURN_COUNT_OVERRIDE: int = _settings.TURN_COUNT_OVERRIDE
 
 
 # ============================================================
@@ -319,13 +320,13 @@ FIELD_HINTS: dict[str, dict[str, Any]] = {
 # RAG 검색 품질 판정 임계값 (Part 3)
 # ============================================================
 
-# 최소 후보 수: 이 값 미만이면 검색 품질 미달
-RETRIEVAL_MIN_CANDIDATES: int = 3
+# 최소 후보 수: 이 값 미만이면 검색 품질 미달 — config.py에서 환경변수로 설정 가능
+RETRIEVAL_MIN_CANDIDATES: int = _settings.RETRIEVAL_MIN_CANDIDATES
 # Top-1 RRF 점수 최소값: RRF(k=60)에서 단일 엔진 1위 = 1/61 ≈ 0.01639
 # 0.015로 설정하면 최소 1개 엔진에서 Top-2 이내에 포함되어야 통과
-RETRIEVAL_MIN_TOP_SCORE: float = 0.015
+RETRIEVAL_MIN_TOP_SCORE: float = _settings.RETRIEVAL_MIN_TOP_SCORE
 # 상위 5개 평균 RRF 점수 최소값
-RETRIEVAL_QUALITY_MIN_AVG: float = 0.01
+RETRIEVAL_QUALITY_MIN_AVG: float = _settings.RETRIEVAL_QUALITY_MIN_AVG
 
 
 # ============================================================

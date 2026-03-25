@@ -75,6 +75,7 @@ async def _get_http_client():
         # double-check: Lock 대기 중 다른 코루틴이 이미 생성했을 수 있음
         if _client is None:
             import httpx
+
             from monglepick.config import settings
 
             _client = httpx.AsyncClient(

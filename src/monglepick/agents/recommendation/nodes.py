@@ -33,24 +33,25 @@ from monglepick.agents.chat.models import (
     ScoreDetail,
 )
 from monglepick.agents.recommendation.models import RecommendationEngineState
+from monglepick.config import settings as _settings
 from monglepick.db.clients import get_redis
 
 logger = structlog.get_logger()
 
-# ── 상수 ──
+# ── 상수 (config.py에서 환경변수로 설정 가능) ──
 
 # Cold Start 임계값 (§7-2 Node 1)
-COLD_START_THRESHOLD = 5     # 시청 < 5편: Cold Start
-WARM_START_THRESHOLD = 30    # 시청 5~29편: Warm Start, 30편+: 정상
+COLD_START_THRESHOLD = _settings.COLD_START_THRESHOLD     # 시청 < 5편: Cold Start
+WARM_START_THRESHOLD = _settings.WARM_START_THRESHOLD     # 시청 5~29편: Warm Start, 30편+: 정상
 
-# CF 캐시 미스 시 기본값
+# CF 캐시 미스 시 기본값 (내부 구현 상수, config 미포함)
 CF_DEFAULT_SCORE = 0.5
 
 # MMR 파라미터 (§7-2 Node 6)
-MMR_LAMBDA = 0.7  # 관련성 70% + 다양성 30%
+MMR_LAMBDA = _settings.MMR_LAMBDA  # 관련성 70% + 다양성 30%
 
 # 최종 선택 영화 수
-TOP_K = 5
+TOP_K = _settings.RECOMMENDATION_TOP_K
 
 # Redis 키 접두사 (cf_builder.py와 동일)
 KEY_SIMILAR_USERS = "cf:similar_users:{user_id}"
@@ -152,6 +153,9 @@ async def collaborative_filter(state: RecommendationEngineState) -> dict:
             logger.info("cf_anonymous_user", score=CF_DEFAULT_SCORE)
             return {"cf_scores": cf_scores}
 
+        # similar_users_raw를 try 블록 밖에서 초기화하여 로깅 시 안전하게 접근 (dir() 안티패턴 제거)
+        similar_users_raw: list = []
+
         try:
             redis = await get_redis()
 
@@ -195,7 +199,11 @@ async def collaborative_filter(state: RecommendationEngineState) -> dict:
                     # 해당 유사 유저가 이 영화를 평가했는지 확인
                     if c_id in user_ratings:
                         sim_val = sim_scores_map[sim_uid]
-                        rating_val = float(user_ratings[c_id])
+                        try:
+                            rating_val = float(user_ratings[c_id])
+                        except (ValueError, TypeError):
+                            # Redis 데이터 손상 시 해당 유저의 평점을 건너뜀
+                            continue
                         numerator += sim_val * rating_val
                         denominator += abs(sim_val)
 
@@ -226,7 +234,7 @@ async def collaborative_filter(state: RecommendationEngineState) -> dict:
             user_id=user_id,
             candidate_count=len(cf_scores),
             avg_score=round(sum(cf_scores.values()) / max(len(cf_scores), 1), 4),
-            similar_user_count=len(similar_users_raw) if 'similar_users_raw' in dir() else 0,
+            similar_user_count=len(similar_users_raw),
             top_cf_scores=[
                 {
                     "title": candidate_title_map.get(mid, mid),

@@ -145,14 +145,45 @@ class Settings(BaseSettings):
     # Ollama 큐 점유를 줄인다.
     MAX_EXPLANATION_MOVIES: int = 3
 
+    # ── Retrieval Quality Thresholds (RAG 검색 품질 판정) ──
+    # 최소 후보 수: 이 값 미만이면 검색 품질 미달
+    RETRIEVAL_MIN_CANDIDATES: int = 3
+    # Top-1 RRF 점수 최소값
+    RETRIEVAL_MIN_TOP_SCORE: float = 0.015
+    # 상위 5개 평균 RRF 점수 최소값
+    RETRIEVAL_QUALITY_MIN_AVG: float = 0.01
+    # 선호 충분성 판정 임계값 (가중치 합산이 이 값 이상이면 추천 진행)
+    SUFFICIENCY_THRESHOLD: float = 2.5
+    # 턴 카운트 오버라이드 (이 턴 이상이면 선호 부족해도 추천 진행)
+    TURN_COUNT_OVERRIDE: int = 2
+
+    # ── Recommendation Engine Thresholds (추천 엔진) ──
+    # Cold Start 판정: 시청 이력이 이 값 미만이면 Cold Start
+    COLD_START_THRESHOLD: int = 5
+    # Warm Start 판정: 시청 이력이 이 값 미만이면 Warm Start (이상이면 정상)
+    WARM_START_THRESHOLD: int = 30
+    # MMR 다양성 파라미터 (λ=0.7: 관련성 70% + 다양성 30%)
+    MMR_LAMBDA: float = 0.7
+    # 최종 추천 영화 수
+    RECOMMENDATION_TOP_K: int = 5
+
+    # ── Hybrid Search (하이브리드 검색) ──
+    # RRF Reciprocal Rank Fusion 상수
+    RRF_K: int = 60
+
 
     @model_validator(mode='after')
     def _warn_empty_passwords(self):
-        """비밀번호가 비어있으면 경고 로그를 출력한다. (W-1)"""
+        """비밀번호 및 필수 API 키가 비어있으면 경고 로그를 출력한다. (W-1)"""
         if not self.NEO4J_PASSWORD:
             _config_logger.warning("NEO4J_PASSWORD가 설정되지 않았습니다. .env 파일을 확인하세요.")
         if not self.MYSQL_PASSWORD:
             _config_logger.warning("MYSQL_PASSWORD가 설정되지 않았습니다. .env 파일을 확인하세요.")
+        # Upstage Solar 임베딩 API 키는 RAG 검색에 필수 — 미설정 시 임베딩 호출 실패
+        if not self.UPSTAGE_API_KEY:
+            _config_logger.warning(
+                "UPSTAGE_API_KEY가 설정되지 않았습니다. 임베딩 검색이 실패합니다. .env 파일을 확인하세요."
+            )
         return self
 
 
