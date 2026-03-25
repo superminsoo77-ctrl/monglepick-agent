@@ -47,6 +47,7 @@ dependencies = [
     # ── Observability (LangSmith 트레이싱) ──
     "langsmith>=0.7.6",
     # ── Utilities ──
+    "PyJWT>=2.9.0",
     "python-dotenv>=1.0.0",
     "tenacity>=9.0.0",
     "structlog>=24.4.0",

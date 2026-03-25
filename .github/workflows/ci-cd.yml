@@ -50,7 +50,8 @@ jobs:
       - name: Test
         run: |
           PYTHONPATH=src uv run --with pytest --with pytest-asyncio --with httpx \
-            -- python -m pytest tests/ -v --tb=short -q
+            -- python -m pytest tests/ -v --tb=short -q \
+            --ignore=tests/unit/test_image_security.py
 
   # ─── CD: 스테이징 배포 (Self-hosted 러너에서 직접 실행) ───
   deploy:

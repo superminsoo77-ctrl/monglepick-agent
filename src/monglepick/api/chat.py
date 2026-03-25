@@ -33,6 +33,8 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+import jwt
+
 from monglepick.agents.chat.graph import run_chat_agent, run_chat_agent_sync
 from monglepick.config import settings
 from monglepick.db.clients import get_redis
@@ -67,6 +69,99 @@ _RATE_LIMIT_WINDOW_SEC: int = 60
 
 # Data URL 접두사 패턴: "data:image/jpeg;base64," 또는 "data:image/png;base64," 등
 _DATA_URL_RE = re.compile(r"^data:[^;]+;base64,", re.IGNORECASE)
+
+
+# ============================================================
+# JWT 검증 (Client → Agent 요청의 user_id 위조 방지)
+# ============================================================
+
+def _extract_user_id_from_jwt(raw_request: Request) -> str | None:
+    """
+    Authorization 헤더에서 JWT를 추출하고 user_id를 반환한다.
+
+    JWT_SECRET이 미설정이면 검증을 건너뛴다 (개발 환경 호환).
+    JWT가 유효하면 subject(user_id)를 반환하고, 유효하지 않으면 None을 반환한다.
+
+    Args:
+        raw_request: FastAPI Request 객체
+
+    Returns:
+        JWT에서 추출한 user_id 또는 None (JWT 없음/무효/미설정)
+    """
+    # JWT_SECRET 미설정 → 검증 건너뜀 (개발 환경)
+    if not settings.JWT_SECRET:
+        return None
+
+    # Authorization 헤더 추출
+    auth_header = raw_request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+
+    token = auth_header[7:]  # "Bearer " 이후
+
+    try:
+        # Backend와 동일한 HS256 알고리즘으로 검증
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET,
+            algorithms=["HS256"],
+        )
+        # Refresh Token은 거부 (access token만 허용)
+        if payload.get("type") == "refresh":
+            logger.warning("jwt_refresh_token_rejected")
+            return None
+        # subject = user_id
+        user_id = payload.get("sub", "")
+        if user_id:
+            return user_id
+        return None
+    except jwt.ExpiredSignatureError:
+        logger.debug("jwt_expired")
+        return None
+    except jwt.InvalidTokenError as e:
+        logger.debug("jwt_invalid", error=str(e))
+        return None
+
+
+def _resolve_user_id(request_user_id: str, raw_request: Request) -> str:
+    """
+    JWT와 요청 body의 user_id를 비교하여 최종 user_id를 결정한다.
+
+    우선순위:
+    1. JWT가 유효하면 JWT의 user_id를 사용 (body의 user_id 무시)
+    2. JWT가 없거나 무효하고 JWT_SECRET이 설정되어 있으면 body의 user_id도 거부 → 익명
+    3. JWT_SECRET이 미설정이면 body의 user_id를 그대로 사용 (개발 환경 호환)
+
+    Args:
+        request_user_id: 요청 body의 user_id
+        raw_request: FastAPI Request 객체
+
+    Returns:
+        검증된 user_id (빈 문자열이면 익명)
+    """
+    jwt_user_id = _extract_user_id_from_jwt(raw_request)
+
+    if jwt_user_id:
+        # JWT 유효 → JWT의 user_id 사용
+        if request_user_id and request_user_id != jwt_user_id:
+            logger.warning(
+                "user_id_mismatch_jwt_overrides",
+                body_user_id=request_user_id,
+                jwt_user_id=jwt_user_id,
+            )
+        return jwt_user_id
+
+    if settings.JWT_SECRET:
+        # JWT_SECRET 설정됨 + JWT 없음/무효 → body의 user_id 무시 (스푸핑 방지)
+        if request_user_id:
+            logger.warning(
+                "no_valid_jwt_body_user_id_ignored",
+                body_user_id=request_user_id,
+            )
+        return ""  # 익명 처리
+
+    # JWT_SECRET 미설정 → 개발 환경, body의 user_id 그대로 사용
+    return request_user_id
 
 
 # ============================================================
@@ -428,6 +523,10 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
     # 요청 수신 타이밍 측정 시작
     request_start = time.perf_counter()
 
+    # JWT 검증: Authorization 헤더에서 user_id 추출 (body의 user_id보다 우선)
+    verified_user_id = _resolve_user_id(request.user_id, raw_request)
+    request.user_id = verified_user_id
+
     # base64 이미지가 있으면 보안 검증 → 디코드 → 리사이즈 → 재인코딩
     image_data = request.image
     if image_data:
@@ -473,24 +572,52 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
         """SSE 이벤트 생성기 — 포인트 체크 + 글로벌/VLM 세마포어로 동시 처리 제한 후 relay."""
         import json as _json
 
-        # ── 포인트 사전 체크 (익명 사용자는 생략) ──
+        # ── 포인트 사전 체크 + 쿼터 검증 (익명 사용자는 생략) ──
         # 과금 단위: "추천 완료" (movie_card 발행 시점)
-        # 사전 체크에서는 차감하지 않고 잔액만 확인하여 잔액 0이면 조기 차단한다.
+        # 사전 체크에서는 차감하지 않고 잔액/쿼터만 확인하여 조기 차단한다.
         # AI 후속 질문만 하는 턴에서는 포인트가 차감되지 않는다.
+        # effective_cost: 실제 차감 포인트 (무료 잔여가 있으면 0). graph.py deduct에 전달.
         from monglepick.config import settings as _settings
+        _effective_cost: int = _settings.POINT_COST_PER_RECOMMENDATION  # 기본값 (체크 실패 시 사용)
         if _settings.POINT_CHECK_ENABLED and request.user_id:
             from monglepick.api.point_client import check_point
             point_check = await check_point(
                 user_id=request.user_id,
                 cost=_settings.POINT_COST_PER_RECOMMENDATION,
             )
+            # effective_cost를 로컬 변수에 저장 (graph.py deduct에 전달)
+            _effective_cost = point_check.effective_cost
+
+            # 1) 사용자 입력 글자수 제한 검증 (등급별 max_input_length)
+            message_text = request.message or ""
+            if len(message_text) > point_check.max_input_length:
+                logger.info(
+                    "chat_sse_input_too_long",
+                    user_id=request.user_id,
+                    max_input_length=point_check.max_input_length,
+                    current_length=len(message_text),
+                )
+                yield {
+                    "event": "error",
+                    "data": _json.dumps({
+                        "message": f"입력 글자수가 {point_check.max_input_length}자를 초과했습니다. (현재: {len(message_text)}자)",
+                        "error_code": "INPUT_TOO_LONG",
+                        "max_input_length": point_check.max_input_length,
+                        "current_length": len(message_text),
+                    }, ensure_ascii=False),
+                }
+                yield {"event": "done", "data": "{}"}
+                return
+
+            # 2) 포인트/쿼터 부족 → 그래프 실행 없이 에러 반환
             if not point_check.allowed:
-                # 포인트 부족 → 그래프 실행 없이 에러 반환
                 logger.info(
                     "chat_sse_point_insufficient",
                     user_id=request.user_id,
                     balance=point_check.balance,
-                    cost=point_check.cost,
+                    cost=point_check.effective_cost,
+                    daily_used=point_check.daily_used,
+                    daily_limit=point_check.daily_limit,
                 )
                 yield {
                     "event": "error",
@@ -498,8 +625,12 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
                         "message": point_check.message,
                         "error_code": "INSUFFICIENT_POINT",
                         "balance": point_check.balance,
-                        "cost": point_check.cost,
+                        "cost": point_check.effective_cost,
                         "needs_purchase": True,
+                        "daily_used": point_check.daily_used,
+                        "daily_limit": point_check.daily_limit,
+                        "monthly_used": point_check.monthly_used,
+                        "monthly_limit": point_check.monthly_limit,
                     }, ensure_ascii=False),
                 }
                 yield {"event": "done", "data": "{}"}
@@ -531,6 +662,7 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
                         session_id=request.session_id,
                         message=request.message,
                         image_data=image_data,
+                        effective_cost=_effective_cost,
                     ):
                         yield sse_event
             else:
@@ -539,6 +671,7 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
                     session_id=request.session_id,
                     message=request.message,
                     image_data=image_data,
+                    effective_cost=_effective_cost,
                 ):
                     yield sse_event
 
@@ -573,7 +706,7 @@ async def chat_sse(request: ChatRequest, raw_request: Request):
         415: {"description": "허용되지 않는 이미지 형식 (JPEG/PNG만 지원)"},
     },
 )
-async def chat_sync(request: ChatRequest):
+async def chat_sync(request: ChatRequest, raw_request: Request):
     """
     동기 JSON 채팅 엔드포인트 (디버그/테스트용).
 
@@ -581,12 +714,17 @@ async def chat_sync(request: ChatRequest):
 
     Args:
         request: ChatRequest (user_id, session_id, message)
+        raw_request: FastAPI Request (JWT 추출용)
 
     Returns:
         ChatSyncResponse (response, intent, emotion, movie_count)
     """
     # 요청 수신 타이밍 측정 시작
     request_start = time.perf_counter()
+
+    # JWT 검증: Authorization 헤더에서 user_id 추출
+    verified_user_id = _resolve_user_id(request.user_id, raw_request)
+    request.user_id = verified_user_id
 
     # base64 이미지가 있으면 보안 검증
     image_for_agent = request.image
@@ -622,6 +760,7 @@ async def chat_sync(request: ChatRequest):
     )
 
     # 글로벌 그래프 세마포어 + VLM 세마포어로 동시 처리 제한
+    # 동기 엔드포인트는 디버그/테스트 전용 → 포인트 체크 없이 기본값(0) 전달
     async with _graph_semaphore:
         if image_for_agent:
             async with _vlm_semaphore:
@@ -630,6 +769,7 @@ async def chat_sync(request: ChatRequest):
                     session_id=request.session_id,
                     message=request.message,
                     image_data=image_for_agent,
+                    effective_cost=0,
                 )
         else:
             state = await run_chat_agent_sync(
@@ -637,6 +777,7 @@ async def chat_sync(request: ChatRequest):
                 session_id=request.session_id,
                 message=request.message,
                 image_data=image_for_agent,
+                effective_cost=0,
             )
 
     # State에서 응답 정보 추출
@@ -739,6 +880,10 @@ async def chat_upload(
     Returns:
         EventSourceResponse (SSE 스트리밍)
     """
+    # JWT 검증: Authorization 헤더에서 user_id 추출
+    verified_user_id = _resolve_user_id(user_id, raw_request)
+    user_id = verified_user_id
+
     # 이미지 파일 → 보안 검증 → 리사이즈 → base64 변환
     image_data: str | None = None
     if image is not None:
@@ -796,19 +941,47 @@ async def chat_upload(
         """SSE 이벤트 생성기 — 포인트 체크 + 글로벌/VLM 세마포어로 동시 처리 제한 후 relay."""
         import json as _json
 
-        # ── 포인트 사전 체크 (업로드 엔드포인트) ──
+        # ── 포인트 사전 체크 + 쿼터 검증 (업로드 엔드포인트) ──
         from monglepick.config import settings as _settings
+        _effective_cost_upload: int = _settings.POINT_COST_PER_RECOMMENDATION  # 기본값
         if _settings.POINT_CHECK_ENABLED and user_id:
             from monglepick.api.point_client import check_point
             point_check = await check_point(
                 user_id=user_id,
                 cost=_settings.POINT_COST_PER_RECOMMENDATION,
             )
+            # effective_cost를 로컬 변수에 저장 (graph.py deduct에 전달)
+            _effective_cost_upload = point_check.effective_cost
+
+            # 1) 사용자 입력 글자수 제한 검증 (등급별 max_input_length)
+            if len(message) > point_check.max_input_length:
+                logger.info(
+                    "chat_upload_input_too_long",
+                    user_id=user_id,
+                    max_input_length=point_check.max_input_length,
+                    current_length=len(message),
+                )
+                yield {
+                    "event": "error",
+                    "data": _json.dumps({
+                        "message": f"입력 글자수가 {point_check.max_input_length}자를 초과했습니다. (현재: {len(message)}자)",
+                        "error_code": "INPUT_TOO_LONG",
+                        "max_input_length": point_check.max_input_length,
+                        "current_length": len(message),
+                    }, ensure_ascii=False),
+                }
+                yield {"event": "done", "data": "{}"}
+                return
+
+            # 2) 포인트/쿼터 부족 → 그래프 실행 없이 에러 반환
             if not point_check.allowed:
                 logger.info(
                     "chat_upload_point_insufficient",
                     user_id=user_id,
                     balance=point_check.balance,
+                    cost=point_check.effective_cost,
+                    daily_used=point_check.daily_used,
+                    daily_limit=point_check.daily_limit,
                 )
                 yield {
                     "event": "error",
@@ -816,8 +989,12 @@ async def chat_upload(
                         "message": point_check.message,
                         "error_code": "INSUFFICIENT_POINT",
                         "balance": point_check.balance,
-                        "cost": point_check.cost,
+                        "cost": point_check.effective_cost,
                         "needs_purchase": True,
+                        "daily_used": point_check.daily_used,
+                        "daily_limit": point_check.daily_limit,
+                        "monthly_used": point_check.monthly_used,
+                        "monthly_limit": point_check.monthly_limit,
                     }, ensure_ascii=False),
                 }
                 yield {"event": "done", "data": "{}"}
@@ -847,6 +1024,7 @@ async def chat_upload(
                         session_id=session_id,
                         message=message,
                         image_data=image_data,
+                        effective_cost=_effective_cost_upload,
                     ):
                         yield sse_event
             else:
@@ -855,6 +1033,7 @@ async def chat_upload(
                     session_id=session_id,
                     message=message,
                     image_data=image_data,
+                    effective_cost=_effective_cost_upload,
                 ):
                     yield sse_event
 

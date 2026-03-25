@@ -938,6 +938,107 @@ async def rag_retriever(state: ChatAgentState) -> dict:
 
 
 # ============================================================
+# 7.5. retrieval_quality_checker — 검색 결과 품질 판정
+# ============================================================
+
+@traceable(name="retrieval_quality_checker", run_type="chain", metadata={"node": "7.5/14"})
+async def retrieval_quality_checker(state: ChatAgentState) -> dict:
+    """
+    RAG 검색 결과의 품질을 판정하여 state에 기록한다.
+
+    검색 결과(candidate_movies)의 건수, Top-1 점수, 평균 점수를 분석하여
+    retrieval_quality_passed(bool)와 retrieval_feedback(str)을 설정한다.
+
+    판정 기준 (models.py 상수 참조):
+    - 후보 >= RETRIEVAL_MIN_CANDIDATES (3편)
+    - Top-1 RRF >= RETRIEVAL_MIN_TOP_SCORE (0.015)
+    - 평균 RRF >= RETRIEVAL_QUALITY_MIN_AVG (0.01)
+
+    세 조건 모두 만족 → passed=True, 하나라도 미달 → passed=False + 피드백 메시지.
+
+    Args:
+        state: ChatAgentState (candidate_movies 필요)
+
+    Returns:
+        dict: retrieval_quality_passed(bool), retrieval_feedback(str) 업데이트
+    """
+    node_start = time.perf_counter()
+    session_id = state.get("session_id", "")
+    try:
+        candidates = state.get("candidate_movies", [])
+
+        # 판정 상수 import
+        from monglepick.agents.chat.models import (
+            RETRIEVAL_MIN_CANDIDATES,
+            RETRIEVAL_MIN_TOP_SCORE,
+            RETRIEVAL_QUALITY_MIN_AVG,
+        )
+
+        # 빈 결과
+        if not candidates:
+            elapsed_ms = (time.perf_counter() - node_start) * 1000
+            logger.info("retrieval_quality_checked", passed=False, reason="empty",
+                        candidate_count=0, elapsed_ms=round(elapsed_ms, 1), session_id=session_id)
+            return {
+                "retrieval_quality_passed": False,
+                "retrieval_feedback": "조건에 맞는 영화를 찾지 못했어요. 다른 키워드로 시도해볼까요?",
+            }
+
+        # 후보 수 부족
+        if len(candidates) < RETRIEVAL_MIN_CANDIDATES:
+            elapsed_ms = (time.perf_counter() - node_start) * 1000
+            logger.info("retrieval_quality_checked", passed=False, reason="insufficient_candidates",
+                        candidate_count=len(candidates), elapsed_ms=round(elapsed_ms, 1), session_id=session_id)
+            return {
+                "retrieval_quality_passed": False,
+                "retrieval_feedback": "검색 결과가 부족해요. 조건을 조금 넓혀볼까요?",
+            }
+
+        # 점수 계산
+        top_score = max(c.rrf_score for c in candidates)
+        avg_score = sum(c.rrf_score for c in candidates) / len(candidates)
+
+        # Top-1 점수 미달
+        if top_score < RETRIEVAL_MIN_TOP_SCORE:
+            elapsed_ms = (time.perf_counter() - node_start) * 1000
+            logger.info("retrieval_quality_checked", passed=False, reason="low_top_score",
+                        top_score=round(top_score, 6), avg_score=round(avg_score, 6),
+                        candidate_count=len(candidates), elapsed_ms=round(elapsed_ms, 1), session_id=session_id)
+            return {
+                "retrieval_quality_passed": False,
+                "retrieval_feedback": "조건과 딱 맞는 영화를 찾기 어려웠어요. 좀 더 구체적으로 알려주시면 더 잘 찾아볼게요!",
+            }
+
+        # 평균 점수 미달
+        if avg_score < RETRIEVAL_QUALITY_MIN_AVG:
+            elapsed_ms = (time.perf_counter() - node_start) * 1000
+            logger.info("retrieval_quality_checked", passed=False, reason="low_avg_score",
+                        top_score=round(top_score, 6), avg_score=round(avg_score, 6),
+                        candidate_count=len(candidates), elapsed_ms=round(elapsed_ms, 1), session_id=session_id)
+            return {
+                "retrieval_quality_passed": False,
+                "retrieval_feedback": "검색 결과의 전반적인 품질이 부족해요. 장르나 분위기를 더 알려주시겠어요?",
+            }
+
+        # 모든 조건 통과
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.info("retrieval_quality_checked", passed=True,
+                    top_score=round(top_score, 6), avg_score=round(avg_score, 6),
+                    candidate_count=len(candidates), elapsed_ms=round(elapsed_ms, 1), session_id=session_id)
+        return {
+            "retrieval_quality_passed": True,
+            "retrieval_feedback": "",
+        }
+
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error("retrieval_quality_checker_error", error=str(e),
+                      elapsed_ms=round(elapsed_ms, 1), session_id=session_id)
+        # 에러 시 통과 처리하여 추천 흐름 계속 진행
+        return {"retrieval_quality_passed": True, "retrieval_feedback": ""}
+
+
+# ============================================================
 # 8. recommendation_ranker — 추천 엔진 서브그래프 호출 (Phase 4)
 # ============================================================
 
