@@ -44,6 +44,7 @@ class RecommendationEngineState(TypedDict, total=False):
 
     # ── 내부 상태 ──
     is_cold_start: bool                       # Cold Start 여부 (시청 < 5편)
+    cf_cache_miss: bool                       # CF 캐시 미스 여부 (Redis에 유사 유저 없음)
     cf_scores: dict[str, float]               # {movie_id: cf_score} 협업 필터링 점수
     cbf_scores: dict[str, float]              # {movie_id: cbf_score} 컨텐츠 기반 점수
     hybrid_scores: dict[str, float]           # {movie_id: hybrid_score} 가중 합산 점수

@@ -309,16 +309,32 @@ async def search_neo4j(
                 )
 
             cypher += " AND ".join(where_clauses)
-            cypher += """
-            OPTIONAL MATCH (m)-[:HAS_MOOD]->(mt:MoodTag) WHERE mt.name IN $mood_tags
-            WITH m, count(mt) AS mood_match
-            RETURN m.id AS movie_id, m.title AS title,
-                   m.rating AS rating, m.popularity_score AS popularity,
-                   mood_match
-            ORDER BY mood_match DESC, m.popularity_score DESC
-            LIMIT $top_k
-            """
+
+            # mood_tags가 있을 때만 OPTIONAL MATCH로 무드 일치 수를 세고 정렬에 사용.
+            # mood_tags가 없으면(감정 미감지) mood_match를 0으로 고정하고 인기도로만 정렬.
+            # 기존 문제: mood_tags=[] 일 때 OPTIONAL MATCH ... WHERE mt.name IN [] → 항상 0 매칭
+            if mood_tags:
+                cypher += """
+                OPTIONAL MATCH (m)-[:HAS_MOOD]->(mt:MoodTag) WHERE mt.name IN $mood_tags
+                WITH m, count(mt) AS mood_match
+                RETURN m.id AS movie_id, m.title AS title,
+                       m.rating AS rating, m.popularity_score AS popularity,
+                       mood_match
+                ORDER BY mood_match DESC, m.popularity_score DESC
+                LIMIT $top_k
+                """
+            else:
+                # 무드태그 없음 (감정 미감지): 무드 매칭 없이 인기도/평점 기반 정렬
+                cypher += """
+                RETURN m.id AS movie_id, m.title AS title,
+                       m.rating AS rating, m.popularity_score AS popularity,
+                       0 AS mood_match
+                ORDER BY m.popularity_score DESC, m.rating DESC
+                LIMIT $top_k
+                """
+
             params["top_k"] = top_k
+            # mood_tags 파라미터가 Cypher 바인딩에 필요할 수 있으므로 안전하게 포함
             if "mood_tags" not in params:
                 params["mood_tags"] = []
 
@@ -486,6 +502,7 @@ async def hybrid_search(
     year_range: tuple[int, int] | None = None,
     director: str | None = None,
     similar_to_movie_id: str | None = None,
+    exclude_ids: list[str] | None = None,
 ) -> list[SearchResult]:
     """
     3개 검색 엔진을 동시 실행하고 RRF로 합산하여 최종 후보를 반환한다.
@@ -494,7 +511,8 @@ async def hybrid_search(
     ① Qdrant 벡터 검색 (의미)
     ② ES BM25 검색 (키워드)
     ③ Neo4j 그래프 검색 (관계)
-    ④ RRF 합산 → 최종 후보
+    ④ 시청 완료 영화 제외 (RRF 전)
+    ⑤ RRF 합산 → 최종 후보
 
     Args:
         query: 사용자 검색 쿼리
@@ -582,10 +600,26 @@ async def hybrid_search(
         neo4j_top3=[r.title for r in neo4j_results[:3]],
     )
 
+    # ── 시청 완료 영화 사전 제외 (RRF 전) ──
+    # RRF 합산 후에 제거하면 이미 본 영화가 상위 슬롯을 차지하여
+    # 최종 후보 수가 top_k 미만으로 줄어들 수 있다. 사전 제거로 방지.
+    if exclude_ids:
+        exclude_set = set(exclude_ids)
+        qdrant_results = [r for r in qdrant_results if r.movie_id not in exclude_set]
+        es_results = [r for r in es_results if r.movie_id not in exclude_set]
+        neo4j_results = [r for r in neo4j_results if r.movie_id not in exclude_set]
+        logger.info(
+            "exclude_ids_applied_before_rrf",
+            exclude_count=len(exclude_set),
+            after_qdrant=len(qdrant_results),
+            after_es=len(es_results),
+            after_neo4j=len(neo4j_results),
+        )
+
     # RRF 합산 타이밍 측정 시작
     rrf_start = time.perf_counter()
 
-    # RRF 합산 (§11-1 ④)
+    # RRF 합산 (§11-1 ⑤)
     fused = reciprocal_rank_fusion(
         [qdrant_results, es_results, neo4j_results],
         k=RRF_K,

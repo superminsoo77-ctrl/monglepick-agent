@@ -147,11 +147,11 @@ async def collaborative_filter(state: RecommendationEngineState) -> dict:
         candidate_ids = {c.id for c in candidates}
         cf_scores: dict[str, float] = {}
 
-        # 익명 사용자이거나 user_id가 없으면 기본값 반환
+        # 익명 사용자이거나 user_id가 없으면 기본값 반환 + 캐시 미스 명시
         if not user_id:
             cf_scores = {c.id: CF_DEFAULT_SCORE for c in candidates}
             logger.info("cf_anonymous_user", score=CF_DEFAULT_SCORE)
-            return {"cf_scores": cf_scores}
+            return {"cf_scores": cf_scores, "cf_cache_miss": True}
 
         # similar_users_raw를 try 블록 밖에서 초기화하여 로깅 시 안전하게 접근 (dir() 안티패턴 제거)
         similar_users_raw: list = []
@@ -170,11 +170,11 @@ async def collaborative_filter(state: RecommendationEngineState) -> dict:
                 num=50,
             )
 
-            # Redis에 유사 유저가 없으면 캐시 미스 → 기본값
+            # Redis에 유사 유저가 없으면 캐시 미스 → 기본값 + 명시적 플래그
             if not similar_users_raw:
                 cf_scores = {c.id: CF_DEFAULT_SCORE for c in candidates}
                 logger.info("cf_cache_miss", user_id=user_id)
-                return {"cf_scores": cf_scores}
+                return {"cf_scores": cf_scores, "cf_cache_miss": True}
 
             # 유사 유저별 평점 조회 (pipeline으로 배치 조회)
             sim_user_ids = [uid for uid, _ in similar_users_raw]
@@ -244,14 +244,16 @@ async def collaborative_filter(state: RecommendationEngineState) -> dict:
             ],
             elapsed_ms=round(elapsed_ms, 1),
         )
-        return {"cf_scores": cf_scores}
+        # 정상 경로: CF 데이터가 실제로 존재 → 캐시 미스 아님
+        return {"cf_scores": cf_scores, "cf_cache_miss": False}
 
     except Exception as e:
         elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.error("collaborative_filter_error", error=str(e), error_type=type(e).__name__,
                       stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1))
         candidates = state.get("candidate_movies", [])
-        return {"cf_scores": {c.id: CF_DEFAULT_SCORE for c in candidates}}
+        # Redis 에러 시에도 캐시 미스로 명시
+        return {"cf_scores": {c.id: CF_DEFAULT_SCORE for c in candidates}, "cf_cache_miss": True}
 
 
 # ============================================================
@@ -344,12 +346,14 @@ async def content_based_filter(state: RecommendationEngineState) -> dict:
             # 2. 감독/배우 빈도 매칭
             crew_score = _crew_match_score(movie, director_freq, actor_freq)
 
-            # 3. 무드 매칭
+            # 3. 무드 매칭 — 유저 무드 기준 비율 (유저가 원하는 무드가 영화에 몇 개 있는지)
+            # 기존: len(교집합) / len(영화무드) → 다양한 무드태그를 가진 영화가 불이익
+            # 수정: len(교집합) / len(유저무드) → 유저가 원하는 것 중 매칭 비율
             if has_emotion and mood_tags:
                 movie_moods = set(movie.mood_tags) if movie.mood_tags else set()
                 user_moods = set(mood_tags)
                 mood_score = (
-                    len(movie_moods & user_moods) / max(len(movie_moods), 1)
+                    len(movie_moods & user_moods) / max(len(user_moods), 1)
                 )
             else:
                 mood_score = 0.0
@@ -449,12 +453,10 @@ async def hybrid_merger(state: RecommendationEngineState) -> dict:
         history_count = len(watch_history)
         has_emotion = emotion is not None and emotion.emotion is not None
 
-        # ── CF 캐시 미스 감지: 모든 CF 점수가 기본값(0.5)이면 캐시 미스 ──
-        cf_values = list(cf_scores.values())
-        cf_is_default = (
-            len(cf_values) > 0
-            and all(abs(v - CF_DEFAULT_SCORE) < 1e-6 for v in cf_values)
-        )
+        # ── CF 캐시 미스 감지: collaborative_filter 노드의 명시적 플래그 사용 ──
+        # 기존 로직(점수 전부 0.5 비교)은 정규화 결과와 캐시 미스를 구분 못하는 오탐 존재.
+        # 이제 collaborative_filter가 cf_cache_miss 플래그를 반환한다.
+        cf_is_default = state.get("cf_cache_miss", False)
 
         # ── CBF 전부 0 감지 ──
         cbf_values = list(cbf_scores.values())
@@ -710,10 +712,18 @@ async def diversity_reranker(state: RecommendationEngineState) -> dict:
                     movie = candidate_map[mid]
                     relevance = hybrid_scores.get(mid, 0.0)
 
-                    # 이미 선택된 영화와의 최대 장르 유사도
+                    # 이미 선택된 영화와의 최대 유사도 (장르 60% + 감독 25% + 배우 15%)
+                    # 기존: 장르 Jaccard만 사용 → 같은 감독/배우 영화가 중복 추천
+                    # 수정: 감독/배우까지 포함하여 다차원 다양성 확보
                     max_sim = 0.0
                     for sel in selected:
-                        sim = _jaccard(set(movie.genres), set(sel.genres))
+                        genre_sim = _jaccard(set(movie.genres), set(sel.genres))
+                        director_sim = 1.0 if (movie.director and movie.director == sel.director) else 0.0
+                        cast_overlap = (
+                            len(set(movie.cast[:3]) & set(sel.cast[:3])) / 3.0
+                            if movie.cast and sel.cast else 0.0
+                        )
+                        sim = 0.60 * genre_sim + 0.25 * director_sim + 0.15 * cast_overlap
                         if sim > max_sim:
                             max_sim = sim
 
@@ -814,10 +824,10 @@ async def score_finalizer(state: RecommendationEngineState) -> dict:
             # 장르 일치도
             genre_match = _jaccard(set(movie.genres), liked_genres)
 
-            # 무드 일치도
+            # 무드 일치도 — 유저 무드 기준 비율 (CBF와 동일한 공식)
             movie_moods = set(movie.mood_tags) if movie.mood_tags else set()
             mood_match = (
-                len(movie_moods & user_moods) / max(len(movie_moods), 1)
+                len(movie_moods & user_moods) / max(len(user_moods), 1)
                 if user_moods
                 else 0.0
             )

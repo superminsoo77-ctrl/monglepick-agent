@@ -489,9 +489,11 @@ async def preference_refiner(state: ChatAgentState) -> dict:
         )
 
         # 이미지 분석 결과로 선호 조건 보강
+        # 이미지 보너스(+1.5)는 genre_cues 또는 mood_cues가 실제로 추출된 경우에만 부여.
+        # 비영화 이미지(음식/풍경 등)는 analyzed=True이더라도 cues가 비어 있으므로 보너스 미적용.
         has_image = False
         if image_analysis is not None and image_analysis.analyzed:
-            has_image = True
+            has_image = bool(image_analysis.genre_cues or image_analysis.mood_cues)
             # genre_cues → genre_preference 보강 (기존 선호가 없을 때만)
             if not merged.genre_preference and image_analysis.genre_cues:
                 merged = merged.model_copy(
@@ -909,7 +911,18 @@ async def rag_retriever(state: ChatAgentState) -> dict:
         ott_filter = [filters["platform"]] if filters.get("platform") else None
         year_range = filters.get("year_range")
 
-        # 하이브리드 검색 실행
+        # 선호에서 감독/참조영화 ID 추출 (Neo4j 검색용)
+        preferences = state.get("preferences")
+        director_name = None
+        similar_movie_id = None
+        if preferences and preferences.reference_movies:
+            # 첫 번째 참조 영화의 ID를 similar_to_movie_id로 사용
+            # (query_builder에서 이미 조회했으므로 ID가 있으면 활용)
+            ref_info = filters.get("reference_movie_id")
+            if ref_info:
+                similar_movie_id = ref_info
+
+        # 하이브리드 검색 실행 — exclude_ids를 RRF 전에 제거하도록 전달
         results = await hybrid_search(
             query=search_query.semantic_query or search_query.keyword_query,
             top_k=search_query.limit,
@@ -917,6 +930,9 @@ async def rag_retriever(state: ChatAgentState) -> dict:
             mood_tags=mood_tags,
             ott_filter=ott_filter,
             year_range=year_range,
+            director=director_name,
+            similar_to_movie_id=similar_movie_id,
+            exclude_ids=search_query.exclude_ids,
         )
 
         # SearchResult → CandidateMovie 변환
@@ -925,7 +941,7 @@ async def rag_retriever(state: ChatAgentState) -> dict:
             for i, r in enumerate(results)
         ]
 
-        # exclude_ids로 시청한 영화 제외
+        # 안전망: hybrid_search 내부에서 이미 exclude 했지만, 혹시 누락된 경우 2차 필터
         if search_query.exclude_ids:
             exclude_set = set(search_query.exclude_ids)
             candidates = [c for c in candidates if c.id not in exclude_set]

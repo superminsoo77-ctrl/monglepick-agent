@@ -436,11 +436,12 @@ class TestHybridMerger:
 
     @pytest.mark.asyncio
     async def test_cf_cache_miss_cbf_only(self):
-        """CF 전부 0.5(캐시 미스)면 CBF에 전적 의존한다."""
+        """CF 캐시 미스(명시적 플래그)면 CBF에 전적 의존한다."""
         candidates = [_make_candidate(id="1")]
         state: RecommendationEngineState = {
             "candidate_movies": candidates,
-            "cf_scores": {"1": 0.5},  # 기본값 = 캐시 미스
+            "cf_scores": {"1": 0.5},
+            "cf_cache_miss": True,  # 명시적 캐시 미스 플래그
             "cbf_scores": {"1": 0.9},
             "watch_history": [{"movie_id": str(i)} for i in range(10)],
             "emotion": None,
@@ -455,7 +456,8 @@ class TestHybridMerger:
         candidates = [_make_candidate(id="1", rrf_score=0.8)]
         state: RecommendationEngineState = {
             "candidate_movies": candidates,
-            "cf_scores": {"1": 0.5},  # 캐시 미스
+            "cf_scores": {"1": 0.5},
+            "cf_cache_miss": True,  # 명시적 캐시 미스 플래그
             "cbf_scores": {"1": 0.0},
             "watch_history": [],
             "emotion": None,
@@ -683,8 +685,9 @@ class TestScoreFinalizer:
         }
         result = await score_finalizer(state)
         # movie_moods = {웅장, 감동}, user_moods = {웅장}
-        # mood_match = |{웅장}| / max(2, 1) = 1/2 = 0.5
-        assert result["ranked_movies"][0].score_detail.mood_match == 0.5
+        # 수정된 공식: len(교집합) / len(user_moods) = |{웅장}| / max(1, 1) = 1/1 = 1.0
+        # (기존: len(교집합) / len(movie_moods) = 1/2 = 0.5 — 다무드 영화 불이익 해소)
+        assert result["ranked_movies"][0].score_detail.mood_match == 1.0
 
     @pytest.mark.asyncio
     async def test_similar_to_from_history(self):
