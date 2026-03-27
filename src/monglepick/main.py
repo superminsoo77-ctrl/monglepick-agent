@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from monglepick.api.chat import chat_router
 from monglepick.api.match import match_router
+from monglepick.api.middleware import RateLimitMiddleware, TimeoutMiddleware
 from monglepick.api.router import api_router
 from monglepick.config import settings
 from monglepick.db.clients import close_all_clients, init_all_clients
@@ -45,13 +46,18 @@ APP_VERSION = "0.3.0"
 
 async def _warmup_ollama_models() -> None:
     """
-    Ollama 모델에 dummy 호출을 수행하여 첫 API 요청의 cold start를 제거한다.
+    Ollama 모델에 dummy 호출을 병렬 수행하여 첫 API 요청의 cold start를 제거한다.
 
     Ollama 서버가 모델을 처음 로드할 때 시간이 소요될 수 있다.
     앱 시작 시 짧은 dummy 호출을 수행하면 사용자 첫 요청 전에
     모델이 완전히 준비된다.
 
-    두 모델을 순차적으로 warmup한다:
+    [W-A3 개선] asyncio.gather()로 모든 모델을 병렬 warmup하여
+    기존 순차 실행(최대 N×120초) 대비 시작 시간을 대폭 단축한다.
+    - 기존: 2모델 × 120초 = 최대 240초 (순차)
+    - 개선: max(120초, 120초) = 최대 120초 (병렬)
+
+    대상 모델:
     1. qwen3.5:35b-a3b (의도+감정 분류, 이미지 분석)
     2. exaone-32b:latest (선호 추출, 대화, 추천 이유)
 
@@ -73,13 +79,21 @@ async def _warmup_ollama_models() -> None:
     logger.info(
         "ollama_warmup_start",
         models=models_to_warmup,
+        mode="parallel",
     )
 
-    for model_name in models_to_warmup:
+    async def _warmup_single(model_name: str) -> None:
+        """
+        단일 모델의 warmup을 수행한다.
+
+        temperature=0.1, num_predict=1로 최소 토큰만 생성하여 빠르게 완료.
+        타임아웃(120초) 초과 또는 기타 예외 발생 시 경고 로그만 남기고 진행한다.
+
+        Args:
+            model_name: Ollama 모델명 (예: "qwen3.5:35b-a3b")
+        """
         warmup_start = time.perf_counter()
         try:
-            # 짧은 dummy 호출로 모델 warmup.
-            # temperature=0.1, num_predict=1로 최소 토큰만 생성하여 빠르게 완료.
             llm = get_llm(model=model_name, temperature=0.1, num_predict=1)
             await asyncio.wait_for(
                 llm.ainvoke([HumanMessage(content="ping")]),
@@ -109,6 +123,13 @@ async def _warmup_ollama_models() -> None:
                 error_type=type(e).__name__,
                 elapsed_sec=round(elapsed_sec, 1),
             )
+
+    # [W-A3] asyncio.gather()로 모든 모델을 병렬 warmup.
+    # return_exceptions=True: 개별 모델 실패가 다른 모델 warmup에 영향을 주지 않는다.
+    await asyncio.gather(
+        *[_warmup_single(m) for m in models_to_warmup],
+        return_exceptions=True,
+    )
 
     logger.info("ollama_warmup_complete", models=models_to_warmup)
 
@@ -229,6 +250,20 @@ app.add_middleware(
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
+
+# ── 전역 미들웨어 등록 ──
+# Starlette 미들웨어는 등록 역순으로 실행된다.
+# 실행 순서: TimeoutMiddleware → RateLimitMiddleware → CORS → 엔드포인트
+#
+# TimeoutMiddleware를 가장 안쪽(나중에 등록)에 두어
+# Rate Limit 체크를 통과한 요청에만 타임아웃을 적용한다.
+# RateLimitMiddleware는 바깥쪽(먼저 등록)에 두어
+# 타임아웃 리소스 소모 전에 과도한 요청을 차단한다.
+#
+# 비인증: 분당 RATE_LIMIT_ANON_RPM 회 (기본 30) /
+# 인증:   분당 RATE_LIMIT_AUTH_RPM 회 (기본 60) — config.py 참조
+app.add_middleware(TimeoutMiddleware)
+app.add_middleware(RateLimitMiddleware)
 
 # API 라우터 등록
 app.include_router(api_router, prefix="/api/v1")

@@ -654,13 +654,29 @@ async def run_chat_agent(
                                     balance_after=deduct_result.balance_after,
                                 )
                             else:
-                                # 차감 실패해도 추천은 전달 (graceful degradation)
+                                # 차감 실패: error_code를 파싱하여 세분화된 SSE error 이벤트 발행.
+                                # INSUFFICIENT_POINT / DAILY_LIMIT_EXCEEDED / MONTHLY_LIMIT_EXCEEDED
+                                # 각각의 error_code는 프론트엔드에서 적절한 안내 UI를 표시하는 데 사용된다.
+                                # 단, 추천 결과(movie_card)는 이미 생성된 상태이므로
+                                # 그대로 전달하는 것이 UX상 더 낫다 (graceful degradation).
+                                # → error 이벤트는 포인트 관련 알림용이며, 추천 차단이 아님.
+                                deduct_error_code = deduct_result.error_code or "INSUFFICIENT_POINT"
+                                deduct_error_msg = deduct_result.error_message or "포인트 차감에 실패했습니다."
                                 logger.warning(
                                     "point_deduct_failed_graceful",
                                     user_id=user_id,
                                     session_id=session_id,
                                     effective_cost=effective_cost,
+                                    error_code=deduct_error_code,
                                 )
+                                # SSE error 이벤트: 프론트엔드가 포인트/쿼터 상태를 파악할 수 있도록 전달
+                                yield _format_sse_event("error", {
+                                    "message": deduct_error_msg,
+                                    "error_code": deduct_error_code,
+                                    "balance": deduct_result.balance_after,
+                                    # 쿼터 초과 여부: 프론트엔드가 구매 유도 UI를 선택적으로 표시
+                                    "needs_purchase": deduct_error_code == "INSUFFICIENT_POINT",
+                                })
                         elif settings.POINT_CHECK_ENABLED and user_id and effective_cost == 0:
                             # 무료 잔여로 커버된 요청 → 차감 없이 point_update 발행
                             logger.info(

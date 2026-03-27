@@ -35,32 +35,89 @@ from monglepick.prompts.explanation import (
 logger = structlog.get_logger()
 
 
-def _build_fallback_explanation(movie: dict) -> str:
+def _build_fallback_explanation(
+    movie: dict,
+    emotion: str | None = None,
+    preferences: ExtractedPreferences | None = None,
+    watch_history_titles: list[str] | None = None,
+) -> str:
     """
-    LLM 에러 시 메타데이터 기반으로 기본 추천 이유를 생성한다.
+    LLM 에러 시 메타데이터 + 사용자 정보 기반으로 기본 추천 이유를 생성한다.
+
+    사용자의 감정, 선호 조건, 시청 이력을 반영하여 개인화된 폴백 설명을 만든다.
 
     Args:
-        movie: 영화 정보 dict (title, genres, rating, director 등)
+        movie: 영화 정보 dict (title, genres, rating, director, mood_tags, cast 등)
+        emotion: 사용자 감정 (None이면 미감지)
+        preferences: 사용자 선호 조건 (None이면 없음)
+        watch_history_titles: 시청 이력 영화 제목 목록 (None이면 없음)
 
     Returns:
-        기본 추천 이유 문자열
+        개인화된 기본 추천 이유 문자열
     """
     title = movie.get("title", "이 영화")
     genres = movie.get("genres", [])
     rating = movie.get("rating", 0.0)
     director = movie.get("director", "")
+    mood_tags = movie.get("mood_tags", [])
+    cast = movie.get("cast", [])
+    overview = movie.get("overview", "")
 
     # 장르 텍스트
     genre_text = ", ".join(genres[:3]) if genres else "다양한 장르"
 
-    # 기본 템플릿: 영화 제목을 문두에 포함해 맥락 있는 폴백 문구를 만든다
-    parts = [f"<{title}>은(는) {genre_text} 장르의 인기 영화예요."]
+    parts: list[str] = []
+
+    # 1순위: 사용자 감정과 영화 무드/장르 연결
+    _emotion_mood_map = {
+        "happy": "유쾌하고 밝은",
+        "sad": "따뜻하고 위로가 되는",
+        "excited": "짜릿하고 몰입감 넘치는",
+        "angry": "카타르시스를 주는",
+        "calm": "잔잔하고 힐링되는",
+    }
+    if emotion and emotion in _emotion_mood_map:
+        mood_desc = _emotion_mood_map[emotion]
+        parts.append(f"{mood_desc} 기분에 딱 어울리는 영화예요.")
+    elif mood_tags:
+        # 감정 미감지 시 무드태그 활용
+        mood_text = ", ".join(mood_tags[:2])
+        parts.append(f"{mood_text} 분위기의 영화를 찾으셨죠.")
+
+    # 2순위: 선호 장르/분위기 매칭
+    if preferences:
+        if preferences.genre_preference and genres:
+            # 사용자 선호 장르와 영화 장르가 겹치면 언급
+            parts.append(f"좋아하시는 {genre_text} 장르의 작품이에요.")
+        elif preferences.mood and mood_tags:
+            parts.append(f"원하시는 {preferences.mood} 분위기에 잘 맞는 영화예요.")
+        elif preferences.reference_movies:
+            ref_text = ", ".join(preferences.reference_movies[:2])
+            parts.append(f"<{ref_text}>을(를) 좋아하셨다면 이 영화도 마음에 드실 거예요.")
+    elif not parts:
+        # 사용자 정보 없을 때 기본 문구
+        parts.append(f"<{title}>은(는) {genre_text} 장르의 인기 영화예요.")
+
+    # 3순위: 영화 고유 매력 (감독, 출연진, 평점)
+    merit_parts: list[str] = []
+    if director:
+        merit_parts.append(f"{director} 감독의 연출")
+    if cast:
+        cast_text = ", ".join(cast[:2])
+        merit_parts.append(f"{cast_text}의 연기")
+    if merit_parts:
+        parts.append(f"{', '.join(merit_parts)}가 돋보이는 작품이에요.")
 
     if rating > 0:
-        parts.append(f"평점 {rating:.1f}점으로 많은 분들이 좋아하는 작품이에요.")
+        parts.append(f"평점 {rating:.1f}점으로 많은 분들이 추천하는 영화예요.")
 
-    if director:
-        parts.append(f"{director} 감독의 연출이 돋보여요.")
+    # 최소 2문장 보장
+    if len(parts) < 2:
+        if overview:
+            # 줄거리 첫 문장 활용
+            first_sentence = overview.split(".")[0].strip()
+            if first_sentence and len(first_sentence) > 10:
+                parts.append(f"{first_sentence[:80]}...")
 
     return " ".join(parts)
 
@@ -98,7 +155,7 @@ async def generate_explanation(
         score_detail: 추천 점수 상세 (None이면 없음)
 
     Returns:
-        2~3문장의 한국어 추천 이유 문자열
+        3~5문장의 한국어 추천 이유 문자열
         - 에러 시: 메타데이터 기반 기본 설명
     """
     # 영화 정보 dict 변환
@@ -113,22 +170,30 @@ async def generate_explanation(
     # 자유 텍스트 LLM (EXAONE 32B, temp=0.5)
     llm = get_explanation_llm()
 
-    # 선호 조건 텍스트 포맷
+    # 선호 조건 텍스트 포맷 (7개 필드 모두 포함)
     pref_text = "(없음)"
     if preferences:
         pref_parts = []
         if preferences.genre_preference:
-            pref_parts.append(f"장르: {preferences.genre_preference}")
+            pref_parts.append(f"선호 장르: {preferences.genre_preference}")
         if preferences.mood:
-            pref_parts.append(f"분위기: {preferences.mood}")
+            pref_parts.append(f"원하는 분위기: {preferences.mood}")
+        if preferences.viewing_context:
+            pref_parts.append(f"시청 상황: {preferences.viewing_context}")
+        if preferences.platform:
+            pref_parts.append(f"시청 플랫폼: {preferences.platform}")
         if preferences.reference_movies:
             pref_parts.append(f"참조 영화: {', '.join(preferences.reference_movies)}")
-        pref_text = ", ".join(pref_parts) if pref_parts else "(없음)"
+        if preferences.era:
+            pref_parts.append(f"선호 시대: {preferences.era}")
+        if preferences.exclude:
+            pref_parts.append(f"제외 조건: {preferences.exclude}")
+        pref_text = " / ".join(pref_parts) if pref_parts else "(없음)"
 
-    # 시청 이력 텍스트 포맷
+    # 시청 이력 텍스트 포맷 (상위 10편으로 확대)
     history_text = "(없음)"
     if watch_history_titles:
-        history_text = ", ".join(watch_history_titles[:5])
+        history_text = ", ".join(watch_history_titles[:10])
 
     # 점수 상세 텍스트 포맷
     score_text = "(없음)"
@@ -140,13 +205,28 @@ async def generate_explanation(
             f"무드 일치={score_detail.mood_match:.0%}"
         )
 
-    # 입력 변수
+    # 출연진 텍스트 (상위 5명)
+    cast_list = movie_dict.get("cast", [])
+    cast_text = ", ".join(cast_list[:5]) if cast_list else "(정보 없음)"
+
+    # 무드태그 텍스트
+    mood_list = movie_dict.get("mood_tags", [])
+    mood_text = ", ".join(mood_list[:5]) if mood_list else "(정보 없음)"
+
+    # 개봉연도
+    release_year = movie_dict.get("release_year", 0)
+    year_text = str(release_year) if release_year else "(정보 없음)"
+
+    # 입력 변수 (cast, mood_tags, release_year 추가)
     inputs = {
         "title": movie_dict.get("title", ""),
         "genres": ", ".join(movie_dict.get("genres", [])),
         "director": movie_dict.get("director", ""),
+        "cast": cast_text,
         "rating": str(movie_dict.get("rating", 0.0)),
-        "overview": (movie_dict.get("overview", "") or "")[:300],
+        "release_year": year_text,
+        "mood_tags": mood_text,
+        "overview": (movie_dict.get("overview", "") or "")[:500],
         "emotion": emotion or "미감지",
         "preferences": pref_text,
         "watch_history": history_text,
@@ -209,7 +289,12 @@ async def generate_explanation(
             error_type=type(e).__name__,
             stack_trace=traceback.format_exc(),
         )
-        return _build_fallback_explanation(movie_dict)
+        return _build_fallback_explanation(
+            movie_dict,
+            emotion=emotion,
+            preferences=preferences,
+            watch_history_titles=watch_history_titles,
+        )
 
 
 async def generate_explanations_batch(
@@ -225,7 +310,7 @@ async def generate_explanations_batch(
     Ollama 큐만 점유하고 실질적 병렬성은 없다. 따라서 순차 실행으로 변경하여
     다른 요청이 Ollama에 접근할 수 있도록 공정하게 배분한다.
 
-    MAX_EXPLANATION_MOVIES(기본 3)편까지만 LLM으로 생성하고,
+    MAX_EXPLANATION_MOVIES(기본 5)편까지만 LLM으로 생성하고,
     초과 영화는 _build_fallback_explanation() 템플릿을 사용한다.
 
     Args:
@@ -254,7 +339,12 @@ async def generate_explanations_batch(
                 index=i,
                 max_llm=max_llm,
             )
-            explanations.append(_build_fallback_explanation(movie_dict))
+            explanations.append(_build_fallback_explanation(
+                movie_dict,
+                emotion=emotion,
+                preferences=preferences,
+                watch_history_titles=watch_history_titles,
+            ))
             continue
 
         # score_detail 추출 (RankedMovie만 해당)
@@ -281,7 +371,12 @@ async def generate_explanations_batch(
                 error=str(e),
                 error_type=type(e).__name__,
             )
-            explanations.append(_build_fallback_explanation(movie_dict))
+            explanations.append(_build_fallback_explanation(
+                movie_dict,
+                emotion=emotion,
+                preferences=preferences,
+                watch_history_titles=watch_history_titles,
+            ))
 
     batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000
 
