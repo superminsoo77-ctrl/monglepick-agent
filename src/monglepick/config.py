@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     # Ollama는 단일 서버에서 OLLAMA_MAX_LOADED_MODELS 수만큼 모델을 동시 로드한다.
     # Mac 64GB 기준: qwen3.5:35b-a3b + exaone-32b 동시 로드 가능 (2모델)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
+    # 컨텍스트 윈도우 크기 (토큰). qwen3.5 기본값 262K → KV캐시 메모리 소모 방지용
+    OLLAMA_NUM_CTX: int = 8192
+    # 모델 GPU 메모리 유지 시간 (마지막 요청 후). 2모델 동시 서빙 시 메모리 관리용
+    OLLAMA_KEEP_ALIVE: str = "10m"
 
     # ── Qdrant ──
     QDRANT_URL: str = "http://localhost:6333"
@@ -71,11 +75,22 @@ class Settings(BaseSettings):
     # "api_only": 모든 체인을 Solar API로 처리 (Ollama 장애 시)
     LLM_MODE: str = "local_only"
 
+    # ── vLLM (운영서버 GPU, SSH 터널 경유) ──
+    # hybrid 모드에서 대화/질문 체인에 운영서버 EXAONE 1.2B 사용
+    VLLM_ENABLED: bool = False
+    VLLM_CHAT_BASE_URL: str = "http://localhost:18000/v1"
+    VLLM_CHAT_MODEL: str = "mongle"
+    VLLM_VISION_BASE_URL: str = "http://localhost:18001/v1"
+    VLLM_VISION_MODEL: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    VLLM_TIMEOUT: int = 60
+    VLLM_MAX_RETRIES: int = 2
+
     # ── Solar API (Upstage, 추론 품질이 중요한 체인) ──
     # OpenAI 호환 API — langchain-openai의 ChatOpenAI로 연동
     # hybrid/api_only 모드에서 의도분류, 감정분석, 선호추출, 추천이유, 이미지분석에 사용
     # UPSTAGE_API_KEY는 상단 API Keys 섹션에서 설정
-    SOLAR_API_BASE_URL: str = "https://api.upstage.ai/v1/chat"
+    # ChatOpenAI가 base_url + "/chat/completions"로 호출하므로 /v1까지만 지정
+    SOLAR_API_BASE_URL: str = "https://api.upstage.ai/v1"
     SOLAR_API_MODEL: str = "solar-pro"
     SOLAR_API_TIMEOUT: int = 30
     SOLAR_API_MAX_RETRIES: int = 2

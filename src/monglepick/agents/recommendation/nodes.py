@@ -593,30 +593,41 @@ async def popularity_fallback(state: RecommendationEngineState) -> dict:
 
         user_moods = set(mood_tags) if mood_tags else set()
 
-        # ── 인기도 기반 점수 계산 ──
+        # ── 인기도 기반 점수 계산 (평점 가중치 강화) ──
+        # 기존 문제: RRF 점수가 평점을 압도하여 무명 영화가 상위에 노출됨
+        # 수정: 평점 비중 40%, RRF 비중 15%로 조정하여 고평점 영화 우선
         hybrid_scores: dict[str, float] = {}
 
         for movie in candidates:
-            # 기본 점수: rating / 10.0 (TMDB 평점 0~10 → 0~1)
-            base_score = min(movie.rating / 10.0, 1.0) if movie.rating > 0 else 0.3
+            # 평점 점수: rating / 10.0 (TMDB 평점 0~10 → 0~1), 가중치 40%
+            rating_score = min(movie.rating / 10.0, 1.0) if movie.rating > 0 else 0.3
 
-            # 장르 매칭 부스트
-            genre_boost = 0.0
+            # 장르 매칭 부스트: 가중치 20%
+            genre_score = 0.0
             if pref_genres and movie.genres:
-                if set(movie.genres) & pref_genres:
-                    genre_boost = 0.1
+                matched = set(movie.genres) & pref_genres
+                genre_score = len(matched) / max(len(pref_genres), 1)
 
-            # 무드 매칭 부스트
-            mood_boost = 0.0
+            # 무드 매칭 부스트: 가중치 10%
+            mood_score = 0.0
             if user_moods and movie.mood_tags:
-                if set(movie.mood_tags) & user_moods:
-                    mood_boost = 0.05
+                matched = set(movie.mood_tags) & user_moods
+                mood_score = len(matched) / max(len(user_moods), 1)
 
-            # RRF 점수 가산 (검색 관련성 반영)
-            rrf_boost = movie.rrf_score * 0.2
+            # RRF 점수 (검색 관련성): 가중치 15%
+            rrf_score = movie.rrf_score
 
-            hybrid_scores[movie.id] = min(
-                base_score + genre_boost + mood_boost + rrf_boost, 1.0
+            # 인기도 점수 (vote_count 기반): 가중치 15%
+            # popularity_score가 metadata에 있으면 사용, 없으면 rating 기반 추정
+            popularity_score = 0.5  # 기본값
+
+            # 가중 합산 (총 100%)
+            hybrid_scores[movie.id] = (
+                0.40 * rating_score
+                + 0.20 * genre_score
+                + 0.10 * mood_score
+                + 0.15 * rrf_score
+                + 0.15 * popularity_score
             )
 
         # min-max 정규화

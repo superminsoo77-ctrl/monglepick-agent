@@ -326,9 +326,14 @@ class TestPreferenceRefiner:
 
     @pytest.mark.asyncio
     async def test_insufficient_preferences(self, mock_ollama):
-        """불충분한 선호 → needs_clarification=True."""
+        """핵심 필드/의도/동적필터 모두 없으면 → needs_clarification=True (Intent-First)."""
+        # Intent-First: user_intent, dynamic_filters, genre/mood/reference 모두 없어야 불충분
         mock_ollama.set_structured_response(
-            ExtractedPreferences(genre_preference=None, mood=None),
+            ExtractedPreferences(
+                genre_preference=None, mood=None,
+                user_intent="", dynamic_filters=[], search_keywords=[],
+                reference_movies=[],
+            ),
         )
         state: ChatAgentState = {
             "current_input": "영화 추천해줘",
@@ -379,12 +384,13 @@ class TestPreferenceRefiner:
 
     @pytest.mark.asyncio
     async def test_reference_movie_db_miss(self, mock_ollama, mock_reference_lookup):
-        """참조 영화가 DB에 없으면 보강 불가 → 후속 질문."""
+        """참조 영화가 DB에 없어도 reference_movies는 핵심 필드 → 추천 진행 (Intent-First)."""
         mock_ollama.set_structured_response(
             ExtractedPreferences(
                 genre_preference=None,
                 mood=None,
                 reference_movies=["존재하지않는영화"],
+                user_intent="",  # intent 없음
             ),
         )
         # DB에 해당 영화 없음
@@ -394,8 +400,9 @@ class TestPreferenceRefiner:
             "turn_count": 1,
         }
         result = await preference_refiner(state)
-        # reference(1.5) + genre(0) + mood(0) = 1.5 < 3.0
-        assert result["needs_clarification"] is True
+        # Intent-First: reference_movies가 핵심 필드이므로 충분 → 추천 진행
+        assert result["needs_clarification"] is False
+        assert "존재하지않는영화" in result["preferences"].reference_movies
 
     @pytest.mark.asyncio
     async def test_reference_movie_genre_already_set(self, mock_ollama, mock_reference_lookup):

@@ -16,6 +16,7 @@ from monglepick.chains.intent_chain import classify_intent
 from monglepick.chains.intent_emotion_chain import classify_intent_and_emotion
 from monglepick.chains.preference_chain import extract_preferences
 from monglepick.chains.question_chain import generate_question
+from monglepick.chains.rerank_chain import rerank_candidates
 from monglepick.chains.tool_executor_chain import execute_tool
 
 __all__ = [
@@ -36,6 +37,8 @@ __all__ = [
     "generate_general_response",
     # 이미지 분석 — VLM 멀티모달 포스터/분위기 사진 분석
     "analyze_image",
+    # LLM 재랭킹 — 사용자 의도 기반 후보 재평가 (Phase Q)
+    "rerank_candidates",
     # 도구 실행 — Phase 6 예정 (영화 상세/영화관/예매 등)
     "execute_tool",
 ]

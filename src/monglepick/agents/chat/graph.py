@@ -1,7 +1,7 @@
 """
 Chat Agent LangGraph StateGraph 구성 (§6-2).
 
-14노드 + 4개 조건부 라우팅 함수로 구성된 Chat Agent 그래프.
+15노드 + 4개 조건부 라우팅 함수로 구성된 Chat Agent 그래프.
 SSE 스트리밍과 동기 실행 인터페이스를 제공한다.
 Redis 세션 저장소를 통해 멀티턴 대화 상태를 영속화한다.
 
@@ -18,7 +18,7 @@ Redis 세션 저장소를 통해 멀티턴 대화 상태를 영속화한다.
           │       ├─ needs_clarification=True  → question_generator → response_formatter → END
           │       └─ needs_clarification=False → query_builder → rag_retriever → retrieval_quality_checker
           │            → route_after_retrieval (조건부 분기)
-          │                ├─ 품질 OK → recommendation_ranker → explanation_generator → response_formatter → END
+          │                ├─ 품질 OK → llm_reranker → recommendation_ranker → explanation_generator → response_formatter → END
           │                └─ 품질 미달 → question_generator → response_formatter → END
           │
           ├─ general → general_responder → response_formatter → END
@@ -62,6 +62,7 @@ from monglepick.agents.chat.nodes import (
     general_responder,
     image_analyzer,
     intent_emotion_classifier,
+    llm_reranker,
     preference_refiner,
     query_builder,
     question_generator,
@@ -220,8 +221,8 @@ def route_after_retrieval(state: ChatAgentState) -> str:
     )
 
     if quality_passed or turn_count >= TURN_COUNT_OVERRIDE:
-        # 품질 통과 또는 TURN_COUNT_OVERRIDE(2)턴 이상이면 추천 진행 (무한 루프 방지)
-        return "recommendation_ranker"
+        # 품질 통과 또는 TURN_COUNT_OVERRIDE(2)턴 이상이면 LLM 재랭킹 → 추천 진행
+        return "llm_reranker"
     else:
         # 품질 미달: state에 피드백 메시지 설정 (question_generator에서 활용)
         # retrieval_quality_checker 노드가 retrieval_feedback을 설정한 후
@@ -256,6 +257,7 @@ def build_chat_graph() -> StateGraph:
     graph.add_node("query_builder", query_builder)
     graph.add_node("rag_retriever", rag_retriever)
     graph.add_node("retrieval_quality_checker", retrieval_quality_checker)
+    graph.add_node("llm_reranker", llm_reranker)
     graph.add_node("recommendation_ranker", recommendation_ranker)
     graph.add_node("explanation_generator", explanation_generator)
     graph.add_node("response_formatter", response_formatter)
@@ -311,10 +313,13 @@ def build_chat_graph() -> StateGraph:
         "retrieval_quality_checker",
         route_after_retrieval,
         {
-            "recommendation_ranker": "recommendation_ranker",
+            "llm_reranker": "llm_reranker",
             "question_generator": "question_generator",
         },
     )
+
+    # LLM 재랭킹 → 추천 엔진 서브그래프 → 설명 생성
+    graph.add_edge("llm_reranker", "recommendation_ranker")
 
     # recommendation_ranker → explanation_generator → response_formatter
     graph.add_edge("recommendation_ranker", "explanation_generator")
@@ -334,7 +339,7 @@ def build_chat_graph() -> StateGraph:
 
     # 그래프 컴파일
     compiled = graph.compile()
-    logger.info("chat_graph_compiled", node_count=14)
+    logger.info("chat_graph_compiled", node_count=15)
     return compiled
 
 
@@ -355,6 +360,7 @@ NODE_STATUS_MESSAGES: dict[str, str] = {
     "query_builder": "검색 조건을 구성하고 있어요...",
     "rag_retriever": "영화를 검색하고 있어요... 🔍",
     "retrieval_quality_checker": "검색 결과 품질을 확인하고 있어요...",
+    "llm_reranker": "사용자님의 요청에 맞는 영화인지 검증하고 있어요...",
     "recommendation_ranker": "최적의 영화를 고르고 있어요...",
     "explanation_generator": "추천 이유를 작성하고 있어요...",
     "response_formatter": "응답을 정리하고 있어요...",
@@ -408,6 +414,9 @@ def _predict_next_node(completed_node: str, state: dict) -> tuple[str, str] | No
             next_node = "retrieval_quality_checker"
         elif completed_node == "retrieval_quality_checker":
             next_node = route_after_retrieval(state)
+        elif completed_node == "llm_reranker":
+            # llm_reranker → recommendation_ranker (고정 엣지)
+            next_node = "recommendation_ranker"
         elif completed_node == "recommendation_ranker":
             # recommendation_ranker → explanation_generator (고정 엣지)
             next_node = "explanation_generator"

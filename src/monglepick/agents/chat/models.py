@@ -8,7 +8,8 @@ Phase 2에서 체인 입출력으로 사용하고, Phase 3에서 LangGraph State
 - IntentResult: 의도 분류 결과 (6가지 intent + confidence)
 - EmotionResult: 감정 분석 결과 (emotion + mood_tags)
 - IntentEmotionResult: 의도+감정 통합 LLM 출력 모델 (1회 LLM 호출로 intent+emotion 동시 추출)
-- ExtractedPreferences: 사용자 선호 조건 7개 필드
+- FilterCondition: 동적 필터 조건 (LLM이 사용자 요청에서 자유롭게 추출)
+- ExtractedPreferences: 사용자 선호 조건 — 핵심 구조화 필드 + 유연한 동적 필터
 - ImageAnalysisResult: VLM 이미지 분석 결과 (장르/무드/시각요소/키워드/설명/포스터 여부)
 - ClarificationHint: 후속 질문 힌트 옵션 (칩/버튼 UI용)
 - ClarificationResponse: 후속 질문 + 힌트 구조화 응답
@@ -19,9 +20,9 @@ Phase 2에서 체인 입출력으로 사용하고, Phase 3에서 LangGraph State
 - ChatAgentState: LangGraph TypedDict State (Phase 3 준비)
 
 유틸 함수:
-- calculate_sufficiency: 가중치 기반 충분성 점수 계산
-- is_sufficient: 추천 진행 가능 여부 판정
-- merge_preferences: 이전 선호 + 현재 선호 병합
+- calculate_sufficiency: Intent-First 기반 충분성 점수 계산
+- is_sufficient: 추천 진행 가능 여부 판정 (의도/동적필터/핵심필드 기반)
+- merge_preferences: 이전 선호 + 현재 선호 병합 (동적 필터 포함)
 """
 
 from __future__ import annotations
@@ -163,26 +164,87 @@ class ImageAnalysisResult(BaseModel):
 
 
 # ============================================================
-# 사용자 선호 조건
+# 동적 필터 조건 (Intent-First 아키텍처)
+# ============================================================
+
+class FilterCondition(BaseModel):
+    """
+    LLM이 사용자 요청에서 자유롭게 추출하는 동적 필터 조건.
+
+    기존 7개 고정 필드로는 "평점 높은", "트레일러 있는", "2시간 이내" 등
+    예측하지 못한 사용자 요구를 처리할 수 없었다.
+    FilterCondition을 통해 DB에 존재하는 모든 필드에 대해 필터링이 가능하다.
+
+    지원 필드 (DB payload 기준):
+    - rating: 평점 (float, 0~10)
+    - release_year: 개봉 연도 (int)
+    - runtime: 상영시간 분 (int)
+    - director: 감독명 (str)
+    - certification: 관람등급 (str, 예: "15세", "전체")
+    - trailer_url: 트레일러 URL (str, exists 연산으로 유무 확인)
+    - popularity_score: 인기도 점수 (float)
+    - vote_count: 투표 수 (int)
+
+    지원 연산자:
+    - gte: 이상 (>=)
+    - lte: 이하 (<=)
+    - eq: 일치 (==)
+    - exists: 존재 여부 (값이 비어있지 않은지)
+    - contains: 포함 (문자열/리스트 내 포함 여부)
+    - not_eq: 불일치 (!=)
+    """
+
+    field: str = Field(
+        ...,
+        description="DB 필드명 (rating, release_year, runtime, director, trailer_url 등)",
+    )
+    operator: str = Field(
+        ...,
+        description="비교 연산자 (gte, lte, eq, exists, contains, not_eq)",
+    )
+    value: Any = Field(
+        default=None,
+        description="필터 값 (exists 연산자일 때는 true/false)",
+    )
+
+
+# 동적 필터로 지원하는 DB 필드 목록 — 프롬프트와 쿼리 빌더에서 참조
+FILTERABLE_FIELDS: dict[str, dict[str, str]] = {
+    "rating": {"type": "float", "description": "TMDB 평점 (0~10)"},
+    "release_year": {"type": "int", "description": "개봉 연도"},
+    "runtime": {"type": "int", "description": "상영시간 (분)"},
+    "director": {"type": "str", "description": "감독명"},
+    "certification": {"type": "str", "description": "관람등급 (전체, 12세, 15세, 청소년관람불가)"},
+    "trailer_url": {"type": "str", "description": "트레일러/예고편 URL (exists로 유무 확인)"},
+    "popularity_score": {"type": "float", "description": "인기도 점수"},
+    "vote_count": {"type": "int", "description": "투표/평가 수"},
+}
+
+
+# ============================================================
+# 사용자 선호 조건 (Intent-First + Dynamic Filter)
 # ============================================================
 
 class ExtractedPreferences(BaseModel):
     """
-    사용자 선호 조건 7개 필드 (§6-2 Node 4).
+    사용자 선호 조건 — 핵심 구조화 필드 + 유연한 동적 필터 (§6-2 Node 4).
 
-    모든 필드는 Optional — 아직 파악되지 않은 선호는 None으로 유지.
-    가중치를 기반으로 충분성을 판단하여 추천 진행 여부를 결정한다.
+    Intent-First 아키텍처:
+    - user_intent: LLM이 요약한 사용자 의도 (시맨틱 검색의 핵심 입력)
+    - dynamic_filters: 사용자 요청에서 추출한 정량적/불린 조건 (DB 필터링)
+    - search_keywords: 검색 부스트용 키워드
 
-    가중치 테이블:
-    - genre_preference: 2.0
-    - mood: 2.0
-    - viewing_context: 1.0
-    - platform: 1.0
-    - reference_movies: 1.5
-    - era: 0.5
-    - exclude: 0.5
+    기존 구조화 필드는 검색 엔진이 잘 지원하는 핵심 4개만 유지:
+    - genre_preference, mood, reference_movies, exclude
+
+    충분성 판정:
+    - user_intent가 있으면 → 충분 (사용자가 원하는 것을 알고 있음)
+    - dynamic_filters가 있으면 → 충분 (구체적 필터 조건 존재)
+    - 핵심 필드 중 하나라도 있으면 → 충분
+    - 이전 방식의 가중치 합산은 fallback으로만 사용
     """
 
+    # ── 핵심 구조화 필드 (검색 엔진이 잘 지원하는 것만 유지) ──
     genre_preference: str | None = Field(
         default=None,
         description="선호 장르 (예: 'SF', '액션 코미디')",
@@ -191,6 +253,16 @@ class ExtractedPreferences(BaseModel):
         default=None,
         description="원하는 분위기 (예: '따뜻한', '긴장감 있는')",
     )
+    reference_movies: list[str] = Field(
+        default_factory=list,
+        description="참조 영화 제목 목록 (예: ['인셉션', '인터스텔라'])",
+    )
+    exclude: str | None = Field(
+        default=None,
+        description="제외 조건 (예: '공포는 빼주세요', '한국 영화 말고')",
+    )
+
+    # ── 하위 호환용 (기존 코드에서 참조하는 필드, 점진적 제거 예정) ──
     viewing_context: str | None = Field(
         default=None,
         description="시청 상황 (예: '혼자', '연인과', '가족과')",
@@ -199,24 +271,31 @@ class ExtractedPreferences(BaseModel):
         default=None,
         description="시청 플랫폼 (예: '넷플릭스', '극장')",
     )
-    reference_movies: list[str] = Field(
-        default_factory=list,
-        description="참조 영화 제목 목록 (예: ['인셉션', '인터스텔라'])",
-    )
     era: str | None = Field(
         default=None,
         description="선호 시대/연도 (예: '2020년대', '90년대')",
     )
-    exclude: str | None = Field(
-        default=None,
-        description="제외 조건 (예: '공포는 빼주세요', '한국 영화 말고')",
+
+    # ── 새로운 유연한 필드들 (Intent-First) ──
+    user_intent: str = Field(
+        default="",
+        description="LLM이 요약한 사용자의 추천 의도 (시맨틱 검색 쿼리로 사용)",
+    )
+    dynamic_filters: list[FilterCondition] = Field(
+        default_factory=list,
+        description="사용자 요청에서 추출한 동적 필터 조건 (평점, 트레일러, 런타임 등)",
+    )
+    search_keywords: list[str] = Field(
+        default_factory=list,
+        description="검색 부스트용 키워드 (LLM이 추출한 핵심 검색어)",
     )
 
 
 # ============================================================
-# 선호 충분성 가중치 테이블 (§6-2 Node 4)
+# 선호 충분성 판정 (Intent-First 아키텍처)
 # ============================================================
 
+# 기존 가중치 테이블 (fallback 용도로 유지)
 PREFERENCE_WEIGHTS: dict[str, float] = {
     "genre_preference": 2.0,
     "mood": 2.0,
@@ -228,8 +307,6 @@ PREFERENCE_WEIGHTS: dict[str, float] = {
 }
 
 # 충분성 판정 임계값 — config.py에서 환경변수로 설정 가능 (기본값 2.5)
-# 장르+감정(4.0), 참조영화+감정(3.5) 등 2개 이상 정보가 있으면 바로 추천 진행
-# 감정만 있으면(2.0 < 2.5) 추가 질문, 턴2 오버라이드(TURN_COUNT_OVERRIDE=2)로 보완
 SUFFICIENCY_THRESHOLD: float = _settings.SUFFICIENCY_THRESHOLD
 # 턴 카운트 오버라이드 임계값 (2턴째부터는 선호 부족해도 추천 진행)
 TURN_COUNT_OVERRIDE: int = _settings.TURN_COUNT_OVERRIDE
@@ -522,7 +599,7 @@ class ChatAgentState(TypedDict, total=False):
 
 
 # ============================================================
-# 유틸 함수: 선호 충분성 판정 + 병합
+# 유틸 함수: 선호 충분성 판정 + 병합 (Intent-First)
 # ============================================================
 
 def calculate_sufficiency(
@@ -531,13 +608,15 @@ def calculate_sufficiency(
     has_image_analysis: bool = False,
 ) -> float:
     """
-    선호 조건의 가중치 합산 점수를 계산한다 (§6-2 Node 4).
+    선호 조건의 충분성 점수를 계산한다 (§6-2 Node 4, Intent-First).
 
-    채워진 필드의 가중치를 합산하여 충분성 점수를 반환.
-    has_emotion이 True이면 mood 가중치(2.0)를 추가한다
-    (감정 분석 결과가 있으면 무드가 암시적으로 파악된 것으로 간주).
-    has_image_analysis가 True이면 +1.5 보너스를 추가한다
-    (이미지 분석으로 장르/무드/키워드가 보강된 것으로 간주).
+    Intent-First 아키텍처에서는 user_intent와 dynamic_filters를 우선 반영한다:
+    - user_intent가 있으면: +3.0 (시맨틱 검색으로 즉시 추천 가능)
+    - dynamic_filters가 있으면: 필터당 +1.5 (구체적 조건 존재, 최대 3.0)
+
+    기존 구조화 필드 가중치는 보조 점수로 합산된다.
+    has_emotion이 True이면 mood 가중치(2.0)를 추가한다.
+    has_image_analysis가 True이면 +1.5 보너스를 추가한다.
 
     Args:
         prefs: 현재까지 파악된 사용자 선호 조건
@@ -545,10 +624,19 @@ def calculate_sufficiency(
         has_image_analysis: 이미지 분석 수행 여부
 
     Returns:
-        가중치 합산 점수 (float)
+        충분성 점수 (float)
     """
     score = 0.0
-    # 각 필드가 채워져 있으면 해당 가중치를 합산
+
+    # ── Intent-First 점수: user_intent가 있으면 즉시 충분 ──
+    if prefs.user_intent:
+        score += 3.0
+
+    # ── 동적 필터: 각 필터 조건당 +1.5 (최대 3.0) ──
+    if prefs.dynamic_filters:
+        score += min(len(prefs.dynamic_filters) * 1.5, 3.0)
+
+    # ── 기존 구조화 필드 가중치 (보조) ──
     if prefs.genre_preference:
         score += PREFERENCE_WEIGHTS["genre_preference"]
     if prefs.mood:
@@ -566,9 +654,15 @@ def calculate_sufficiency(
         score += PREFERENCE_WEIGHTS["era"]
     if prefs.exclude:
         score += PREFERENCE_WEIGHTS["exclude"]
-    # 이미지 분석 보너스: 이미지에서 장르/무드/키워드가 추출되면 +1.5
+
+    # 이미지 분석 보너스
     if has_image_analysis:
         score += 1.5
+
+    # 검색 키워드 보너스 (키워드가 있으면 +1.0)
+    if prefs.search_keywords:
+        score += 1.0
+
     return score
 
 
@@ -579,25 +673,41 @@ def is_sufficient(
     has_image_analysis: bool = False,
 ) -> bool:
     """
-    추천 진행 가능 여부를 판정한다 (§6-2 Node 4).
+    추천 진행 가능 여부를 판정한다 (§6-2 Node 4, Intent-First).
 
-    판정 기준 (OR 조건):
-    1. 가중치 합산 >= 2.5 (SUFFICIENCY_THRESHOLD) — 장르+감정 등 2개 이상 정보로 추천 가능
-    2. turn_count >= 2 (TURN_COUNT_OVERRIDE) — 2턴째부터 추천 진행
+    Intent-First 판정 기준 (OR 조건, 우선순위 순):
+    1. user_intent가 비어있지 않으면 → 충분 (사용자 의도 파악됨)
+    2. dynamic_filters가 하나라도 있으면 → 충분 (구체적 필터 조건 존재)
+    3. 핵심 필드 중 하나라도 있으면 → 충분 (genre/mood/reference_movies)
+    4. turn_count >= TURN_COUNT_OVERRIDE → 충분 (턴 오버라이드)
+    5. 가중치 합산 >= SUFFICIENCY_THRESHOLD → 충분 (기존 방식 fallback)
 
     Args:
         prefs: 현재까지 파악된 사용자 선호 조건
         turn_count: 현재 대화 턴 수
         has_emotion: 감정 분석 결과 존재 여부
-        has_image_analysis: 이미지 분석 수행 여부 (True이면 +1.5 보너스)
+        has_image_analysis: 이미지 분석 수행 여부
 
     Returns:
         True면 추천 진행, False면 후속 질문 필요
     """
-    # 턴 카운트 오버라이드: 3턴 이상이면 선호 부족해도 추천 진행
+    # 1) user_intent가 있으면 → 충분 (사용자가 원하는 것을 LLM이 이해함)
+    if prefs.user_intent:
+        return True
+
+    # 2) dynamic_filters가 있으면 → 충분 (구체적 ��터 조건 존재)
+    if prefs.dynamic_filters:
+        return True
+
+    # 3) 핵심 구조화 필드 중 하나라도 있으면 → 충분
+    if prefs.genre_preference or prefs.mood or prefs.reference_movies:
+        return True
+
+    # 4) 턴 카운트 오버라이드
     if turn_count >= TURN_COUNT_OVERRIDE:
         return True
-    # 가중치 합산 기반 판정
+
+    # 5) 기존 가중치 합산 fallback
     return calculate_sufficiency(prefs, has_emotion, has_image_analysis) >= SUFFICIENCY_THRESHOLD
 
 
@@ -609,9 +719,12 @@ def merge_preferences(
     이전 선호 조건과 현재 추출된 선호 조건을 병합한다.
 
     병합 규칙:
-    - 새 값이 None이 아니면 덮어쓰기
-    - 새 값이 None이면 이전 값 유지
+    - 새 값이 None/빈값이 아니면 덮어쓰기
+    - 새 값이 None/빈값이면 이전 값 유지
     - reference_movies: 합집합 (중복 제거)
+    - dynamic_filters: 현재 턴 필터 우선, 이전 필터 중 다른 필드의 것만 추가
+    - search_keywords: 합집합 (중복 제거)
+    - user_intent: 현재 턴 것이 있으면 덮어쓰기 (최신 의도 우선)
 
     Args:
         prev: 이전 턴까지 누적된 선호 조건 (None이면 빈 조건)
@@ -623,6 +736,18 @@ def merge_preferences(
     if prev is None:
         return curr
 
+    # ── dynamic_filters 병합: 현재 턴 필터 우선, 이전 필터 중 겹치지 않는 필드만 추가 ──
+    curr_filter_fields = {f.field for f in curr.dynamic_filters}
+    merged_filters = list(curr.dynamic_filters)
+    for prev_filter in prev.dynamic_filters:
+        if prev_filter.field not in curr_filter_fields:
+            merged_filters.append(prev_filter)
+
+    # ── search_keywords 병합: 합집합 (중복 제거, 순서 유지) ──
+    merged_keywords = list(dict.fromkeys(
+        prev.search_keywords + curr.search_keywords
+    ))
+
     return ExtractedPreferences(
         genre_preference=curr.genre_preference if curr.genre_preference is not None else prev.genre_preference,
         mood=curr.mood if curr.mood is not None else prev.mood,
@@ -632,4 +757,8 @@ def merge_preferences(
         reference_movies=list(dict.fromkeys(prev.reference_movies + curr.reference_movies)),
         era=curr.era if curr.era is not None else prev.era,
         exclude=curr.exclude if curr.exclude is not None else prev.exclude,
+        # ── Intent-First 필드 ──
+        user_intent=curr.user_intent if curr.user_intent else prev.user_intent,
+        dynamic_filters=merged_filters,
+        search_keywords=merged_keywords,
     )

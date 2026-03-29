@@ -2,9 +2,9 @@
 추천 이유 생성 체인 단위 테스트 (Task 9).
 
 테스트 대상:
-- Mock LLM → 2~3문장 한국어 설명
-- fallback 함수 → 장르+평점 포함된 기본 설명
-- 배치: 3편 → 3개 설명 반환
+- Mock LLM → 4~6문장 한국어 설명 (유저 감정/상황/무드태그 반영)
+- fallback 함수 → 장르+평점+배우+무드태그+감정 공감 포함된 기본 설명
+- 배치: 3편 → 3개 설명 반환 (user_message, user_mood_tags 전달)
 - 에러 → fallback 반환
 """
 
@@ -105,6 +105,27 @@ class TestBuildFallbackExplanation:
         assert "SF" in result
         assert "8.7" in result
         assert "놀란" in result
+
+    def test_with_emotion_adds_empathy(self):
+        """감정이 주어지면 공감 문구가 포함된다."""
+        result = _build_fallback_explanation(
+            {"title": "리틀 미스 선샤인", "genres": ["코미디"], "rating": 8.0},
+            emotion="sad",
+        )
+        assert "위로" in result
+
+    def test_with_cast_and_mood_tags(self):
+        """배우와 무드태그가 포함된 풍부한 설명."""
+        result = _build_fallback_explanation({
+            "title": "인터스텔라",
+            "genres": ["SF"],
+            "rating": 8.7,
+            "director": "크리스토퍼 놀란",
+            "cast": ["매튜 매커너히", "앤 해서웨이"],
+            "mood_tags": ["몰입", "웅장", "감동"],
+        })
+        assert "매튜 매커너히" in result
+        assert "몰입" in result
 
     def test_minimal_info(self):
         """최소 정보로도 유효한 설명 생성."""

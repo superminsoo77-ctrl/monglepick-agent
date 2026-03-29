@@ -53,11 +53,13 @@ async def search_qdrant(
     ott_filter: list[str] | None = None,
     min_rating: float | None = None,
     year_range: tuple[int, int] | None = None,
+    has_trailer: bool | None = None,
 ) -> list[SearchResult]:
     """
     Qdrant 벡터 검색: 쿼리의 의미적 유사도로 영화를 검색한다.
 
     §11-1 ①: 쿼리 벡터 생성 → 코사인 유사도 Top-30 + 메타데이터 필터
+    동적 필터(min_rating, has_trailer) 지원 추가.
     """
     # Qdrant 검색 타이밍 측정 시작
     qdrant_start = time.perf_counter()
@@ -87,6 +89,13 @@ async def search_qdrant(
         conditions.append(FieldCondition(key="rating", range={"gte": min_rating}))
     if year_range is not None:
         conditions.append(FieldCondition(key="release_year", range={"gte": year_range[0], "lte": year_range[1]}))
+    # 트레일러 존재 여부 필터: trailer_url 필드가 비어있지 않은 문서만 검색
+    if has_trailer:
+        # Qdrant에서 문자열 필드의 존재/비존재 필터링:
+        # trailer_url이 빈 문자열("")이 아닌 경우만 포함하도록 range 조건 사용 불가하므로
+        # MatchExcept로 빈 문자열을 제외하는 방식으로 구현
+        from qdrant_client.models import MatchExcept
+        conditions.append(FieldCondition(key="trailer_url", match=MatchExcept(except_=["", "null"])))
 
     query_filter = Filter(must=conditions) if conditions else None
 
@@ -148,11 +157,14 @@ async def search_elasticsearch(
     top_k: int = 20,
     genre_filter: list[str] | None = None,
     mood_filter: list[str] | None = None,
+    min_rating: float | None = None,
+    has_trailer: bool | None = None,
 ) -> list[SearchResult]:
     """
     Elasticsearch BM25 검색: Nori 한국어 형태소 분석 기반 키워드 매칭.
 
     §11-1 ②: multi_match + function_score (무드태그 부스트)
+    동적 필터(min_rating, has_trailer) 지원 추가.
     """
     # ES 검색 타이밍 측정 시작
     es_start = time.perf_counter()
@@ -179,6 +191,14 @@ async def search_elasticsearch(
         filter_clauses.append({"terms": {"genres": genre_filter}})
     if mood_filter:
         filter_clauses.append({"terms": {"mood_tags": mood_filter}})
+    # 동적 필터: 최소 평점
+    if min_rating is not None:
+        filter_clauses.append({"range": {"rating": {"gte": min_rating}}})
+    # 동적 필터: 트레일러 존재 여부 (빈 문자열이 아닌 경우만)
+    if has_trailer:
+        filter_clauses.append({"exists": {"field": "trailer_url"}})
+        # 빈 문자열 제외 (exists만으로는 ""도 포함되므로)
+        filter_clauses.append({"bool": {"must_not": [{"term": {"trailer_url.keyword": ""}}]}})
 
     # function_score로 인기도 부스트
     body = {
@@ -503,13 +523,14 @@ async def hybrid_search(
     director: str | None = None,
     similar_to_movie_id: str | None = None,
     exclude_ids: list[str] | None = None,
+    has_trailer: bool | None = None,
 ) -> list[SearchResult]:
     """
     3개 검색 엔진을 동시 실행하고 RRF로 합산하여 최종 후보를 반환한다.
 
     §11-1 하이브리드 검색 흐름:
-    ① Qdrant 벡터 검색 (의미)
-    ② ES BM25 검색 (키워드)
+    ① Qdrant 벡터 검색 (의미) — min_rating, has_trailer 필터 지원
+    ② ES BM25 검색 (키워드) — min_rating, has_trailer 필터 지원
     ③ Neo4j 그래프 검색 (관계)
     ④ 시청 완료 영화 제외 (RRF 전)
     ⑤ RRF 합산 → 최종 후보
@@ -520,10 +541,12 @@ async def hybrid_search(
         genre_filter: 장르 필터
         mood_tags: 무드태그 필터
         ott_filter: OTT 플랫폼 필터
-        min_rating: 최소 평점
+        min_rating: 최소 평점 (동적 필터)
         year_range: (시작연도, 끝연도)
-        director: 감독명 (Neo4j 검색용)
+        director: 감독명 (Neo4j 검색용, 동적 필터)
         similar_to_movie_id: 유사 영화 기준 ID (Neo4j SIMILAR_TO)
+        exclude_ids: 제외할 영화 ID 목록
+        has_trailer: 트레일러 존재 여부 필터 (동적 필터)
 
     Returns:
         RRF 합산 점수 기준 상위 top_k 결과
@@ -549,6 +572,7 @@ async def hybrid_search(
                 ott_filter=ott_filter,
                 min_rating=min_rating,
                 year_range=year_range,
+                has_trailer=has_trailer,
             )
         except Exception as e:
             logger.warning("qdrant_search_failed_skipping", error=str(e), error_type=type(e).__name__)
@@ -562,6 +586,8 @@ async def hybrid_search(
                 top_k=20,
                 genre_filter=genre_filter,
                 mood_filter=mood_tags,
+                min_rating=min_rating,
+                has_trailer=has_trailer,
             )
         except Exception as e:
             logger.warning("es_search_failed_skipping", error=str(e), error_type=type(e).__name__)

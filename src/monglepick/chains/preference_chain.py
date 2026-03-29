@@ -1,14 +1,15 @@
 """
-선호 추출 체인 (§6-2 Node 4).
+선호 추출 체인 (§6-2 Node 4, Intent-First + Dynamic Filter).
 
-사용자 메시지에서 영화 선호 조건 7개 필드를 추출하고,
+사용자 메시지에서 영화 추천 의도(user_intent), 동적 필터(dynamic_filters),
+검색 키워드(search_keywords), 구조화된 선호 필드를 추출하고
 이전 선호 조건과 병합하는 체인.
 EXAONE 32B 구조화 출력으로 ExtractedPreferences를 반환한다.
 
 처리 흐름:
 1. 이전 선호 조건을 문자열로 포맷하여 프롬프트에 포함
 2. get_preference_llm() (EXAONE 32B, structured output) 호출
-3. merge_preferences(previous, current) 로 병합
+3. merge_preferences(previous, current) 로 병합 (동적 필터 포함)
 4. 에러 시: 이전 선호 조건 그대로 반환 (첫 턴이면 빈 ExtractedPreferences)
 """
 
@@ -38,6 +39,9 @@ def _format_existing_preferences(prefs: ExtractedPreferences | None) -> str:
     """
     이전 선호 조건을 프롬프트용 문자열로 포맷한다.
 
+    Intent-First 필드(user_intent, dynamic_filters, search_keywords)도 포함하여
+    LLM이 이전에 파악된 조건을 인지하고 중복 추출을 방지한다.
+
     Args:
         prefs: 이전 턴까지 누적된 선호 조건 (None이면 없음)
 
@@ -48,6 +52,19 @@ def _format_existing_preferences(prefs: ExtractedPreferences | None) -> str:
         return "(아직 파악된 선호 조건 없음)"
 
     parts = []
+
+    # ── Intent-First 필드 ──
+    if prefs.user_intent:
+        parts.append(f"- 추천 의도: {prefs.user_intent}")
+    if prefs.dynamic_filters:
+        filter_strs = [
+            f"{f.field} {f.operator} {f.value}" for f in prefs.dynamic_filters
+        ]
+        parts.append(f"- 동적 필터: {', '.join(filter_strs)}")
+    if prefs.search_keywords:
+        parts.append(f"- 검색 키워드: {', '.join(prefs.search_keywords)}")
+
+    # ── 기존 구조화 필드 ──
     if prefs.genre_preference:
         parts.append(f"- 장르: {prefs.genre_preference}")
     if prefs.mood:
@@ -141,6 +158,12 @@ async def extract_preferences(
 
         logger.info(
             "preference_chain_llm_response",
+            raw_user_intent=extracted.user_intent[:100] if extracted.user_intent else "",
+            raw_dynamic_filters=[
+                {"field": f.field, "op": f.operator, "value": f.value}
+                for f in extracted.dynamic_filters
+            ] if extracted.dynamic_filters else [],
+            raw_search_keywords=extracted.search_keywords,
             raw_genre=extracted.genre_preference,
             raw_mood=extracted.mood,
             raw_context=extracted.viewing_context,
@@ -153,6 +176,9 @@ async def extract_preferences(
 
         logger.info(
             "preferences_extracted",
+            user_intent=merged.user_intent[:80] if merged.user_intent else "",
+            dynamic_filter_count=len(merged.dynamic_filters),
+            search_keywords=merged.search_keywords[:5],
             genre=merged.genre_preference,
             mood=merged.mood,
             reference_movies=merged.reference_movies,

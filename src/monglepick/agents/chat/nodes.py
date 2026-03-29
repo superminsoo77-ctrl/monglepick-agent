@@ -42,6 +42,7 @@ from monglepick.agents.chat.models import (
     ClarificationResponse,
     EmotionResult,
     ExtractedPreferences,
+    FilterCondition,
     ImageAnalysisResult,
     IntentResult,
     RankedMovie,
@@ -764,8 +765,14 @@ async def query_builder(state: ChatAgentState) -> dict:
         watch_history = state.get("watch_history", [])
         image_analysis = state.get("image_analysis")
 
-        # semantic_query 구성: 사용자 입력 + 장르 + 무드 + 참조 영화
-        query_parts = [current_input]
+        # ── semantic_query 구성 (Intent-First) ──
+        # user_intent가 있으면 시맨틱 검색의 핵심 입력으로 사용
+        # 없으면 기존 방식 (사용자 입력 + 장르 + 무드 + 참조영화)으로 fallback
+        query_parts = []
+        if prefs.user_intent:
+            # Intent-First: LLM이 요약한 의도가 가장 강력한 시맨틱 쿼리
+            query_parts.append(prefs.user_intent)
+        query_parts.append(current_input)
         if prefs.genre_preference:
             query_parts.append(prefs.genre_preference)
         if prefs.mood:
@@ -777,7 +784,7 @@ async def query_builder(state: ChatAgentState) -> dict:
             query_parts.append(image_analysis.description)
         semantic_query = " ".join(query_parts)
 
-        # filters 구성
+        # ── filters 구성 (기존 구조화 필드 + 동적 필터 통합) ──
         filters: dict[str, Any] = {}
         if prefs.genre_preference:
             # 쉼표나 공백으로 구분된 장르를 리스트로 변환
@@ -787,13 +794,49 @@ async def query_builder(state: ChatAgentState) -> dict:
         if prefs.platform:
             filters["platform"] = prefs.platform
 
-        # 연도 범위 파싱
+        # 연도 범위 파싱 (era 필드에서)
         year_range = _parse_era(prefs.era) if prefs.era else None
         if year_range:
             filters["year_range"] = year_range
 
-        # boost_keywords: 무드태그 + 참조영화 + 이미지 키워드
+        # ── 동적 필터를 filters 딕셔너리에 변환 ──
+        # LLM이 추출한 FilterCondition들을 검색 엔진이 이해하는 형태로 변환
+        for fc in prefs.dynamic_filters:
+            if fc.field == "rating" and fc.operator == "gte":
+                filters["min_rating"] = float(fc.value)
+            elif fc.field == "rating" and fc.operator == "lte":
+                filters["max_rating"] = float(fc.value)
+            elif fc.field == "trailer_url" and fc.operator == "exists":
+                filters["has_trailer"] = bool(fc.value)
+            elif fc.field == "runtime" and fc.operator == "lte":
+                filters["max_runtime"] = int(fc.value)
+            elif fc.field == "runtime" and fc.operator == "gte":
+                filters["min_runtime"] = int(fc.value)
+            elif fc.field == "director" and fc.operator == "eq":
+                filters["director"] = str(fc.value)
+            elif fc.field == "certification" and fc.operator == "eq":
+                filters["certification"] = str(fc.value)
+            elif fc.field == "release_year" and fc.operator == "gte":
+                # 동적 필터의 release_year가 era보다 우선
+                existing_range = filters.get("year_range")
+                start = int(fc.value)
+                end = existing_range[1] if existing_range else 2030
+                filters["year_range"] = (start, end)
+            elif fc.field == "release_year" and fc.operator == "lte":
+                existing_range = filters.get("year_range")
+                start = existing_range[0] if existing_range else 1900
+                end = int(fc.value)
+                filters["year_range"] = (start, end)
+            elif fc.field == "popularity_score" and fc.operator == "gte":
+                filters["min_popularity"] = float(fc.value)
+            elif fc.field == "vote_count" and fc.operator == "gte":
+                filters["min_vote_count"] = int(fc.value)
+
+        # ── boost_keywords 구성 (기존 + 새 search_keywords 통합) ──
         boost_keywords: list[str] = []
+        # LLM이 추출한 search_keywords를 최우선 부스트로 추가
+        if prefs.search_keywords:
+            boost_keywords.extend(prefs.search_keywords)
         if emotion and emotion.mood_tags:
             boost_keywords.extend(emotion.mood_tags)
         if prefs.reference_movies:
@@ -821,6 +864,8 @@ async def query_builder(state: ChatAgentState) -> dict:
             semantic_query=semantic_query[:200],
             keyword_query=current_input[:100],
             filters=filters,
+            dynamic_filter_count=len(prefs.dynamic_filters),
+            user_intent_used=bool(prefs.user_intent),
             boost_keywords=boost_keywords[:10],
             exclude_count=len(exclude_ids),
             image_enhanced=bool(image_analysis and image_analysis.analyzed),
@@ -911,28 +956,32 @@ async def rag_retriever(state: ChatAgentState) -> dict:
         ott_filter = [filters["platform"]] if filters.get("platform") else None
         year_range = filters.get("year_range")
 
-        # 선호에서 감독/참조영화 ID 추출 (Neo4j 검색용)
+        # ── 동적 필터 파라미터 추출 (Intent-First) ──
+        min_rating = filters.get("min_rating")       # float | None
+        has_trailer = filters.get("has_trailer")      # bool | None
+        director_name = filters.get("director")       # str | None (동적 필터에서 추출)
+
+        # 선호에서 참조영화 ID 추출 (Neo4j 검색용)
         preferences = state.get("preferences")
-        director_name = None
         similar_movie_id = None
         if preferences and preferences.reference_movies:
-            # 첫 번째 참조 영화의 ID를 similar_to_movie_id로 사용
-            # (query_builder에서 이미 조회했으므로 ID가 있으면 활용)
             ref_info = filters.get("reference_movie_id")
             if ref_info:
                 similar_movie_id = ref_info
 
-        # 하이브리드 검색 실행 — exclude_ids를 RRF 전에 제거하도록 전달
+        # 하이브리드 검색 실행 — 동적 필터(min_rating, has_trailer)도 전달
         results = await hybrid_search(
             query=search_query.semantic_query or search_query.keyword_query,
             top_k=search_query.limit,
             genre_filter=genre_filter,
             mood_tags=mood_tags,
             ott_filter=ott_filter,
+            min_rating=min_rating,
             year_range=year_range,
             director=director_name,
             similar_to_movie_id=similar_movie_id,
             exclude_ids=search_query.exclude_ids,
+            has_trailer=has_trailer,
         )
 
         # SearchResult → CandidateMovie 변환
@@ -946,17 +995,57 @@ async def rag_retriever(state: ChatAgentState) -> dict:
             exclude_set = set(search_query.exclude_ids)
             candidates = [c for c in candidates if c.id not in exclude_set]
 
+        # ── 후처리 필터링 (DB 검색에서 적용 못한 동적 필터 2차 적용) ──
+        # Qdrant/ES/Neo4j 모두에서 지원하지 않는 필터는 후처리로 적용
+        pre_filter_count = len(candidates)
+
+        # has_trailer 후처리: 트레일러 URL이 실제로 있는 영화만 필터 (Qdrant 필터 누락 대비)
+        if has_trailer and candidates:
+            filtered = [c for c in candidates if c.trailer_url]
+            # 필터 후 후보가 2편 미만이면 필터 완화 (추천 실패 방지)
+            if len(filtered) >= 2:
+                candidates = filtered
+
+        # min_rating 후처리: 평점 조건 2차 검증
+        if min_rating is not None and candidates:
+            filtered = [c for c in candidates if c.rating >= min_rating]
+            if len(filtered) >= 2:
+                candidates = filtered
+
+        # max_runtime 후처리
+        max_runtime = filters.get("max_runtime")
+        if max_runtime is not None and candidates:
+            # CandidateMovie에 runtime 필드가 없으므로 메타데이터에서 확인
+            # (현재 모델에는 runtime이 없지만 향후 추가 대비)
+            pass
+
+        if pre_filter_count != len(candidates):
+            logger.info(
+                "rag_post_filter_applied",
+                before=pre_filter_count,
+                after=len(candidates),
+                has_trailer=has_trailer,
+                min_rating=min_rating,
+            )
+
         elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
             "rag_retrieved_node",
             candidate_count=len(candidates),
             query_preview=search_query.semantic_query[:80] if search_query.semantic_query else "",
+            dynamic_filters_applied={
+                "min_rating": min_rating,
+                "has_trailer": has_trailer,
+                "director": director_name,
+            },
             candidates=[
                 {
                     "rank": i + 1,
                     "title": c.title,
+                    "rating": c.rating,
                     "rrf_score": round(c.rrf_score, 6),
                     "genres": c.genres[:3],
+                    "has_trailer": bool(c.trailer_url),
                     "source": c.retrieval_source,
                 }
                 for i, c in enumerate(candidates[:10])
@@ -1074,6 +1163,81 @@ async def retrieval_quality_checker(state: ChatAgentState) -> dict:
                       elapsed_ms=round(elapsed_ms, 1), session_id=session_id)
         # 에러 시 통과 처리하여 추천 흐름 계속 진행
         return {"retrieval_quality_passed": True, "retrieval_feedback": ""}
+
+
+# ============================================================
+# 7.7. llm_reranker — LLM 기반 후처리 재랭킹 (Phase Q)
+# ============================================================
+
+@traceable(name="llm_reranker", run_type="chain", metadata={"node": "7.7/15", "llm": "solar-pro"})
+async def llm_reranker(state: ChatAgentState) -> dict:
+    """
+    LLM 기반으로 후보 영화를 사용자 의도에 맞게 재랭킹한다.
+
+    RAG 검색 + RRF 합산으로 가져온 후보를 LLM의 세계 지식으로 재평가하여:
+    - DB 필터나 벡터 검색으로 잡을 수 없는 조건을 검증
+    - 사용자 요청에 부적합한 후보를 제거/감점
+    - 적합한 후보를 상위로 이동
+
+    예: "아카데미 수상작" → DB에 수상 필드 없지만 LLM이 자체 지식으로 판단
+    예: "실화 바탕" → overview에 없어도 LLM이 영화 지식으로 판단
+    예: "OST 좋은 영화" → LLM이 영화별 OST 평가를 자체 지식으로 판단
+
+    에러 시 원본 순서를 그대로 유지한다 (graceful degradation).
+
+    Args:
+        state: ChatAgentState (candidate_movies, current_input, emotion, preferences 필요)
+
+    Returns:
+        dict: candidate_movies(재랭킹된 list[CandidateMovie]) 업데이트
+    """
+    # 노드 실행 타이밍 측정 시작
+    node_start = time.perf_counter()
+    session_id = state.get("session_id", "")
+    user_id = state.get("user_id", "")
+    try:
+        candidates = state.get("candidate_movies", [])
+        current_input = state.get("current_input", "")
+        emotion = state.get("emotion")
+        preferences = state.get("preferences")
+
+        if not candidates:
+            return {"candidate_movies": []}
+
+        # rerank_candidates 체인 호출 (Solar API)
+        from monglepick.chains.rerank_chain import rerank_candidates
+
+        reranked = await rerank_candidates(
+            candidates=candidates,
+            user_request=current_input,
+            emotion=emotion,
+            preferences=preferences,
+        )
+
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.info(
+            "llm_reranker_node_completed",
+            original_count=len(candidates),
+            reranked_count=len(reranked),
+            top_reranked=[
+                {"title": m.title, "rating": m.rating, "rrf": round(m.rrf_score, 4)}
+                for m in reranked[:5]
+            ],
+            elapsed_ms=round(elapsed_ms, 1),
+            session_id=session_id,
+            user_id=user_id,
+        )
+        return {"candidate_movies": reranked}
+
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error(
+            "llm_reranker_error", error=str(e), error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1),
+            session_id=session_id, user_id=user_id,
+        )
+        # 에러 시: 원본 순서 유지 (graceful degradation)
+        return {"candidate_movies": state.get("candidate_movies", [])}
 
 
 # ============================================================
@@ -1211,6 +1375,8 @@ async def explanation_generator(state: ChatAgentState) -> dict:
         emotion = state.get("emotion")
         prefs = state.get("preferences")
         watch_history = state.get("watch_history", [])
+        # 사용자의 원래 요청 메시지 (추천 이유에 공감 문구 생성용)
+        current_input = state.get("current_input", "")
 
         if not ranked:
             return {"ranked_movies": []}
@@ -1220,12 +1386,16 @@ async def explanation_generator(state: ChatAgentState) -> dict:
             wh.get("title", "") for wh in watch_history[:5] if wh.get("title")
         ]
 
+        # 감정 문자열 + 무드태그 추출 (EmotionResult에서 분리)
         emotion_str = emotion.emotion if emotion else None
+        user_mood_tags = emotion.mood_tags if emotion else None
 
-        # 배치 병렬 생성
+        # 배치 생성 (사용자 원문 메시지 + 무드태그 전달)
         explanations = await generate_explanations_batch(
             movies=ranked,
             emotion=emotion_str,
+            user_mood_tags=user_mood_tags,
+            user_message=current_input,
             preferences=prefs,
             watch_history_titles=watch_titles,
         )

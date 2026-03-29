@@ -243,10 +243,36 @@ class TestIsSufficient:
         assert is_sufficient(prefs) is True
 
     def test_insufficient_by_score(self):
-        """가중치 합산 < 2.5이면 불충분."""
-        prefs = ExtractedPreferences(genre_preference="SF")
-        # 2.0 < 2.5 → False
+        """핵심 필드/의도/동적필터 모두 없으면 불충분 (Intent-First)."""
+        # viewing_context만 있으면 불충분 (핵심 필드가 아님)
+        prefs = ExtractedPreferences(viewing_context="혼자")
         assert is_sufficient(prefs) is False
+
+        # 아무것도 없으면 불충분
+        prefs_empty = ExtractedPreferences()
+        assert is_sufficient(prefs_empty) is False
+
+    def test_intent_first_sufficient(self):
+        """Intent-First: user_intent가 있으면 즉시 충분."""
+        prefs = ExtractedPreferences(user_intent="평점 높은 인기 영화")
+        assert is_sufficient(prefs) is True
+
+    def test_dynamic_filter_sufficient(self):
+        """Intent-First: dynamic_filters가 있으면 즉시 충분."""
+        from monglepick.agents.chat.models import FilterCondition
+        prefs = ExtractedPreferences(
+            dynamic_filters=[FilterCondition(field="rating", operator="gte", value=7.0)]
+        )
+        assert is_sufficient(prefs) is True
+
+    def test_core_field_sufficient(self):
+        """Intent-First: genre/mood/reference_movies 중 하나면 충분."""
+        # genre만 있으면 충분
+        assert is_sufficient(ExtractedPreferences(genre_preference="SF")) is True
+        # mood만 있으면 충분
+        assert is_sufficient(ExtractedPreferences(mood="웅장한")) is True
+        # reference_movies만 있으면 충분
+        assert is_sufficient(ExtractedPreferences(reference_movies=["인셉션"])) is True
 
     def test_turn_count_override(self):
         """turn_count >= 2이면 선호 부족해도 충분 (TURN_COUNT_OVERRIDE=2)."""
@@ -255,16 +281,21 @@ class TestIsSufficient:
         assert is_sufficient(prefs, turn_count=5) is True
 
     def test_turn_count_below_threshold(self):
-        """turn_count < 2이고 점수 부족이면 불충분."""
+        """turn_count < 2이고 핵심 정보 없으면 불충분."""
         prefs = ExtractedPreferences()
         assert is_sufficient(prefs, turn_count=1) is False
 
     def test_emotion_contributes_to_sufficiency(self):
-        """감정이 감지되면 mood 가중치가 추가되어 충분해질 수 있다."""
+        """감정이 감지되면 가중치 합산에 기여한다 (calculate_sufficiency)."""
+        from monglepick.agents.chat.models import calculate_sufficiency
         prefs = ExtractedPreferences(genre_preference="SF")
-        # 2.0 < 2.5 → False (emotion 없이)
-        assert is_sufficient(prefs) is False
-        # 2.0 + 2.0(emotion→mood) = 4.0 >= 2.5 → True
+        # genre(2.0) = 2.0 (감정 없이)
+        score_no_emotion = calculate_sufficiency(prefs)
+        # genre(2.0) + mood(2.0, emotion→mood) = 4.0
+        score_with_emotion = calculate_sufficiency(prefs, has_emotion=True)
+        assert score_with_emotion > score_no_emotion
+        # Intent-First에서 genre만 있으면 이미 충분
+        assert is_sufficient(prefs) is True
         assert is_sufficient(prefs, has_emotion=True) is True
 
 

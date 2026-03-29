@@ -4,12 +4,12 @@ RAG 검색 품질 판정 로직 테스트.
 route_after_retrieval 라우터와 retrieval_quality_checker 노드를 테스트한다.
 
 테스트 시나리오:
-1. 품질 OK (3개 이상 + Top-1 ≥ 0.015 + 평균 ≥ 0.01) → recommendation_ranker
+1. 품질 OK (3개 이상 + Top-1 ≥ 0.015 + 평균 ≥ 0.01) → llm_reranker
 2. 품질 미달 (후보 부족) → question_generator
 3. 품질 미달 (Top-1 점수 낮음) → question_generator
 4. 품질 미달 (평균 점수 낮음) → question_generator
 5. 빈 결과 → question_generator
-6. 품질 미달 + turn_count ≥ 3 → recommendation_ranker (무한 루프 방지)
+6. 품질 미달 + turn_count ≥ 3 → llm_reranker (무한 루프 방지)
 7. 경계값 테스트 (정확히 임계값)
 8. retrieval_quality_checker 노드 state 업데이트 검증
 """
@@ -49,7 +49,7 @@ class TestRouteAfterRetrieval:
             "turn_count": 1,
         }
         result = route_after_retrieval(state)
-        assert result == "recommendation_ranker"
+        assert result == "llm_reranker"
 
     def test_insufficient_candidates(self):
         """후보 2개 (최소 3개 미만) → question_generator."""
@@ -106,7 +106,7 @@ class TestRouteAfterRetrieval:
             "turn_count": 3,  # 오버라이드 임계값
         }
         result = route_after_retrieval(state)
-        assert result == "recommendation_ranker"
+        assert result == "llm_reranker"
 
     def test_boundary_exact_threshold(self):
         """정확히 임계값 → 품질 OK."""
@@ -122,7 +122,7 @@ class TestRouteAfterRetrieval:
         }
         result = route_after_retrieval(state)
         # 정확히 임계값이면 >= 조건이므로 PASS
-        assert result == "recommendation_ranker"
+        assert result == "llm_reranker"
 
     def test_boundary_just_below_threshold(self):
         """임계값 바로 아래 → 품질 미달."""
