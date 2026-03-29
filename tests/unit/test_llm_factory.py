@@ -45,6 +45,8 @@ class TestGetLlm:
                 model="test-model",
                 temperature=0.3,
                 base_url=settings.OLLAMA_BASE_URL,
+                num_ctx=settings.OLLAMA_NUM_CTX,
+                keep_alive=settings.OLLAMA_KEEP_ALIVE,
                 format="json",
             )
 
@@ -82,6 +84,8 @@ class TestGetLlm:
                 model=settings.CONVERSATION_MODEL,
                 temperature=0.5,
                 base_url=settings.OLLAMA_BASE_URL,
+                num_ctx=settings.OLLAMA_NUM_CTX,
+                keep_alive=settings.OLLAMA_KEEP_ALIVE,
             )
 
 

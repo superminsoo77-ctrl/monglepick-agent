@@ -71,7 +71,8 @@ jobs:
           set -e
           echo "========== AI Agent 배포 시작 =========="
 
-          PROJECT_DIR="${PROJECT_DIR:-/Users/yoonhyungjoo/Documents/monglepick}"
+          # 스테이징 맥북 프로젝트 경로 (Runner 환경변수 또는 기본값)
+          PROJECT_DIR="${PROJECT_DIR:-$HOME/Documents/monglepick}"
 
           # checkout된 코드를 프로젝트 디렉토리에 동기화
           rsync -a --delete --exclude='.venv' --exclude='__pycache__' --exclude='.env' \
@@ -79,8 +80,9 @@ jobs:
 
           cd "$PROJECT_DIR"
 
-          # Agent 컨테이너만 재빌드 + 재시작 (DB 건드리지 않음)
-          docker compose -f docker-compose.staging.yml up -d --build --no-deps ai-agent
+          # Agent 컨테이너만 재빌드 + 재시작 (인프라는 이미 실행 중)
+          docker compose -f Staging/docker-compose.app.yml --env-file Staging/.env.staging \
+            up -d --build --no-deps ai-agent
 
           # 헬스체크 대기 (최대 30초)
           echo ">>> Agent 헬스체크 대기..."

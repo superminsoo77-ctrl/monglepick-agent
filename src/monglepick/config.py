@@ -38,10 +38,6 @@ class Settings(BaseSettings):
     # Ollama는 단일 서버에서 OLLAMA_MAX_LOADED_MODELS 수만큼 모델을 동시 로드한다.
     # Mac 64GB 기준: qwen3.5:35b-a3b + exaone-32b 동시 로드 가능 (2모델)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    # 컨텍스트 윈도우 크기 (토큰). qwen3.5 기본값 262K → KV캐시 메모리 소모 방지용
-    OLLAMA_NUM_CTX: int = 8192
-    # 모델 GPU 메모리 유지 시간 (마지막 요청 후). 2모델 동시 서빙 시 메모리 관리용
-    OLLAMA_KEEP_ALIVE: str = "10m"
 
     # ── Qdrant ──
     QDRANT_URL: str = "http://localhost:6333"
@@ -75,21 +71,10 @@ class Settings(BaseSettings):
     # "api_only": 모든 체인을 Solar API로 처리 (Ollama 장애 시)
     LLM_MODE: str = "local_only"
 
-    # ── vLLM (운영서버 GPU, SSH 터널 경유) ──
-    # hybrid 모드에서 대화/질문 체인에 운영서버 EXAONE 1.2B 사용
-    VLLM_ENABLED: bool = False
-    VLLM_CHAT_BASE_URL: str = "http://localhost:18000/v1"
-    VLLM_CHAT_MODEL: str = "mongle"
-    VLLM_VISION_BASE_URL: str = "http://localhost:18001/v1"
-    VLLM_VISION_MODEL: str = "Qwen/Qwen2.5-VL-3B-Instruct"
-    VLLM_TIMEOUT: int = 60
-    VLLM_MAX_RETRIES: int = 2
-
     # ── Solar API (Upstage, 추론 품질이 중요한 체인) ──
     # OpenAI 호환 API — langchain-openai의 ChatOpenAI로 연동
     # hybrid/api_only 모드에서 의도분류, 감정분석, 선호추출, 추천이유, 이미지분석에 사용
     # UPSTAGE_API_KEY는 상단 API Keys 섹션에서 설정
-    # ChatOpenAI가 base_url + "/chat/completions"로 호출하므로 /v1까지만 지정
     SOLAR_API_BASE_URL: str = "https://api.upstage.ai/v1"
     SOLAR_API_MODEL: str = "solar-pro"
     SOLAR_API_TIMEOUT: int = 30
@@ -102,6 +87,28 @@ class Settings(BaseSettings):
     # 파인튜닝 전에는 EXAONE 4.0 1.2B 베이스 모델 사용 가능
     MONGLE_MODEL: str = "mongle"
     MONGLE_TEMPERATURE: float = 0.5
+
+    # ── vLLM (운영서버 GPU, OpenAI 호환 API) ──
+    # hybrid 모드에서 Ollama 대신 운영서버 vLLM을 사용할 때 활성화
+    # vLLM은 OpenAI 호환 API를 제공하므로 ChatOpenAI로 연동
+    VLLM_ENABLED: bool = False
+    # vLLM 채팅 모델 (EXAONE 4.0 1.2B, 일반대화/후속질문)
+    VLLM_CHAT_BASE_URL: str = "http://localhost:18000/v1"
+    VLLM_CHAT_MODEL: str = "LGAI-EXAONE/EXAONE-4.0-1.2B"
+    # vLLM 비전 모델 (Qwen2.5-VL-3B, 이미지 분석)
+    VLLM_VISION_BASE_URL: str = "http://localhost:18001/v1"
+    VLLM_VISION_MODEL: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    VLLM_TIMEOUT: int = 60
+    VLLM_MAX_RETRIES: int = 2
+
+    # ── Ollama 서빙 옵션 ──
+    # 컨텍스트 윈도우 크기 (토큰 수). 모델 기본값(qwen3.5=262K)은 KV 캐시로 GPU 메모리를
+    # 과도하게 소모하므로, 영화 추천 대화에 충분한 8192로 제한하여 메모리를 절약한다.
+    # 64GB Mac 기준: num_ctx=8192이면 qwen3.5(~24GB) + exaone-32b(~20GB) = ~44GB (여유 20GB)
+    OLLAMA_NUM_CTX: int = 8192
+    # keep_alive: 모델 메모리 유지 시간. "10m"이면 마지막 요청 후 10분간 GPU에 상주.
+    # 짧으면 메모리 절약, 길면 응답 빠름. "-1"이면 영구 유지, "0"이면 즉시 언로드.
+    OLLAMA_KEEP_ALIVE: str = "10m"
 
     # ── LLM Models (Ollama 로컬 모델) ──
     # local_only 모드에서 사용되는 Ollama 모델명
@@ -181,8 +188,9 @@ class Settings(BaseSettings):
     # 과부하 방지를 위해 모델별 동시 호출 수를 제한한다.
     LLM_PER_MODEL_CONCURRENCY: int = 2
     # 추천 이유를 LLM으로 생성할 최대 영화 수.
+    # RECOMMENDATION_TOP_K(5)와 동일하게 맞춰 모든 추천 영화에 LLM 설명을 생성한다.
     # 초과 영화는 메타데이터 기반 템플릿(_build_fallback_explanation)으로 대체.
-    MAX_EXPLANATION_MOVIES: int = 3
+    MAX_EXPLANATION_MOVIES: int = 5
 
     # ── Retrieval Quality Thresholds (RAG 검색 품질 판정) ──
     # 최소 후보 수: 이 값 미만이면 검색 품질 미달
@@ -210,6 +218,27 @@ class Settings(BaseSettings):
     # RRF Reciprocal Rank Fusion 상수
     RRF_K: int = 60
 
+    # ── 전역 API Rate Limiting (RateLimitMiddleware) ──
+    # 비인증 사용자(IP 기반): 분당 최대 요청 수
+    RATE_LIMIT_ANON_RPM: int = 30
+    # 인증 사용자(Bearer 토큰 기반): 분당 최대 요청 수
+    RATE_LIMIT_AUTH_RPM: int = 60
+
+    # ── 요청 타임아웃 (TimeoutMiddleware) ──
+    # SSE 엔드포인트(/api/v1/chat, /api/v1/match): LangGraph 전체 실행 포함 (초)
+    TIMEOUT_SSE_SEC: int = 300
+    # 일반 엔드포인트 타임아웃 (초)
+    TIMEOUT_DEFAULT_SEC: int = 30
+
+    # ── MySQL 커넥션 풀 ──
+    # 풀 최소 연결 수 (유휴 상태에서도 유지할 연결)
+    MYSQL_POOL_MIN: int = 1
+    # 풀 최대 연결 수 (동시 쿼리 허용 상한)
+    MYSQL_POOL_MAX: int = 10
+
+    # ── Redis 커넥션 풀 ──
+    # Redis 클라이언트 최대 연결 수
+    REDIS_MAX_CONNECTIONS: int = 50
 
     @model_validator(mode='after')
     def _warn_empty_passwords(self):

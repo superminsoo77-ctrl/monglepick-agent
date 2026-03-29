@@ -53,6 +53,9 @@ _ollama_cache: dict[tuple[str, float, str | None], ChatOllama] = {}
 # Solar API 캐시: (model, temperature) → ChatOpenAI
 _solar_cache: dict[tuple[str, float], ChatOpenAI] = {}
 
+# vLLM 캐시: (base_url, model, temperature) → ChatOpenAI
+_vllm_cache: dict[tuple[str, str, float], ChatOpenAI] = {}
+
 # 구조화 출력 캐시: (backend, model, temperature, schema_name) → Runnable
 _structured_cache: dict[tuple[str, str, float, str], Runnable] = {}
 
@@ -96,6 +99,12 @@ def get_ollama_llm(
                 "model": model,
                 "temperature": temperature,
                 "base_url": settings.OLLAMA_BASE_URL,
+                # GPU 메모리 보호: 모델 기본 context(qwen3.5=262K)가 KV 캐시로
+                # 과도한 VRAM을 소모하므로, 설정값으로 제한한다.
+                "num_ctx": settings.OLLAMA_NUM_CTX,
+                # 모델 메모리 유지 시간: 마지막 요청 후 이 시간이 지나면 GPU에서 언로드.
+                # 2개 모델 동시 서빙 시 메모리 관리에 필수.
+                "keep_alive": settings.OLLAMA_KEEP_ALIVE,
             }
             if format == "json":
                 kwargs["format"] = "json"
@@ -162,6 +171,59 @@ def get_solar_api_llm(
             logger.debug("solar_cache_hit", model=model, temperature=temperature)
 
         return _solar_cache[cache_key]
+
+
+# ============================================================
+# vLLM (운영서버 GPU, OpenAI 호환 API) LLM 생성
+# ============================================================
+
+def get_vllm_llm(
+    temperature: float = 0.5,
+    base_url: str | None = None,
+    model: str | None = None,
+) -> ChatOpenAI:
+    """
+    운영서버 vLLM LLM 인스턴스를 생성하거나 캐시에서 반환한다.
+
+    vLLM은 OpenAI 호환 프로토콜이므로 ChatOpenAI 클래스를 사용한다.
+    동일 (base_url, model, temperature) 조합은 싱글턴으로 재사용된다.
+
+    Args:
+        temperature: 생성 온도 (기본값: 0.5)
+        base_url: vLLM 서버 URL (기본값: settings.VLLM_CHAT_BASE_URL)
+        model: vLLM 모델명 (기본값: settings.VLLM_CHAT_MODEL)
+
+    Returns:
+        ChatOpenAI 인스턴스 (vLLM 백엔드)
+    """
+    base_url = base_url or settings.VLLM_CHAT_BASE_URL
+    model = model or settings.VLLM_CHAT_MODEL
+
+    cache_key = (base_url, model, temperature)
+
+    with _cache_lock:
+        if cache_key not in _vllm_cache:
+            _vllm_cache[cache_key] = ChatOpenAI(
+                model=model,
+                temperature=temperature,
+                base_url=base_url,
+                # vLLM은 API 키 불필요 — 더미 값 전달 (ChatOpenAI 필수 인자)
+                api_key="EMPTY",
+                # 몽글이(1.2B)는 max_model_len=2048. 프롬프트(~500 tok) 여유를 두고 출력 제한
+                max_tokens=512,
+                timeout=settings.VLLM_TIMEOUT,
+                max_retries=settings.VLLM_MAX_RETRIES,
+            )
+            logger.info(
+                "vllm_llm_created",
+                model=model,
+                temperature=temperature,
+                base_url=base_url,
+            )
+        else:
+            logger.debug("vllm_cache_hit", model=model, temperature=temperature)
+
+        return _vllm_cache[cache_key]
 
 
 # ============================================================
@@ -364,17 +426,21 @@ def get_conversation_llm() -> BaseChatModel:
     """
     일반 대화용 LLM (temp=0.5).
 
-    hybrid → 몽글이 (settings.MONGLE_MODEL, Ollama 로컬, 빠른 응답)
+    hybrid + VLLM_ENABLED → vLLM EXAONE 1.2B (운영서버 GPU, 빠른 응답)
+    hybrid + !VLLM_ENABLED → 몽글이 (settings.MONGLE_MODEL, Ollama 로컬)
     local_only → Ollama (settings.CONVERSATION_MODEL, 기본 EXAONE 32B)
     api_only → Solar API
 
     자유 텍스트 생성 — 구조화 출력 미적용.
     """
-    logger.debug("get_conversation_llm_called", mode=settings.LLM_MODE)
+    logger.debug("get_conversation_llm_called", mode=settings.LLM_MODE, vllm=settings.VLLM_ENABLED)
     if settings.LLM_MODE == "api_only":
         return get_solar_api_llm(temperature=0.5)
     if settings.LLM_MODE == "hybrid":
-        # hybrid: 몽글이(파인튜닝 모델)로 빠른 응답
+        if settings.VLLM_ENABLED:
+            # hybrid + vLLM: 운영서버 EXAONE 1.2B로 빠른 응답
+            return get_vllm_llm(temperature=settings.MONGLE_TEMPERATURE)
+        # hybrid + Ollama: 몽글이(파인튜닝 모델)로 빠른 응답
         return get_ollama_llm(
             model=settings.MONGLE_MODEL,
             temperature=settings.MONGLE_TEMPERATURE,
@@ -387,17 +453,21 @@ def get_question_llm() -> BaseChatModel:
     """
     후속 질문 생성용 LLM (temp=0.5).
 
-    hybrid → 몽글이 (settings.MONGLE_MODEL, Ollama 로컬, 빠른 응답)
+    hybrid + VLLM_ENABLED → vLLM EXAONE 1.2B (운영서버 GPU, 빠른 응답)
+    hybrid + !VLLM_ENABLED → 몽글이 (settings.MONGLE_MODEL, Ollama 로컬)
     local_only → Ollama (settings.QUESTION_MODEL, 기본 EXAONE 32B)
     api_only → Solar API
 
     자유 텍스트 생성 — 구조화 출력 미적용.
     """
-    logger.debug("get_question_llm_called", mode=settings.LLM_MODE)
+    logger.debug("get_question_llm_called", mode=settings.LLM_MODE, vllm=settings.VLLM_ENABLED)
     if settings.LLM_MODE == "api_only":
         return get_solar_api_llm(temperature=0.5)
     if settings.LLM_MODE == "hybrid":
-        # hybrid: 몽글이(파인튜닝 모델)로 빠른 응답
+        if settings.VLLM_ENABLED:
+            # hybrid + vLLM: 운영서버 EXAONE 1.2B로 빠른 응답
+            return get_vllm_llm(temperature=settings.MONGLE_TEMPERATURE)
+        # hybrid + Ollama: 몽글이(파인튜닝 모델)로 빠른 응답
         return get_ollama_llm(
             model=settings.MONGLE_MODEL,
             temperature=settings.MONGLE_TEMPERATURE,

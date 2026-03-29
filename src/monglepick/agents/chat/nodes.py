@@ -1435,24 +1435,28 @@ async def explanation_generator(state: ChatAgentState) -> dict:
 @traceable(name="response_formatter", run_type="chain", metadata={"node": "10/13"})
 async def response_formatter(state: ChatAgentState) -> dict:
     """
-    응답 유형별로 최종 텍스트를 포맷팅하고, messages에 assistant 메시지를 추가한다.
+    몽글이 LLM을 호출하여 최종 응답을 생성하고, messages에 assistant 메시지를 추가한다.
+
+    Solar API가 처리한 데이터(추천 영화, 추천 이유, 감정, 선호 등)를
+    몽글이에게 전달하여 자연스러운 대화체 응답을 생성한다.
 
     응답 유형:
-    - 추천: ranked_movies가 있으면 영화 카드 포맷
-    - 질문: follow_up_question / response가 이미 설정된 경우
-    - 에러: error가 설정된 경우
-    - 일반: response가 이미 설정된 경우
-
-    포맷:
-    - 추천: "{rank}. **{title}** ({release_year})\n- 장르: ...\n- 감독: ...\n- 평점: ...\n{explanation}"
-    - 질문/일반/에러: 텍스트 그대로
+    - 추천: ranked_movies → 몽글이가 대화체로 추천 답변 생성
+    - 질문: follow_up_question → 몽글이가 대화체로 질문 전달
+    - 에러: 에러 안내 메시지
+    - 일반: 기존 response 그대로 사용 (general_responder에서 이미 몽글이가 생성)
 
     Args:
-        state: ChatAgentState (ranked_movies, response, error, messages 필요)
+        state: ChatAgentState (ranked_movies, response, error, messages, emotion, preferences 필요)
 
     Returns:
         dict: response, messages 업데이트
     """
+    from monglepick.chains.response_generation_chain import (
+        generate_question_response,
+        generate_recommendation_response,
+    )
+
     # 노드 실행 타이밍 측정 시작
     node_start = time.perf_counter()
     session_id = state.get("session_id", "")
@@ -1462,27 +1466,44 @@ async def response_formatter(state: ChatAgentState) -> dict:
         existing_response = state.get("response", "")
         error = state.get("error")
         messages = list(state.get("messages", []))
+        current_input = state.get("current_input", "")
+
+        # 사용자 정보 추출 (몽글이에게 전달)
+        emotion_obj = state.get("emotion")
+        emotion_str = emotion_obj.emotion if emotion_obj else None
+        preferences = state.get("preferences")
+        clarification = state.get("clarification")
 
         # 에러 응답
         if error and not existing_response:
             response = "죄송해요, 지금은 추천이 어려워요. 다시 시도해주세요!"
-        # 추천 응답: ranked_movies가 있으면 영화 카드 포맷
+
+        # 추천 응답: 몽글이가 Solar 데이터를 대화체로 변환
         elif ranked:
-            parts = ["추천 영화를 찾았어요! 🎬\n"]
-            for movie in ranked:
-                genres_str = ", ".join(movie.genres[:3]) if movie.genres else "-"
-                year_str = f" ({movie.release_year})" if movie.release_year else ""
-                card = (
-                    f"{movie.rank}. **{movie.title}**{year_str}\n"
-                    f"   - 장르: {genres_str}\n"
-                    f"   - 감독: {movie.director or '-'}\n"
-                    f"   - 평점: {movie.rating:.1f}\n"
-                )
-                if movie.explanation:
-                    card += f"   > {movie.explanation}\n"
-                parts.append(card)
-            response = "\n".join(parts)
-        # 기존 response 사용 (질문/일반 대화)
+            response = await generate_recommendation_response(
+                ranked_movies=ranked,
+                emotion=emotion_str,
+                preferences=preferences,
+                user_message=current_input,
+            )
+
+        # 후속 질문 응답: 몽글이가 질문을 대화체로 전달
+        elif existing_response and clarification:
+            # clarification이 있으면 후속 질문 응답
+            hints = []
+            if hasattr(clarification, "hints") and clarification.hints:
+                for hint in clarification.hints:
+                    if hasattr(hint, "options"):
+                        hints.extend(hint.options)
+            response = await generate_question_response(
+                question=existing_response,
+                hints=hints[:6] if hints else None,
+                emotion=emotion_str,
+                preferences=preferences,
+                user_message=current_input,
+            )
+
+        # 기존 response 사용 (일반 대화 — general_responder에서 이미 몽글이가 생성)
         elif existing_response:
             response = existing_response
         else:
@@ -1496,6 +1517,7 @@ async def response_formatter(state: ChatAgentState) -> dict:
             "response_formatted_node",
             response_length=len(response),
             has_movies=bool(ranked),
+            used_mongle_llm=bool(ranked) or bool(clarification),
             elapsed_ms=round(elapsed_ms, 1),
             session_id=session_id,
             user_id=user_id,
@@ -1510,6 +1532,7 @@ async def response_formatter(state: ChatAgentState) -> dict:
         logger.error("response_formatter_error", error=str(e), error_type=type(e).__name__,
                       stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1),
                       session_id=session_id, user_id=user_id)
+        # 폴백: 몽글이 호출 실패 시 기계적 조합
         fallback = "죄송해요, 응답을 구성하는 중 문제가 생겼어요."
         messages = list(state.get("messages", []))
         messages.append({"role": "assistant", "content": fallback})

@@ -51,11 +51,23 @@ class PointCheckResult(BaseModel):
 
 
 class PointDeductResult(BaseModel):
-    """포인트 차감 결과. 차감 성공 여부와 변동 후 잔액을 포함한다."""
+    """
+    포인트 차감 결과. 차감 성공 여부와 변동 후 잔액을 포함한다.
 
-    success: bool           # 차감 성공 여부
-    balance_after: int = 0  # 변동 후 잔액
-    transaction_id: int | None = None  # 거래 이력 ID (추적용)
+    error_code: Backend의 402 응답 body에서 파싱한 세분화된 에러 코드.
+      - INSUFFICIENT_POINT: 포인트 잔액 부족
+      - DAILY_LIMIT_EXCEEDED: 일일 AI 추천 사용 한도 초과
+      - MONTHLY_LIMIT_EXCEEDED: 월간 AI 추천 사용 한도 초과
+      - None: 에러 없음 (차감 성공) 또는 미분류 에러
+    error_message: 사용자에게 표시할 안내 메시지 (Backend 응답 message 필드)
+    """
+
+    success: bool                       # 차감 성공 여부
+    balance_after: int = 0              # 변동 후 잔액
+    transaction_id: int | None = None   # 거래 이력 ID (추적용)
+    # ── 에러 세분화 필드 (이슈 2: Backend 402 응답 파싱) ──
+    error_code: str | None = None       # 세분화된 에러 코드 (SSE error 이벤트에 포함)
+    error_message: str = ""             # 사용자 안내 메시지
 
 
 # ── 싱글턴 클라이언트 ──
@@ -204,18 +216,34 @@ async def deduct_point(
                 transaction_id=data.get("transactionId"),
             )
 
-        # 402 Payment Required: 잔액 부족
+        # 402 Payment Required: 잔액 부족 또는 쿼터 초과
+        # Backend는 402 응답 body에 error_code 필드로 에러 유형을 세분화한다.
+        # 가능한 error_code 값:
+        #   INSUFFICIENT_POINT      — 포인트 잔액 부족 (포인트 구매 유도)
+        #   DAILY_LIMIT_EXCEEDED    — 일일 AI 추천 사용 한도 초과
+        #   MONTHLY_LIMIT_EXCEEDED  — 월간 AI 추천 사용 한도 초과
+        # error_code를 PointDeductResult에 담아 chat.py의 SSE error 이벤트로 전달한다.
         if resp.status_code == 402:
             data = resp.json()
+            # Backend error_code 파싱: 없으면 잔액 부족으로 간주
+            error_code = data.get("errorCode") or data.get("error_code") or "INSUFFICIENT_POINT"
+            error_message = data.get("message", "")
             logger.info(
                 "point_deduct_insufficient",
                 user_id=user_id,
                 balance=data.get("balance", 0),
                 required=data.get("required", amount),
+                error_code=error_code,
+                error_message=error_message,
             )
-            return PointDeductResult(success=False, balance_after=data.get("balance", 0))
+            return PointDeductResult(
+                success=False,
+                balance_after=data.get("balance", 0),
+                error_code=error_code,
+                error_message=error_message,
+            )
 
-        # 기타 에러
+        # 기타 에러 (4xx/5xx)
         logger.warning(
             "point_deduct_failed",
             user_id=user_id,
