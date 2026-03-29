@@ -16,6 +16,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from monglepick.api.admin import admin_router
 from monglepick.api.chat import chat_router
 from monglepick.api.match import match_router
 from monglepick.api.router import api_router
@@ -234,6 +235,7 @@ app.add_middleware(
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")
 app.include_router(match_router, prefix="/api/v1")
+app.include_router(admin_router, prefix="/api/v1")
 
 
 @app.get(
