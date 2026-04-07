@@ -616,10 +616,10 @@ def mock_session_store():
 
     controller = MockSessionStoreController()
 
-    async def mock_load(session_id: str):
+    async def mock_load(user_id: str, session_id: str):
         return controller._session_data
 
-    async def mock_save(session_id: str, state: dict):
+    async def mock_save(user_id: str, session_id: str, state: dict):
         # Pydantic 모델을 dict로 변환하여 저장
         save_data = {}
         for key, val in state.items():
