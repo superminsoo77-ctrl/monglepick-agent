@@ -29,6 +29,7 @@ import json
 import re
 import time
 import traceback
+from datetime import datetime, timezone
 from typing import Any
 
 import aiomysql
@@ -98,7 +99,11 @@ async def context_loader(state: ChatAgentState) -> dict:
 
         # 기존 메시지 복사 + 현재 입력 추가
         messages: list[dict[str, str]] = list(state.get("messages", []))
-        messages.append({"role": "user", "content": current_input})
+        messages.append({
+            "role": "user",
+            "content": current_input,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
 
         # 턴 카운트: user 메시지 수
         turn_count = sum(1 for m in messages if m.get("role") == "user")
@@ -155,17 +160,23 @@ async def context_loader(state: ChatAgentState) -> dict:
                         user_profile = dict(row)
 
                     # 시청 이력 조회 (최근 50건, 영화 메타데이터 포함)
-                    # — Phase 0: genres, director, cast, mood_tags, popularity_score 추가
-                    #   CBF에서 장르/감독/배우/무드 프로필 구축에 활용
+                    # — 2026-04-07: watch_history → reviews 로 교체
+                    #   근거: 몽글픽은 영상 스트리밍 미제공. "봤다" = 리뷰 작성.
+                    #         reviews 테이블이 단일 진실 원본이며,
+                    #         watch_history 는 Kaggle 26M CF 학습용 시드 데이터 전용.
+                    # — review_source: 어떤 경로(AI추천/검색/위시리스트 등)로 시청 후 리뷰했는지
+                    # — CBF에서 장르/감독/배우/무드 프로필 구축에 활용
                     await cursor.execute(
                         """
-                        SELECT wh.movie_id, m.title, wh.rating, wh.watched_at,
+                        SELECT r.movie_id, m.title, r.rating, r.created_at AS watched_at,
                                m.genres, m.director, m.cast_members AS `cast`,
-                               m.mood_tags, m.popularity_score, m.rating AS movie_rating
-                        FROM watch_history wh
-                        LEFT JOIN movies m ON wh.movie_id = m.movie_id
-                        WHERE wh.user_id = %s
-                        ORDER BY wh.watched_at DESC
+                               m.mood_tags, m.popularity_score, m.rating AS movie_rating,
+                               r.review_source
+                        FROM reviews r
+                        LEFT JOIN movies m ON r.movie_id = m.movie_id
+                        WHERE r.user_id = %s
+                          AND r.is_deleted = false
+                        ORDER BY r.created_at DESC
                         LIMIT 50
                         """,
                         (user_id,),
@@ -1657,8 +1668,21 @@ async def response_formatter(state: ChatAgentState) -> dict:
         else:
             response = "무엇을 도와드릴까요? 영화 추천이 필요하시면 말씀해주세요!"
 
-        # assistant 메시지 추가
-        messages.append({"role": "assistant", "content": response})
+        # assistant 메시지 추가 (timestamp + movies 포함 — 이전 대화 복원 시 영화 카드도 표시)
+        assistant_msg: dict = {
+            "role": "assistant",
+            "content": response,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        # 추천 영화 카드를 메시지에 포함: 이전 채팅 로드 시 영화 카드도 복원
+        if ranked:
+            try:
+                assistant_msg["movies"] = [
+                    m.model_dump() if hasattr(m, "model_dump") else m for m in ranked
+                ]
+            except Exception:
+                pass  # 직렬화 실패 시 movies 제외 (안전 처리)
+        messages.append(assistant_msg)
 
         elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
@@ -1683,7 +1707,11 @@ async def response_formatter(state: ChatAgentState) -> dict:
         # 폴백: 몽글이 호출 실패 시 기계적 조합
         fallback = "죄송해요, 응답을 구성하는 중 문제가 생겼어요."
         messages = list(state.get("messages", []))
-        messages.append({"role": "assistant", "content": fallback})
+        messages.append({
+            "role": "assistant",
+            "content": fallback,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
         return {
             "response": fallback,
             "messages": messages,
@@ -1850,3 +1878,146 @@ async def tool_executor_node(state: ChatAgentState) -> dict:
                       stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1),
                       session_id=session_id, user_id=user_id)
         return {"response": "해당 기능은 아직 준비 중이에요. 영화 추천이 필요하시면 말씀해주세요!"}
+
+
+# ============================================================
+# 14. graph_traversal_node — relation Intent 전용 Neo4j 멀티홉 탐색
+# ============================================================
+
+@traceable(name="graph_traversal_node", run_type="chain", metadata={"node": "14/14"})
+async def graph_traversal_node(state: ChatAgentState) -> dict:
+    """
+    relation Intent 전용 Neo4j 멀티홉 탐색 노드 (§관계_대사_검색_설계서.md §5.6).
+
+    처리 흐름:
+    1. LLM(extract_graph_query_plan)으로 GraphQueryPlan 추출
+       - query_type: chain / intersection / person_filmography
+       - start_entity, hop_genre, persons 등 탐색 파라미터 구조화
+    2. graph_cypher_builder로 매개변수화된 Cypher 쿼리 생성
+       - 모든 사용자 입력은 $param으로 전달 (인젝션 방지)
+    3. search_neo4j_relation으로 Neo4j 멀티홉 탐색 실행
+    4. 결과를 CandidateMovie 형태로 변환하여 candidate_movies에 저장
+    5. recommendation_ranker → explanation_generator → response_formatter 흐름으로 직행
+       (preference_refiner / rag_retriever 스킵)
+
+    결과 없음:
+    - candidate_movies=[] 일 때 final_answer를 설정하고 response_formatter로 이동.
+    - response_formatter는 final_answer를 그대로 응답으로 사용한다.
+
+    에러:
+    - 모든 예외를 try/except로 처리, 에러 전파 금지.
+    - 에러 시 final_answer에 안내 메시지를 설정한다.
+
+    Args:
+        state: ChatAgentState (current_input 필요)
+
+    Returns:
+        dict: graph_query_plan, traversal_results, candidate_movies,
+              needs_clarification, [final_answer] 업데이트
+    """
+    node_start = time.perf_counter()
+    session_id = state.get("session_id", "")
+    user_id = state.get("user_id", "")
+    current_input: str = state.get("current_input", "")
+
+    logger.info(
+        "graph_traversal_node_start",
+        input_preview=current_input[:80],
+        session_id=session_id,
+        user_id=user_id,
+    )
+
+    try:
+        # 1. 그래프 탐색 계획 추출 (LLM)
+        # LLM 장애 시 extract_graph_query_plan 내부에서 _DEFAULT_PLAN 반환 (에러 전파 없음)
+        from monglepick.chains.graph_query_chain import extract_graph_query_plan
+        from monglepick.rag.hybrid_search import search_neo4j_relation
+
+        plan = await extract_graph_query_plan(current_input)
+        logger.info(
+            "graph_traversal_plan_ready",
+            query_type=plan.get("query_type"),
+            start_entity=plan.get("start_entity"),
+            hop_genre=plan.get("hop_genre"),
+            persons=plan.get("persons"),
+        )
+
+        # 2. Neo4j 멀티홉 탐색 실행
+        # 오류 시 search_neo4j_relation 내부에서 [] 반환 (에러 전파 없음)
+        raw_results = await search_neo4j_relation(
+            graph_query_plan=plan,
+            top_k=20,
+        )
+
+        # 3. SearchResult → CandidateMovie 변환
+        # rrf_score 필드에 relation_score(0~1 정규화)를 저장하여
+        # recommendation_ranker가 기존 흐름과 동일하게 처리할 수 있도록 한다.
+        candidates: list[CandidateMovie] = []
+        for r in raw_results:
+            candidates.append(
+                CandidateMovie(
+                    # CandidateMovie의 PK는 'id' (models.py 기준)
+                    id=r.movie_id,
+                    title=r.title,
+                    rrf_score=r.score,                  # 0~1 정규화된 relation_score
+                    retrieval_source="neo4j_relation",
+                    # metadata에서 추가 필드 복원
+                    rating=float(r.metadata.get("rating") or 0.0),
+                    popularity_score=float(r.metadata.get("popularity") or 0.0),
+                )
+            )
+
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.info(
+            "graph_traversal_node_done",
+            candidate_count=len(candidates),
+            elapsed_ms=round(elapsed_ms, 1),
+            session_id=session_id,
+        )
+
+        # 4. 결과 없음 처리: 찾지 못했을 때 안내 메시지를 설정하고 응답 포맷터로 직행
+        if not candidates:
+            entity_hint = (
+                plan.get("start_entity")
+                or (", ".join(plan.get("persons") or []))
+                or "해당 인물"
+            )
+            no_result_msg = (
+                f"'{entity_hint}' 관련 영화를 그래프에서 찾지 못했어요. "
+                "인물명을 한국어로 정확히 입력하거나 검색어를 바꿔서 다시 시도해 주세요."
+            )
+            return {
+                "graph_query_plan": plan,
+                "traversal_results": [],
+                "candidate_movies": [],
+                "needs_clarification": False,
+                "final_answer": no_result_msg,
+            }
+
+        # 5. 정상 결과: candidate_movies를 채우고 recommendation_ranker로 진행
+        return {
+            "graph_query_plan": plan,
+            "traversal_results": [r.metadata for r in raw_results],
+            "candidate_movies": candidates,
+            "needs_clarification": False,
+        }
+
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error(
+            "graph_traversal_node_error",
+            error=str(e),
+            error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(),
+            elapsed_ms=round(elapsed_ms, 1),
+            session_id=session_id,
+            user_id=user_id,
+        )
+        # 에러 전파 금지: 안내 메시지로 응답 포맷터에서 처리
+        return {
+            "graph_query_plan": None,
+            "traversal_results": [],
+            "candidate_movies": [],
+            "needs_clarification": False,
+            "final_answer": "관계 기반 영화 검색 중 오류가 발생했어요. 잠시 후 다시 시도해 주세요.",
+        }

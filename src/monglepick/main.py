@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from monglepick.api.admin import admin_router
+from monglepick.api.admin_data import admin_data_router
 from monglepick.api.chat import chat_router
 from monglepick.api.match import match_router
 from monglepick.api.middleware import RateLimitMiddleware, TimeoutMiddleware
@@ -274,6 +275,8 @@ app.include_router(api_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")
 app.include_router(match_router, prefix="/api/v1")
 app.include_router(admin_router, prefix="/api/v1")
+# Phase 6 (2026-04-08): 데이터 관리 admin 라우터 등록 — 영화 CRUD + 파이프라인 SSE + 데이터 현황
+app.include_router(admin_data_router, prefix="/api/v1")
 
 
 @app.get(

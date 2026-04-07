@@ -560,6 +560,126 @@ async def search_neo4j(
 
 
 # ============================================================
+# 3-b. Neo4j 관계 기반 멀티홉 탐색 (relation Intent 전용)
+# ============================================================
+
+@traceable(
+    name="search_neo4j_relation",
+    run_type="retriever",
+    metadata={"db": "neo4j", "type": "graph_relation"},
+)
+async def search_neo4j_relation(
+    graph_query_plan: dict,
+    top_k: int = 20,
+) -> list[SearchResult]:
+    """
+    relation Intent 전용 Neo4j 멀티홉 탐색.
+
+    GraphQueryPlan을 받아 graph_cypher_builder로 Cypher를 생성하고 실행한다.
+    기존 search_neo4j와 달리 무드/장르 태그가 아닌 인물-영화 관계 체인을 탐색한다.
+
+    지원 탐색 유형:
+    - chain: A 감독의 스릴러에 나온 배우들의 다른 영화
+    - intersection: N명 모두 출연한 영화
+    - person_filmography: 특정 인물 필모그래피
+
+    점수 정규화:
+    - relation_score(actor_count 등)를 0~1 범위로 정규화하여 SearchResult.score에 저장한다.
+    - 폴백(인기작) 결과는 score=0.0 으로 반환된다.
+
+    Args:
+        graph_query_plan: extract_graph_query_plan()이 반환한 GraphQueryPlan dict
+        top_k: 반환할 최대 결과 수 (기본 20)
+
+    Returns:
+        SearchResult 리스트 (score 내림차순). 오류 시 빈 리스트 반환 (에러 전파 금지).
+    """
+    neo4j_start = time.perf_counter()
+    driver = await get_neo4j()
+    results: list[SearchResult] = []
+
+    logger.info(
+        "neo4j_relation_search_start",
+        query_type=graph_query_plan.get("query_type"),
+        start_entity=graph_query_plan.get("start_entity"),
+        persons=graph_query_plan.get("persons"),
+        top_k=top_k,
+    )
+
+    try:
+        from monglepick.rag.graph_cypher_builder import build_cypher_from_plan
+
+        # GraphQueryPlan → Cypher + 파라미터 변환
+        cypher, params = build_cypher_from_plan(graph_query_plan)
+        params["top_k"] = top_k
+
+        async with driver.session() as session:
+            result = await session.run(cypher, **params)
+            records = await result.data()
+
+        # relation_score 정규화를 위한 최댓값 계산
+        # chain/intersection에서 actor_count 기반 점수는 정수이므로,
+        # max 값으로 나눠 0~1 범위로 변환한다.
+        max_relation_score = max(
+            (float(row.get("relation_score", 0.0)) for row in records),
+            default=1.0,
+        )
+        # 분모가 0이 되는 것을 방지
+        if max_relation_score <= 0:
+            max_relation_score = 1.0
+
+        for row in records:
+            movie_id = str(row.get("movie_id", ""))
+            if not movie_id:
+                # movie_id가 없는 레코드는 무시
+                continue
+
+            title = str(row.get("title", ""))
+            relation_score_raw = float(row.get("relation_score", 0.0))
+            # 0~1 정규화: 높은 relation_score일수록 1.0에 가까움
+            normalized_score = relation_score_raw / max_relation_score
+
+            results.append(
+                SearchResult(
+                    movie_id=movie_id,
+                    title=title,
+                    score=normalized_score,
+                    source="neo4j_relation",
+                    metadata={
+                        "relation_score": relation_score_raw,
+                        "rating": row.get("rating"),
+                        "popularity": row.get("popularity"),
+                    },
+                )
+            )
+
+        elapsed_ms = (time.perf_counter() - neo4j_start) * 1000
+        logger.info(
+            "neo4j_relation_search_done",
+            result_count=len(results),
+            elapsed_ms=round(elapsed_ms, 1),
+            top_results=[
+                {"title": r.title, "score": round(r.score, 4), "id": r.movie_id}
+                for r in results[:5]
+            ],
+        )
+
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - neo4j_start) * 1000
+        logger.warning(
+            "neo4j_relation_search_failed",
+            error=str(e),
+            error_type=type(e).__name__,
+            query_type=graph_query_plan.get("query_type"),
+            elapsed_ms=round(elapsed_ms, 1),
+        )
+        # 에러 전파 금지: 빈 리스트 반환
+        return []
+
+    return results
+
+
+# ============================================================
 # 4. RRF (Reciprocal Rank Fusion) 합산
 # ============================================================
 

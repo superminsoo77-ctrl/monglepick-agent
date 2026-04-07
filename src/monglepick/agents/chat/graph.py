@@ -60,6 +60,7 @@ from monglepick.agents.chat.nodes import (
     error_handler,
     explanation_generator,
     general_responder,
+    graph_traversal_node,
     image_analyzer,
     intent_emotion_classifier,
     llm_reranker,
@@ -133,6 +134,10 @@ def route_after_intent(state: ChatAgentState) -> str:
         next_node = "preference_refiner"
     elif intent_type == "general":
         next_node = "general_responder"
+    elif intent_type == "relation":
+        # 관계 기반 탐색: Neo4j 멀티홉 그래프 탐색 (§관계_대사_검색_설계서)
+        # "봉준호 감독 스릴러 배우들이 찍은 영화" 등 인물 관계 기반 질의
+        next_node = "graph_traversal_node"
     elif intent_type in ("info", "theater", "booking"):
         next_node = "tool_executor_node"
     else:
@@ -248,7 +253,7 @@ def build_chat_graph() -> StateGraph:
     # StateGraph 생성 (ChatAgentState TypedDict 기반)
     graph = StateGraph(ChatAgentState)
 
-    # ── 노드 등록 (14개) ──
+    # ── 노드 등록 (15개) ──
     graph.add_node("context_loader", context_loader)
     graph.add_node("image_analyzer", image_analyzer)
     graph.add_node("intent_emotion_classifier", intent_emotion_classifier)
@@ -264,6 +269,8 @@ def build_chat_graph() -> StateGraph:
     graph.add_node("error_handler", error_handler)
     graph.add_node("general_responder", general_responder)
     graph.add_node("tool_executor_node", tool_executor_node)
+    # relation Intent 전용: Neo4j 멀티홉 탐색 (§관계_대사_검색_설계서.md §5.6)
+    graph.add_node("graph_traversal_node", graph_traversal_node)
 
     # ── 엣지 정의 ──
 
@@ -288,6 +295,7 @@ def build_chat_graph() -> StateGraph:
         {
             "preference_refiner": "preference_refiner",
             "general_responder": "general_responder",
+            "graph_traversal_node": "graph_traversal_node",  # relation Intent
             "tool_executor_node": "tool_executor_node",
             "error_handler": "error_handler",
         },
@@ -331,6 +339,11 @@ def build_chat_graph() -> StateGraph:
     # 도구 실행: tool_executor_node → response_formatter
     graph.add_edge("tool_executor_node", "response_formatter")
 
+    # 관계 탐색: graph_traversal_node → recommendation_ranker
+    # 탐색 결과(candidate_movies)를 recommendation_ranker에서 CF+CBF와 결합하여 최종 순위 결정
+    # final_answer가 있으면(결과 없음 폴백) recommendation_ranker가 스킵하고 response_formatter로 직행
+    graph.add_edge("graph_traversal_node", "recommendation_ranker")
+
     # 에러 처리: error_handler → response_formatter
     graph.add_edge("error_handler", "response_formatter")
 
@@ -339,7 +352,7 @@ def build_chat_graph() -> StateGraph:
 
     # 그래프 컴파일
     compiled = graph.compile()
-    logger.info("chat_graph_compiled", node_count=15)
+    logger.info("chat_graph_compiled", node_count=16)
     return compiled
 
 
@@ -367,6 +380,7 @@ NODE_STATUS_MESSAGES: dict[str, str] = {
     "error_handler": "문제를 처리하고 있어요...",
     "general_responder": "답변을 준비하고 있어요...",
     "tool_executor_node": "기능을 확인하고 있어요...",
+    "graph_traversal_node": "관계 그래프를 탐색하고 있어요... 🕸️",
 }
 
 

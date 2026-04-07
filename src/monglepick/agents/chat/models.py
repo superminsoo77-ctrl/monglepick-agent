@@ -37,21 +37,23 @@ from monglepick.config import settings as _settings
 # 의도 분류 결과
 # ============================================================
 
-# 6가지 의도 타입 (§6-2 Node 2)
-IntentType = Literal["recommend", "search", "info", "theater", "booking", "general"]
+# 7가지 의도 타입 (§6-2 Node 2) — Phase M-Relation: "relation" 추가
+# - relation: 인물/관계 기반 탐색 ("봉준호 감독이 찍은 스릴러에 나온 배우들의 영화" 등)
+#   → graph_traversal_node로 라우팅 (Neo4j 멀티홉 탐색)
+IntentType = Literal["recommend", "search", "info", "theater", "booking", "general", "relation"]
 
 
 class IntentResult(BaseModel):
     """
     의도 분류 LLM 출력 모델.
 
-    intent: 6가지 중 하나 (recommend, search, info, theater, booking, general)
+    intent: 7가지 중 하나 (recommend, search, info, theater, booking, general, relation)
     confidence: 0.0~1.0 신뢰도 (< 0.6이면 general로 보정)
     """
 
     intent: IntentType = Field(
         default="general",
-        description="분류된 사용자 의도 (6가지 중 하나)",
+        description="분류된 사용자 의도 (7가지 중 하나)",
     )
     confidence: float = Field(
         default=0.0,
@@ -94,6 +96,9 @@ class IntentEmotionResult(BaseModel):
     기존 IntentResult + EmotionResult를 1회 LLM 호출로 동시 추출한다.
     동일 모델(qwen3.5:35b-a3b)로 동일 입력을 분석하므로
     2번 호출할 필요 없이 통합하여 지연 시간을 ~45초 절감한다.
+
+    intent: 7가지 중 하나 (recommend, search, info, theater, booking, general, relation)
+    - relation: "봉준호 감독이 찍은 스릴러에 나온 배우들의 영화" 등 인물/관계 기반 탐색
     """
 
     intent: IntentType = Field(
@@ -646,6 +651,18 @@ class ChatAgentState(TypedDict, total=False):
 
     # ── Phase 4: 행동 프로필 (user_behavior_profile 테이블) ──
     user_behavior_profile: dict[str, Any]  # taste_consistency, genre_affinity 등
+
+    # ── relation Intent 전용 (graph_traversal_node 출력) ──
+    # graph_traversal_node가 LLM으로 추출한 Neo4j 탐색 계획.
+    # query_type(chain/intersection/person_filmography), start_entity, hop_genre,
+    # persons, relation_type 등 Cypher 생성에 필요한 파라미터를 포함한다.
+    graph_query_plan: dict | None
+    # Neo4j 멀티홉 탐색의 원시 결과 (metadata dict 목록).
+    # explanation_generator 등에서 관계 정보를 추가 활용할 수 있도록 보존한다.
+    traversal_results: list[dict]
+    # graph_traversal_node 또는 다른 노드가 결과 없음/에러 시 직접 설정하는 응답.
+    # response_formatter에서 final_answer가 있으면 LLM 생성 없이 그대로 반환한다.
+    final_answer: str | None
 
     # ── error_handler ──
     error: str | None
