@@ -132,24 +132,53 @@ async def _check_redis() -> dict:
 
 
 async def _check_mysql() -> dict:
-    """MySQL 연결 상태 + 활성 커넥션 조회."""
+    """
+    MySQL 연결 상태 + 운영 지표 조회.
+
+    관리자 대시보드 DbStatus 카드에서 기대하는 필드(totalRows / diskUsage /
+    slowQueries / activeConnections)를 모두 채워 반환한다.
+
+    - totalRows         : information_schema 기반 전체 테이블 행 수 합계 (근사치)
+    - diskUsage         : MySQL 데이터 볼륨의 추정 디스크 사용량 (MB)
+    - slowQueries       : `SHOW GLOBAL STATUS LIKE 'Slow_queries'` 누적 값
+    - activeConnections : `Threads_connected` 현재 값
+    """
     try:
         pool = await get_mysql()
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                # movies 테이블 행 수
-                await cur.execute("SELECT COUNT(*) FROM movies")
+                # 현재 사용 중인 스키마 전체 행 수 합계 (정확치는 아님 — InnoDB 통계)
+                await cur.execute(
+                    """
+                    SELECT COALESCE(SUM(TABLE_ROWS), 0) AS total_rows,
+                           COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) AS total_bytes
+                    FROM information_schema.TABLES
+                    WHERE TABLE_SCHEMA = DATABASE()
+                    """
+                )
                 row = await cur.fetchone()
-                movie_count = row[0] if row else 0
+                total_rows = int(row[0]) if row else 0
+                total_bytes = int(row[1]) if row else 0
 
-                # 활성 커넥션 수
+                # 누적 슬로우 쿼리 수
+                await cur.execute("SHOW GLOBAL STATUS LIKE 'Slow_queries'")
+                row = await cur.fetchone()
+                slow_queries = int(row[1]) if row else 0
+
+                # 현재 활성 커넥션 수
                 await cur.execute("SHOW STATUS LIKE 'Threads_connected'")
                 row = await cur.fetchone()
                 active_connections = int(row[1]) if row else 0
 
+        # 디스크 사용량을 MB 단위로 환산 (1 KB 미만은 "<1MB")
+        disk_mb = total_bytes / (1024 * 1024)
+        disk_usage = f"{disk_mb:.1f}MB" if disk_mb >= 1 else "<1MB"
+
         return {
             "connected": True,
-            "movieCount": movie_count,
+            "totalRows": total_rows,
+            "diskUsage": disk_usage,
+            "slowQueries": slow_queries,
             "activeConnections": active_connections,
         }
     except Exception as e:

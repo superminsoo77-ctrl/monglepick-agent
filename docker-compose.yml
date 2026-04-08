@@ -34,8 +34,13 @@ services:
     environment:
       - NEO4J_AUTH=neo4j/monglepick_dev
       - NEO4J_PLUGINS=["apoc"]
-      - NEO4J_dbms_memory_heap_max__size=1G
-    mem_limit: 2g
+      # Phase ML-4 재적재 대응: 1.18M Movie + 수백만 Person/Genre + 관계 처리용 메모리 증설
+      # 기존 1G → 2G로 heap 증설, pagecache 1G 신규 지정, 트랜잭션 한도도 별도 확장
+      - NEO4J_server_memory_heap_initial__size=2G
+      - NEO4J_server_memory_heap_max__size=2G
+      - NEO4J_server_memory_pagecache_size=1G
+      - NEO4J_db_memory_transaction_total_max=1G
+    mem_limit: 4g
     healthcheck:
       test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "monglepick_dev", "RETURN 1"]
       interval: 30s
