@@ -129,59 +129,74 @@ def _payload_to_movie_document(point_id: str, payload: dict) -> MovieDocument:
     """
     Qdrant 포인트 payload를 MovieDocument로 변환한다.
 
-    payload는 MovieDocument의 필드를 그대로 포함하고 있으므로
-    직접 매핑한다. 누락된 필드는 기본값으로 채운다.
-    """
-    # Qdrant payload의 cast 필드는 list[str] 또는 list[dict]일 수 있음
-    cast_raw = payload.get("cast", [])
-    if cast_raw and isinstance(cast_raw[0], dict):
-        # cast_characters 형태인 경우 이름만 추출
-        cast_list = [c.get("name", "") for c in cast_raw if isinstance(c, dict)]
-    elif cast_raw and isinstance(cast_raw[0], str):
-        cast_list = cast_raw
-    else:
-        cast_list = []
+    Phase ML-4 보강 (2026-04-07):
+        기존 구현은 명시적으로 열거한 필드(약 35개)만 MovieDocument에 매핑했고,
+        overview_en / alternative_titles / screenwriters / director_original_name /
+        cast_characters / reviews / kmdb_* / kobis_directors / images_* 등 약 40개
+        필드를 누락했다. 이로 인해 ES 재동기화 시 Phase ML-1/ML-2에서 추가된
+        다국어 검색 필드(alternative_titles standard analyzer, overview_en
+        multi_match 등)가 전부 빈 값으로 들어가 검색 품질이 오히려 저하된다.
 
-    return MovieDocument(
-        id=str(payload.get("id", point_id)),
-        title=payload.get("title", ""),
-        title_en=payload.get("title_en", ""),
-        poster_path=payload.get("poster_path", ""),
-        backdrop_path=payload.get("backdrop_path", ""),
-        release_year=payload.get("release_year", 0),
-        runtime=payload.get("runtime", 0),
-        rating=payload.get("rating", 0.0),
-        vote_count=payload.get("vote_count", 0),
-        popularity_score=payload.get("popularity_score", 0.0),
-        genres=payload.get("genres", []),
-        director=payload.get("director", ""),
-        cast=cast_list,
-        certification=payload.get("certification", ""),
-        trailer_url=payload.get("trailer_url", ""),
-        overview=payload.get("overview", ""),
-        tagline=payload.get("tagline", ""),
-        imdb_id=payload.get("imdb_id", ""),
-        original_language=payload.get("original_language", ""),
-        collection_name=payload.get("collection_name", ""),
-        collection_id=payload.get("collection_id", 0),
-        keywords=payload.get("keywords", []),
-        mood_tags=payload.get("mood_tags", []),
-        ott_platforms=payload.get("ott_platforms", []),
-        production_countries=payload.get("production_countries", []),
-        source=payload.get("source", "tmdb"),
-        embedding_text=payload.get("embedding_text", ""),
-        # KOBIS 보강 필드
-        kobis_movie_cd=payload.get("kobis_movie_cd", ""),
-        kobis_nation=payload.get("kobis_nation", ""),
-        kobis_genres=payload.get("kobis_genres", []),
-        kobis_type_nm=payload.get("kobis_type_nm", ""),
-        kobis_watch_grade=payload.get("kobis_watch_grade", ""),
-        sales_acc=payload.get("sales_acc", 0),
-        audience_count=payload.get("audience_count", 0),
-        screen_count=payload.get("screen_count", 0),
-        budget=payload.get("budget", 0),
-        revenue=payload.get("revenue", 0),
-    )
+        본 구현은 Pydantic v2의 model_validate()를 사용하여 payload dict를
+        MovieDocument로 통째 매핑한다. Qdrant payload(qdrant_loader._movie_to_point)
+        는 MovieDocument의 모든 필드를 저장하므로, payload를 그대로 모델에
+        주입하면 누락 없이 복원된다. MovieDocument에 정의되지 않은 키는
+        Pydantic 기본 설정(extra="ignore")으로 무시된다.
+
+    처리 흐름:
+        1. payload dict 복사 (원본 불변)
+        2. id 보충 (payload["id"]가 없으면 point_id로 대체)
+        3. cast 타입 정규화 (list[dict] → list[str], 구버전 호환)
+        4. MovieDocument.model_validate()로 자동 매핑 + 검증
+        5. 실패 시 최소 필드 fallback 후 warning 로깅
+
+    Args:
+        point_id: Qdrant PointStruct의 id (int 또는 uuid5 문자열)
+        payload: Qdrant PointStruct의 payload dict
+
+    Returns:
+        완전히 복원된 MovieDocument (40+ 필드 보존)
+    """
+    # 1) payload 복사 — 원본 dict 수정 방지
+    data = dict(payload)
+
+    # 2) id 보충 — Qdrant payload에는 "id" 키가 없을 수 있으므로 point_id로 보완
+    if not data.get("id"):
+        data["id"] = point_id
+    else:
+        data["id"] = str(data["id"])
+
+    # 3) cast 타입 정규화
+    # Phase ML-2 이전 적재본은 cast를 list[dict](cast_characters 형태)로
+    # 저장했을 수 있다. MovieDocument.cast는 list[str]이므로 dict인 경우
+    # name만 추출한다. Phase ML-2 이후는 list[str]이므로 그대로 사용한다.
+    cast_raw = data.get("cast") or []
+    if isinstance(cast_raw, list) and cast_raw and isinstance(cast_raw[0], dict):
+        data["cast"] = [
+            c.get("name", "")
+            for c in cast_raw
+            if isinstance(c, dict) and c.get("name")
+        ]
+    elif not isinstance(cast_raw, list):
+        # 예상치 못한 타입은 빈 리스트로 정규화
+        data["cast"] = []
+
+    # 4) Pydantic model_validate로 자동 매핑
+    # MovieDocument는 extra="ignore" 기본 설정이므로 Qdrant payload에만 존재하는
+    # 키(point_id 등)는 자동 무시된다. 필드 검증 실패 시 ValidationError 발생.
+    try:
+        return MovieDocument.model_validate(data)
+    except Exception as e:
+        # 5) fallback — 검증 실패 시 최소 필드만으로 생성하여 배치 진행 유지
+        logger.warning(
+            "payload_validate_failed_fallback",
+            id=data.get("id"),
+            error=str(e)[:200],
+        )
+        return MovieDocument(
+            id=str(data.get("id", point_id)),
+            title=data.get("title", ""),
+        )
 
 
 # ============================================================
