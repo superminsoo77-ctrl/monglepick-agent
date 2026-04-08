@@ -57,6 +57,8 @@ from monglepick.data_pipeline.neo4j_loader import load_to_neo4j  # noqa: E402
 from monglepick.data_pipeline.es_loader import load_to_elasticsearch  # noqa: E402
 from monglepick.data_pipeline.cf_builder import build_cf_matrix, cache_cf_to_redis  # noqa: E402
 from monglepick.data_pipeline.kaggle_loader import KaggleLoader  # noqa: E402
+# Phase ML-4 품질 개선: 청크 단위 Solar Pro 3 배치 무드태그 생성
+from monglepick.data_pipeline.mood_batch import enrich_documents_with_solar_mood  # noqa: E402
 from monglepick.db.clients import (  # noqa: E402
     init_all_clients,
     close_all_clients,
@@ -458,6 +460,11 @@ async def run_full_reload(
     skip_kaggle: bool = False,
     skip_cf: bool = False,
     kaggle_dir: str = "data/kaggle_movies",
+    mood_provider: str = "upstage",
+    mood_model: str = "solar-pro3",
+    mood_rpm: int = 100,
+    mood_concurrency: int = 20,
+    mood_batch_size: int = 10,
 ) -> None:
     """
     전체 재적재 파이프라인을 실행한다.
@@ -466,20 +473,37 @@ async def run_full_reload(
 
     흐름:
     1. DB 클라이언트 초기화 (+ 선택적 기존 데이터 삭제)
-    2. JSONL 스트리밍 읽기 → 청크 단위 전처리 → 임베딩 → 3DB 적재
+    2. JSONL 스트리밍 읽기 → 청크 단위 전처리 → [Solar Pro 3 배치 무드] →
+       임베딩 텍스트 재생성 → 벡터 임베딩 → 3DB 적재
     3. (선택) Kaggle 보강 데이터 적재
     4. (선택) CF 매트릭스 재구축 (Redis)
+
+    Phase ML-4 품질 개선 (2026-04-08):
+        청크 단위로 Solar Pro 3 배치 API 를 호출하여 정밀 무드태그를 생성하고,
+        그 결과로 build_embedding_text 를 재실행하여 임베딩 벡터에 정밀 무드가
+        반영되도록 한다 (mood_batch.enrich_documents_with_solar_mood).
+        기존 방식(fallback mood → 임베딩 → 적재 → run_mood_enrichment 별도 실행)
+        은 벡터에 정밀 무드를 반영하지 못했다.
 
     Args:
         jsonl_path: TMDB JSONL 파일 경로 (None이면 기본 경로)
         chunk_size: 청크당 레코드 수 (메모리 vs 오버헤드 트레이드오프)
         embed_batch_size: Upstage API 배치 크기 (최대 100)
         generate_mood: Ollama 무드태그 생성 여부 (True: 느림, False: 장르 기반 fallback)
+            ※ mood_provider="upstage" 일 때는 청크 단위로 Solar Pro 3 이 덮어쓰므로
+               이 값은 실질적으로 무시된다.
         clear_db: 기존 DB 데이터 삭제 후 적재 여부
         resume: 체크포인트에서 재개 여부
         skip_kaggle: Kaggle 보강 스킵 여부
         skip_cf: CF 매트릭스 재구축 스킵 여부
         kaggle_dir: Kaggle 데이터 디렉토리 경로
+        mood_provider: 청크 단위 무드태그 제공자.
+            - "upstage" (기본): Solar Pro 3 배치 API 로 정밀 분석
+            - "fallback": 장르 기반 fallback (process_raw_movie 가 생성한 값 유지)
+        mood_model: Upstage 모델명 (기본 "solar-pro3", 102B MoE)
+        mood_rpm: Solar API 분당 호출 한도 (기본 100)
+        mood_concurrency: Solar API 동시 호출 수 (기본 20)
+        mood_batch_size: 1회 API 호출당 영화 수 (기본 10)
     """
     path = Path(jsonl_path) if jsonl_path else DEFAULT_JSONL_PATH
 
@@ -583,12 +607,33 @@ async def run_full_reload(
             _save_checkpoint(checkpoint)
             print(f"  [복구 완료] {skip_lines:,}번째 라인까지 처리 완료")
 
+        # ── Step Mood 사전 검증: Upstage API 키 확인 ──
+        # mood_provider="upstage" 인데 키가 없으면 안전하게 fallback 으로 강등
+        upstage_api_key: str | None = None
+        if mood_provider == "upstage":
+            upstage_api_key = (
+                settings.UPSTAGE_API_KEY
+                if hasattr(settings, "UPSTAGE_API_KEY") and settings.UPSTAGE_API_KEY
+                else None
+            )
+            if not upstage_api_key:
+                logger.warning(
+                    "upstage_api_key_missing_fallback_to_local",
+                    message="UPSTAGE_API_KEY 미설정 → fallback mood 로 진행",
+                )
+                mood_provider = "fallback"
+            else:
+                print(
+                    f"         무드 모드: upstage ({mood_model}, "
+                    f"rpm={mood_rpm}, concurrency={mood_concurrency}, batch={mood_batch_size})"
+                )
+
         # ── 메인 청크 루프 ──
         for raw_movies, current_line in read_jsonl_chunks(path, chunk_size, skip_lines):
             chunk_count += 1
             chunk_start = time.time()
 
-            # ── Step A: 전처리 ──
+            # ── Step A: 전처리 (fallback mood 로 일단 채움) ──
             documents, skipped = await process_chunk(raw_movies, generate_mood)
             total_skipped += skipped
 
@@ -602,13 +647,44 @@ async def run_full_reload(
                 _save_checkpoint(checkpoint)
                 continue
 
-            # 전처리 완료 → 캐시 저장 + 체크포인트
+            # ── Step A2 (신규): Solar Pro 3 배치 무드 보강 ──
+            # process_chunk 가 만든 fallback mood 를 Solar Pro 3 로 덮어쓰고,
+            # embedding_text 를 재생성하여 정밀 무드가 벡터에 반영되도록 한다.
+            # 내부적으로 RPM/concurrency 제한 및 429 재시도 + fallback 처리됨.
+            if mood_provider == "upstage" and upstage_api_key:
+                try:
+                    mood_stats = await enrich_documents_with_solar_mood(
+                        documents=documents,
+                        api_key=upstage_api_key,
+                        model=mood_model,
+                        rpm=mood_rpm,
+                        concurrency=mood_concurrency,
+                        batch_size=mood_batch_size,
+                        rebuild_embedding_text=True,
+                    )
+                    logger.info(
+                        "chunk_mood_enrichment_done",
+                        chunk=chunk_count,
+                        total=mood_stats["total"],
+                        enriched=mood_stats["enriched"],
+                        batches=mood_stats["batches"],
+                        elapsed_s=mood_stats["elapsed_s"],
+                    )
+                except Exception as e:
+                    # 청크 단위 mood 실패는 치명적이지 않음 — fallback mood 로 진행
+                    logger.error(
+                        "chunk_mood_enrichment_failed_continue_with_fallback",
+                        chunk=chunk_count,
+                        error=str(e)[:200],
+                    )
+
+            # 전처리+mood 완료 → 캐시 저장 + 체크포인트
             _save_docs_cache(documents)
             checkpoint["last_line"] = current_line
             checkpoint["chunk_step"] = "preprocessed"
             _save_checkpoint(checkpoint)
 
-            # ── Step B: 임베딩 ──
+            # ── Step B: 임베딩 (정밀 mood 가 반영된 embedding_text 로 벡터 생성) ──
             embeddings = await embed_chunk(documents, embed_batch_size)
 
             # 임베딩 완료 → 캐시 저장 + 체크포인트
@@ -777,11 +853,51 @@ def main() -> None:
         default="data/kaggle_movies",
         help="Kaggle 데이터 디렉토리 경로 (기본: data/kaggle_movies)",
     )
+    # ── Phase ML-4 품질 개선: 청크 단위 Solar Pro 3 무드태그 통합 ──
+    parser.add_argument(
+        "--mood-provider",
+        choices=["upstage", "fallback"],
+        default="upstage",
+        help=(
+            "청크 단위 무드태그 생성 방식. "
+            "'upstage' (기본): Solar Pro 3 배치 API 로 정밀 분석 + embedding_text 재생성, "
+            "'fallback': 장르 기반 기본값만 사용 (process_raw_movie 결과 유지)"
+        ),
+    )
+    parser.add_argument(
+        "--mood-model",
+        type=str,
+        default="solar-pro3",
+        help="Upstage 모델명 (기본: solar-pro3, 102B MoE)",
+    )
+    parser.add_argument(
+        "--mood-rpm",
+        type=int,
+        default=100,
+        help="Solar API 분당 호출 한도 (기본: 100, 429 발생 시 낮춤)",
+    )
+    parser.add_argument(
+        "--mood-concurrency",
+        type=int,
+        default=20,
+        help="Solar API 동시 호출 수 (기본: 20)",
+    )
+    parser.add_argument(
+        "--mood-batch-size",
+        type=int,
+        default=10,
+        help="1회 Solar API 호출당 영화 수 (기본: 10)",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="--clear-db 확인 프롬프트 자동 승인 (비대화형 실행용)",
+    )
 
     args = parser.parse_args()
 
-    # --clear-db 안전 확인
-    if args.clear_db:
+    # --clear-db 안전 확인 (--yes 로 비대화형 우회 가능)
+    if args.clear_db and not args.yes:
         confirm = input(
             "\n⚠️  --clear-db: 기존 Qdrant/Neo4j/Elasticsearch 데이터가 모두 삭제됩니다.\n"
             "   정말 진행하시겠습니까? (yes/no): "
@@ -801,6 +917,11 @@ def main() -> None:
             skip_kaggle=args.skip_kaggle,
             skip_cf=args.skip_cf,
             kaggle_dir=args.kaggle_dir,
+            mood_provider=args.mood_provider,
+            mood_model=args.mood_model,
+            mood_rpm=args.mood_rpm,
+            mood_concurrency=args.mood_concurrency,
+            mood_batch_size=args.mood_batch_size,
         )
     )
 
