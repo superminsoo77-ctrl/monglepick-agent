@@ -76,24 +76,35 @@ def _scroll_qdrant_payloads(
             )]
         )
 
-    # MySQL에 필요한 필드만 조회 (payload 전체 대신 필요 필드 지정)
-    # Phase 3 재적재 보강 (2026-04-07): JPA Movie 엔티티 35컬럼 전체 커버
-    # - cast_members 추가 (구 cast 컬럼은 레거시, JPA 엔티티에 없음)
-    # - keywords / mood_tags / ott_platforms (JSON) 추가
-    # - adult / kr_release_date 추가 (release_date 컬럼 생성용)
+    # MySQL 에 필요한 필드 전체 (58 컬럼, init.sql 2026-04-09 확장 기준)
+    # Phase 2026-04-09: Phase ML-1 한영이중 + KOBIS 풀필드 + KMDb 풀필드 + 재무/다국어 포함
     payload_fields = [
         "id",
+        # 기본
         "title", "title_en", "poster_path", "backdrop_path",
-        "release_year", "runtime", "rating", "vote_count",
-        "popularity_score", "genres", "director", "cast",
-        "certification", "trailer_url", "overview", "tagline",
-        "imdb_id", "original_language", "collection_name",
+        "release_year", "kr_release_date",
+        "runtime", "rating", "vote_count", "popularity_score",
+        "genres", "keywords", "mood_tags", "ott_platforms",
+        # Phase ML-1 한영 이중
+        "director", "director_original_name",
+        "cast", "cast_characters",
+        # 메타
+        "certification", "trailer_url", "overview", "overview_en",
+        "tagline", "imdb_id", "original_language",
+        "spoken_languages", "origin_country",
+        "production_countries", "production_country_names", "production_companies",
+        "budget", "revenue", "homepage", "status", "adult",
+        "collection_id", "collection_name",
+        # KOBIS 풀필드
         "kobis_movie_cd", "sales_acc", "audience_count", "screen_count",
-        "kobis_watch_grade", "kobis_open_dt", "kmdb_id", "awards",
-        "filming_location", "source",
-        # Phase 3 재적재 추가 필드
-        "keywords", "mood_tags", "ott_platforms",
-        "adult", "kr_release_date",
+        "kobis_nation", "kobis_watch_grade", "kobis_open_dt", "kobis_type_nm",
+        "kobis_directors", "kobis_actors", "kobis_companies", "kobis_staffs",
+        "kobis_genres",
+        # KMDb 풀필드
+        "kmdb_id", "awards", "filming_location",
+        "soundtrack", "theme_song",
+        # 출처
+        "source",
     ]
 
     offset = None
@@ -161,41 +172,57 @@ def _resolve_release_date(payload: dict) -> str | None:
     return None
 
 
+def _json_or_null(value) -> str | None:
+    """list/dict 를 JSON 으로 직렬화 (ensure_ascii=False). 비어있으면 None."""
+    if value is None:
+        return None
+    if isinstance(value, (list, dict)) and not value:
+        return None
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return None
+
+
 def _payload_to_mysql_row(point_id: str, payload: dict) -> tuple:
     """
-    Qdrant payload를 MySQL movies 테이블 INSERT 값으로 변환한다.
+    Qdrant payload → MySQL movies 58 컬럼 INSERT 값 튜플.
 
-    Phase 3 재적재 보강 (2026-04-07):
-        기존 30 컬럼 → 36 컬럼으로 확장. JPA Movie 엔티티와 정합.
-        - 레거시 `cast` (VARCHAR) 컬럼은 더 이상 사용하지 않음 (JPA 엔티티에 없음)
-        - JPA가 쓰는 `cast_members` (JSON) 컬럼에 배우 리스트 저장
-        - `keywords`, `mood_tags`, `ott_platforms` (JSON 3종) 추가
-        - `tmdb_id` (BIGINT) 추가 — source='tmdb' 이고 movie_id가 정수일 때만
-        - `adult` (BOOLEAN) 추가
-        - `release_date` (DATE) 추가 — _resolve_release_date()로 우선순위 결정
+    2026-04-09 전면 확장:
+        - 36 → 58 컬럼 (init.sql 재확장 반영)
+        - Phase ML-1 한영 이중: director_original_name + cast_original_names
+          (cast_original_names 는 cast_characters[].name 에서 추출 — TMDB 는 name 이 원어)
+        - KOBIS 풀필드: nation/type_nm + directors/actors/companies/staffs/genres JSON
+        - KMDb 풀필드: soundtrack/theme_song 추가
+        - 재무/다국어: budget/revenue/homepage/status/spoken_languages/production_*
+        - 컬렉션: collection_id (int)
 
-    JSON 컬럼은 json.dumps(ensure_ascii=False)로 직렬화하여 한글 보존.
-    NULL 가능 필드는 빈 값을 None으로 변환한다.
+    JSON 컬럼 (한글 보존): genres, keywords, mood_tags, ott_platforms,
+        cast_members, cast_original_names, spoken_languages, origin_country,
+        production_countries, production_country_names, production_companies,
+        kobis_directors, kobis_actors, kobis_companies, kobis_staffs, kobis_genres
 
     Returns:
-        MySQL INSERT에 사용할 값 튜플 (36개 컬럼 순서) — UPSERT_SQL과 일치해야 함
+        58 컬럼 순서 튜플 — UPSERT_SQL 과 반드시 일치
     """
-    # cast 필드 정규화 (list[dict] → list[str])
-    # Qdrant payload의 cast 는 Phase ML-2 이후 list[str] (한영 이중) 이지만,
-    # 이전 적재본은 list[dict](cast_characters 형태)일 수 있으므로 둘 다 처리.
-    cast_raw = payload.get("cast", [])
+    # ── cast 한영 이중 처리 ──
+    # cast (list[str]): Phase ML-1 이후 한국어 번역이 있으면 한국어, 없으면 원어
+    # cast_characters (list[dict]): {id, name, character, profile_path} — name 은 항상 원어
+    cast_raw = payload.get("cast", []) or []
     if cast_raw and isinstance(cast_raw[0], dict):
-        cast_list = [c.get("name", "") for c in cast_raw if isinstance(c, dict) and c.get("name")]
+        cast_members_list = [c.get("name", "") for c in cast_raw if isinstance(c, dict) and c.get("name")]
     elif cast_raw and isinstance(cast_raw[0], str):
-        cast_list = cast_raw
+        cast_members_list = cast_raw
     else:
-        cast_list = []
+        cast_members_list = []
 
-    # movie_id: Qdrant payload["id"] 우선, 없으면 point_id 사용
+    cast_characters_raw = payload.get("cast_characters", []) or []
+    cast_original_list = [
+        c.get("name", "") for c in cast_characters_raw
+        if isinstance(c, dict) and c.get("name")
+    ]
+
+    # ── movie_id / tmdb_id ──
     movie_id = str(payload.get("id", point_id))
-
-    # tmdb_id: source='tmdb'이고 movie_id가 순수 정수 문자열일 때만 BIGINT로 변환
-    # KOBIS/KMDb source는 uuid5 기반 문자열이므로 BIGINT 변환 불가 → NULL
     source = payload.get("source", "tmdb") or "tmdb"
     tmdb_id = None
     if source == "tmdb" and movie_id.isdigit():
@@ -204,71 +231,80 @@ def _payload_to_mysql_row(point_id: str, payload: dict) -> tuple:
         except ValueError:
             tmdb_id = None
 
-    # JSON 컬럼 직렬화 (한글 보존 ensure_ascii=False)
-    genres_json = (
-        json.dumps(payload.get("genres", []), ensure_ascii=False)
-        if payload.get("genres") else None
-    )
-    cast_members_json = (
-        json.dumps(cast_list, ensure_ascii=False) if cast_list else None
-    )
-    keywords_json = (
-        json.dumps(payload.get("keywords", []), ensure_ascii=False)
-        if payload.get("keywords") else None
-    )
-    mood_tags_json = (
-        json.dumps(payload.get("mood_tags", []), ensure_ascii=False)
-        if payload.get("mood_tags") else None
-    )
-    ott_platforms_json = (
-        json.dumps(payload.get("ott_platforms", []), ensure_ascii=False)
-        if payload.get("ott_platforms") else None
-    )
-
-    # adult: Qdrant payload에 저장된 bool 값, 기본 False
+    # ── adult / release_date ──
     adult_value = bool(payload.get("adult", False))
-
-    # release_date: 우선순위 기반 선택
     release_date = _resolve_release_date(payload)
+    kr_release_date = (payload.get("kr_release_date") or "")[:10] or None
 
-    # UPSERT_SQL의 37개 컬럼 순서와 정확히 일치해야 함
+    # ── TEXT 길이 제한 ──
+    overview = (payload.get("overview", "") or "")[:65535] or None
+    overview_en = (payload.get("overview_en", "") or "")[:65535] or None
+    awards = (payload.get("awards", "") or "")[:65535] or None
+    filming_location = (payload.get("filming_location", "") or "")[:65535] or None
+    soundtrack = (payload.get("soundtrack", "") or "")[:65535] or None
+    theme_song = (payload.get("theme_song", "") or "")[:65535] or None
+
+    # ── 58 컬럼 튜플 (init.sql 순서) ──
     return (
-        movie_id,                                                    # 1. movie_id
-        tmdb_id,                                                     # 2. tmdb_id
-        payload.get("title", "") or None,                            # 3. title
-        payload.get("title_en", "") or None,                         # 4. title_en
-        (payload.get("overview", "") or "")[:65535] or None,         # 5. overview (TEXT, 길이 제한)
-        genres_json,                                                 # 6. genres (JSON)
-        payload.get("release_year") or None,                         # 7. release_year
-        payload.get("rating") or None,                               # 8. rating
-        payload.get("poster_path", "") or None,                      # 9. poster_path
-        cast_members_json,                                           # 10. cast_members (JSON)
-        payload.get("director", "") or None,                         # 11. director
-        keywords_json,                                               # 12. keywords (JSON)
-        ott_platforms_json,                                          # 13. ott_platforms (JSON)
-        mood_tags_json,                                              # 14. mood_tags (JSON)
-        source,                                                      # 15. source
-        release_date,                                                # 16. release_date
-        payload.get("runtime") or None,                              # 17. runtime
-        payload.get("vote_count") or None,                           # 18. vote_count
-        payload.get("popularity_score") or None,                     # 19. popularity_score
-        payload.get("certification", "") or None,                    # 20. certification
-        payload.get("trailer_url", "") or None,                      # 21. trailer_url
-        payload.get("tagline", "") or None,                          # 22. tagline
-        payload.get("imdb_id", "") or None,                          # 23. imdb_id
-        payload.get("original_language", "") or None,                # 24. original_language
-        payload.get("collection_name", "") or None,                  # 25. collection_name
-        payload.get("kobis_movie_cd", "") or None,                   # 26. kobis_movie_cd
-        payload.get("sales_acc") or None,                            # 27. sales_acc
-        payload.get("audience_count") or None,                       # 28. audience_count
-        payload.get("screen_count") or None,                         # 29. screen_count
-        payload.get("kobis_watch_grade", "") or None,                # 30. kobis_watch_grade
-        payload.get("kobis_open_dt", "") or None,                    # 31. kobis_open_dt (원본 문자열 보존)
-        payload.get("kmdb_id", "") or None,                          # 32. kmdb_id
-        payload.get("backdrop_path", "") or None,                    # 33. backdrop_path
-        adult_value,                                                 # 34. adult
-        payload.get("awards", "") or None,                           # 35. awards
-        payload.get("filming_location", "") or None,                 # 36. filming_location
+        movie_id,                                                              # 1. movie_id
+        tmdb_id,                                                               # 2. tmdb_id
+        payload.get("title", "") or None,                                      # 3. title
+        payload.get("title_en", "") or None,                                   # 4. title_en
+        payload.get("poster_path", "") or None,                                # 5. poster_path
+        payload.get("backdrop_path", "") or None,                              # 6. backdrop_path
+        payload.get("release_year") or None,                                   # 7. release_year
+        release_date,                                                          # 8. release_date
+        kr_release_date,                                                       # 9. kr_release_date
+        payload.get("runtime") or None,                                        # 10. runtime
+        payload.get("rating") or None,                                         # 11. rating
+        payload.get("vote_count") or None,                                     # 12. vote_count
+        payload.get("popularity_score") or None,                               # 13. popularity_score
+        _json_or_null(payload.get("genres")),                                  # 14. genres
+        _json_or_null(payload.get("keywords")),                                # 15. keywords
+        _json_or_null(payload.get("mood_tags")),                               # 16. mood_tags
+        _json_or_null(payload.get("ott_platforms")),                           # 17. ott_platforms
+        payload.get("director", "") or None,                                   # 18. director
+        payload.get("director_original_name", "") or None,                     # 19. director_original_name
+        _json_or_null(cast_members_list),                                      # 20. cast_members
+        _json_or_null(cast_original_list),                                     # 21. cast_original_names
+        payload.get("certification", "") or None,                              # 22. certification
+        payload.get("trailer_url", "") or None,                                # 23. trailer_url
+        overview,                                                              # 24. overview
+        overview_en,                                                           # 25. overview_en
+        payload.get("tagline", "") or None,                                    # 26. tagline
+        payload.get("imdb_id", "") or None,                                    # 27. imdb_id
+        payload.get("original_language", "") or None,                          # 28. original_language
+        _json_or_null(payload.get("spoken_languages")),                        # 29. spoken_languages
+        _json_or_null(payload.get("origin_country")),                          # 30. origin_country
+        _json_or_null(payload.get("production_countries")),                    # 31. production_countries
+        _json_or_null(payload.get("production_country_names")),                # 32. production_country_names
+        _json_or_null(payload.get("production_companies")),                    # 33. production_companies
+        int(payload.get("budget") or 0),                                       # 34. budget
+        int(payload.get("revenue") or 0),                                      # 35. revenue
+        payload.get("homepage", "") or None,                                   # 36. homepage
+        payload.get("status", "") or None,                                     # 37. status
+        adult_value,                                                           # 38. adult
+        int(payload.get("collection_id") or 0) or None,                        # 39. collection_id
+        payload.get("collection_name", "") or None,                            # 40. collection_name
+        payload.get("kobis_movie_cd", "") or None,                             # 41. kobis_movie_cd
+        int(payload.get("sales_acc") or 0),                                    # 42. sales_acc
+        int(payload.get("audience_count") or 0),                               # 43. audience_count
+        int(payload.get("screen_count") or 0),                                 # 44. screen_count
+        payload.get("kobis_nation", "") or None,                               # 45. kobis_nation
+        payload.get("kobis_watch_grade", "") or None,                          # 46. kobis_watch_grade
+        payload.get("kobis_open_dt", "") or None,                              # 47. kobis_open_dt
+        payload.get("kobis_type_nm", "") or None,                              # 48. kobis_type_nm
+        _json_or_null(payload.get("kobis_directors")),                         # 49. kobis_directors
+        _json_or_null(payload.get("kobis_actors")),                            # 50. kobis_actors
+        _json_or_null(payload.get("kobis_companies")),                         # 51. kobis_companies
+        _json_or_null(payload.get("kobis_staffs")),                            # 52. kobis_staffs
+        _json_or_null(payload.get("kobis_genres")),                            # 53. kobis_genres
+        payload.get("kmdb_id", "") or None,                                    # 54. kmdb_id
+        awards,                                                                # 55. awards
+        filming_location,                                                      # 56. filming_location
+        soundtrack,                                                            # 57. soundtrack
+        theme_song,                                                            # 58. theme_song
+        source,                                                                # 59. source
     )
 
 
@@ -276,26 +312,33 @@ def _payload_to_mysql_row(point_id: str, payload: dict) -> tuple:
 # MySQL 배치 upsert
 # ============================================================
 
-# movies 테이블의 INSERT SQL (ON DUPLICATE KEY UPDATE)
-# Phase 3 재적재 보강 (2026-04-07): 30 → 36 컬럼. JPA Movie 엔티티와 정합.
+# movies 테이블 INSERT SQL (ON DUPLICATE KEY UPDATE)
+# 2026-04-09 전면 확장: 36 → 59 컬럼 (init.sql 재확장 기준).
 #
-# 컬럼 순서는 _payload_to_mysql_row() 반환 튜플의 순서와 반드시 일치해야 한다.
-# 변경점:
-#   - `cast` (레거시 VARCHAR) 제거 → `cast_members` (JSON) 추가
-#   - `tmdb_id` BIGINT 추가 (2번째 슬롯)
-#   - `keywords`, `mood_tags`, `ott_platforms` (JSON 3종) 추가
-#   - `release_date` DATE 추가
-#   - `adult` BOOLEAN 추가
+# 컬럼 순서는 _payload_to_mysql_row() 반환 튜플 순서와 정확히 일치해야 한다.
+# 주요 추가 컬럼:
+#   - Phase ML-1 한영이중: director_original_name, cast_original_names (JSON)
+#   - 다국어: overview_en, spoken_languages, origin_country,
+#            production_countries, production_country_names, production_companies (JSON)
+#   - 재무: budget, revenue, homepage, status, collection_id
+#   - 한국 개봉: kr_release_date
+#   - KOBIS 풀필드: kobis_nation, kobis_type_nm,
+#                   kobis_directors/actors/companies/staffs/genres (JSON 5종)
+#   - KMDb 풀필드: soundtrack, theme_song
 UPSERT_SQL = """
 INSERT INTO movies (
-    movie_id, tmdb_id, title, title_en, overview,
-    genres, release_year, rating, poster_path, cast_members,
-    director, keywords, ott_platforms, mood_tags, source,
-    release_date, runtime, vote_count, popularity_score, certification,
-    trailer_url, tagline, imdb_id, original_language, collection_name,
-    kobis_movie_cd, sales_acc, audience_count, screen_count, kobis_watch_grade,
-    kobis_open_dt, kmdb_id, backdrop_path, adult, awards,
-    filming_location
+    movie_id, tmdb_id, title, title_en, poster_path,
+    backdrop_path, release_year, release_date, kr_release_date, runtime,
+    rating, vote_count, popularity_score, genres, keywords,
+    mood_tags, ott_platforms, director, director_original_name, cast_members,
+    cast_original_names, certification, trailer_url, overview, overview_en,
+    tagline, imdb_id, original_language, spoken_languages, origin_country,
+    production_countries, production_country_names, production_companies, budget, revenue,
+    homepage, status, adult, collection_id, collection_name,
+    kobis_movie_cd, sales_acc, audience_count, screen_count, kobis_nation,
+    kobis_watch_grade, kobis_open_dt, kobis_type_nm, kobis_directors, kobis_actors,
+    kobis_companies, kobis_staffs, kobis_genres, kmdb_id, awards,
+    filming_location, soundtrack, theme_song, source
 ) VALUES (
     %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s,
@@ -304,43 +347,70 @@ INSERT INTO movies (
     %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s,
-    %s
+    %s, %s, %s, %s, %s,
+    %s, %s, %s, %s, %s,
+    %s, %s, %s, %s, %s,
+    %s, %s, %s, %s, %s,
+    %s, %s, %s, %s
 ) ON DUPLICATE KEY UPDATE
     tmdb_id = VALUES(tmdb_id),
     title = VALUES(title),
     title_en = VALUES(title_en),
-    overview = VALUES(overview),
-    genres = VALUES(genres),
-    release_year = VALUES(release_year),
-    rating = VALUES(rating),
     poster_path = VALUES(poster_path),
-    cast_members = VALUES(cast_members),
-    director = VALUES(director),
-    keywords = VALUES(keywords),
-    ott_platforms = VALUES(ott_platforms),
-    mood_tags = VALUES(mood_tags),
-    source = VALUES(source),
+    backdrop_path = VALUES(backdrop_path),
+    release_year = VALUES(release_year),
     release_date = VALUES(release_date),
+    kr_release_date = VALUES(kr_release_date),
     runtime = VALUES(runtime),
+    rating = VALUES(rating),
     vote_count = VALUES(vote_count),
     popularity_score = VALUES(popularity_score),
+    genres = VALUES(genres),
+    keywords = VALUES(keywords),
+    mood_tags = VALUES(mood_tags),
+    ott_platforms = VALUES(ott_platforms),
+    director = VALUES(director),
+    director_original_name = VALUES(director_original_name),
+    cast_members = VALUES(cast_members),
+    cast_original_names = VALUES(cast_original_names),
     certification = VALUES(certification),
     trailer_url = VALUES(trailer_url),
+    overview = VALUES(overview),
+    overview_en = VALUES(overview_en),
     tagline = VALUES(tagline),
     imdb_id = VALUES(imdb_id),
     original_language = VALUES(original_language),
+    spoken_languages = VALUES(spoken_languages),
+    origin_country = VALUES(origin_country),
+    production_countries = VALUES(production_countries),
+    production_country_names = VALUES(production_country_names),
+    production_companies = VALUES(production_companies),
+    budget = VALUES(budget),
+    revenue = VALUES(revenue),
+    homepage = VALUES(homepage),
+    status = VALUES(status),
+    adult = VALUES(adult),
+    collection_id = VALUES(collection_id),
     collection_name = VALUES(collection_name),
     kobis_movie_cd = VALUES(kobis_movie_cd),
     sales_acc = VALUES(sales_acc),
     audience_count = VALUES(audience_count),
     screen_count = VALUES(screen_count),
+    kobis_nation = VALUES(kobis_nation),
     kobis_watch_grade = VALUES(kobis_watch_grade),
     kobis_open_dt = VALUES(kobis_open_dt),
+    kobis_type_nm = VALUES(kobis_type_nm),
+    kobis_directors = VALUES(kobis_directors),
+    kobis_actors = VALUES(kobis_actors),
+    kobis_companies = VALUES(kobis_companies),
+    kobis_staffs = VALUES(kobis_staffs),
+    kobis_genres = VALUES(kobis_genres),
     kmdb_id = VALUES(kmdb_id),
-    backdrop_path = VALUES(backdrop_path),
-    adult = VALUES(adult),
     awards = VALUES(awards),
-    filming_location = VALUES(filming_location)
+    filming_location = VALUES(filming_location),
+    soundtrack = VALUES(soundtrack),
+    theme_song = VALUES(theme_song),
+    source = VALUES(source)
 """
 
 
@@ -410,7 +480,10 @@ async def run_mysql_sync(
                 try:
                     row = _payload_to_mysql_row(pid, payload)
                     # title이 없는 행은 스킵
-                    if row[1]:  # title 필드 (인덱스 1)
+                    # 2026-04-09: 59 컬럼 확장 후 title 인덱스가 2로 이동.
+                    # row[0]=movie_id, row[1]=tmdb_id, row[2]=title
+                    # 기존 row[1] 는 tmdb_id 였고 KOBIS/KMDb 는 None → 105K 건 필터되던 버그
+                    if row[2]:  # title 필드 (인덱스 2)
                         rows.append(row)
                 except Exception as e:
                     total_errors += 1

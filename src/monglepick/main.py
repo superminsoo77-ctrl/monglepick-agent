@@ -15,6 +15,13 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
+
+# ── 로깅 초기화 (다른 모듈 import 이전에 반드시 실행) ──
+# JSON 포맷/stdout 출력 → docker json-file → Filebeat → Logstash agent_json 분기
+from monglepick.utils.logging_config import configure_logging
+
+configure_logging()
 
 from monglepick.api.admin import admin_router
 from monglepick.api.admin_data import admin_data_router
@@ -277,6 +284,26 @@ app.include_router(match_router, prefix="/api/v1")
 app.include_router(admin_router, prefix="/api/v1")
 # Phase 6 (2026-04-08): 데이터 관리 admin 라우터 등록 — 영화 CRUD + 파이프라인 SSE + 데이터 현황
 app.include_router(admin_data_router, prefix="/api/v1")
+
+# ── Prometheus 메트릭 엔드포인트 ──
+# prometheus-fastapi-instrumentator 가 /metrics 경로에 자동으로
+# http_requests_total, http_request_duration_seconds, http_request_size_bytes 등
+# 표준 메트릭을 노출한다. LangGraph 노드 커스텀 메트릭은 Phase 3에서 structlog → OpenTelemetry 로 확장 예정.
+#
+# 제외 경로:
+#  - /health, /metrics 자체는 Prometheus 스크레이프 잡음이 되므로 제외
+#  - /docs, /redoc, /openapi.json 은 Swagger UI 로드 시 노이즈
+#
+# should_respect_env_var: `ENABLE_METRICS` 환경변수가 "true" 가 아니면 비활성화되도록
+# 설정할 수 있으나, 운영 VM3 에서 상시 스크레이프하므로 기본 활성화로 둔다.
+Instrumentator(
+    should_group_status_codes=True,
+    should_ignore_untemplated=True,
+    should_instrument_requests_inprogress=True,
+    excluded_handlers=["/health", "/metrics", "/docs", "/redoc", "/openapi.json"],
+    inprogress_name="http_requests_inprogress",
+    inprogress_labels=True,
+).instrument(app).expose(app, endpoint="/metrics", include_in_schema=False, tags=["system"])
 
 
 @app.get(

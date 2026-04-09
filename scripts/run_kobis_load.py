@@ -51,11 +51,19 @@ from monglepick.data_pipeline.kobis_collector import (  # noqa: E402
     load_kobis_cache,
 )
 from monglepick.data_pipeline.kobis_movie_converter import (  # noqa: E402
+    build_kobis_enrichment_payload,
     convert_kobis_movies,
-    dedup_kobis_movies,
+    dedup_kobis_movies,  # backwards compat (미사용)
+    split_kobis_movies,
 )
-from monglepick.data_pipeline.neo4j_loader import load_to_neo4j  # noqa: E402
+# Phase ML-4 일관성: Solar Pro 3 배치 무드태그 + embedding_text 재생성
+from monglepick.data_pipeline.mood_batch import enrich_documents_with_solar_mood  # noqa: E402
+from monglepick.data_pipeline.neo4j_loader import (  # noqa: E402
+    load_to_neo4j,
+    update_movies_properties_bulk,
+)
 from monglepick.data_pipeline.qdrant_loader import load_to_qdrant  # noqa: E402
+from monglepick.data_pipeline.es_loader import update_movies_partial_bulk  # noqa: E402
 from monglepick.db.clients import init_all_clients, close_all_clients  # noqa: E402
 from monglepick.config import settings  # noqa: E402
 
@@ -110,10 +118,10 @@ def _save_checkpoint(state: dict) -> None:
 
 def _get_existing_movies_from_qdrant() -> list[dict]:
     """
-    Qdrant에서 기존 영화 payload를 조회한다 (id, title, title_en, release_year).
+    Qdrant에서 기존 영화 payload를 조회한다 (id, title, title_en, release_year, kobis_movie_cd).
 
-    중복 제거 시 dedup_kobis_movies()에 전달하기 위해
-    필요한 최소 필드만 가져온다.
+    split_kobis_movies() 에 전달할 최소 필드.
+    kobis_movie_cd 는 ID 기반 1차 매칭 (이미 KOBIS 적재된 영화 재보강) 용도.
     """
     from qdrant_client import QdrantClient
 
@@ -127,7 +135,7 @@ def _get_existing_movies_from_qdrant() -> list[dict]:
             limit=1000,
             offset=offset,
             with_vectors=False,
-            with_payload=["title", "title_en", "release_year", "source"],
+            with_payload=["title", "title_en", "release_year", "source", "kobis_movie_cd"],
         )
         if not points:
             break
@@ -140,6 +148,7 @@ def _get_existing_movies_from_qdrant() -> list[dict]:
                 "title_en": payload.get("title_en", ""),
                 "release_year": payload.get("release_year", 0),
                 "source": payload.get("source", "tmdb"),
+                "kobis_movie_cd": payload.get("kobis_movie_cd", ""),
             })
 
         if next_offset is None:
@@ -152,6 +161,120 @@ def _get_existing_movies_from_qdrant() -> list[dict]:
 
 
 # ============================================================
+# KOBIS 기존 영화 3DB enrichment (2026-04-09)
+# ============================================================
+
+async def _apply_kobis_enrichments_3db(
+    enrichment_targets: list[tuple[str, dict]],
+    detail_map: dict[str, dict],
+    boxoffice_map: dict[str, dict],
+) -> int:
+    """
+    split_kobis_movies 가 분류한 enrichment 대상에 KOBIS 풍부 데이터를
+    Qdrant + Elasticsearch + Neo4j 3DB 에 partial update 한다.
+
+    MySQL 은 Phase 3 의 run_mysql_sync.py 가 Qdrant → MySQL 로 sync
+    하므로 여기서는 Qdrant payload 갱신으로 충분 (MySQL 전파 자동).
+
+    Args:
+        enrichment_targets: [(existing_movie_id, kobis_raw_dict), ...]
+        detail_map: {movieCd: detail_dict} — searchMovieInfo 응답
+        boxoffice_map: {movieCd: boxoffice_dict} — 박스오피스 집계
+
+    Returns:
+        Qdrant 에서 실제 업데이트된 건수 (3DB 중 가장 보수적)
+    """
+    from qdrant_client import QdrantClient
+
+    if not enrichment_targets:
+        return 0
+
+    # ── 1. 각 enrichment 대상의 payload 생성 ──
+    qdrant_updates: list[tuple[str, dict]] = []  # (point_id, payload)
+    bulk_updates: list[tuple[str, dict]] = []     # (movie_id, enrichment_dict) ES/Neo4j 공용
+
+    for existing_id, kobis_raw in enrichment_targets:
+        movie_cd = kobis_raw.get("movieCd", "")
+        detail_data = detail_map.get(movie_cd)
+        boxoffice_data = boxoffice_map.get(movie_cd)
+
+        enrichment = build_kobis_enrichment_payload(
+            kobis_raw=kobis_raw,
+            detail_data=detail_data,
+            boxoffice_data=boxoffice_data,
+        )
+        if not enrichment:
+            continue
+
+        # runtime_kobis 는 내부 용도 — Qdrant payload 로는 제외
+        # (기존 영화의 runtime 을 덮어쓰지 않음 — 원본 보존)
+        enrichment_for_qdrant = {
+            k: v for k, v in enrichment.items() if k != "runtime_kobis"
+        }
+
+        qdrant_updates.append((existing_id, enrichment_for_qdrant))
+        bulk_updates.append((existing_id, enrichment_for_qdrant))
+
+    if not qdrant_updates:
+        return 0
+
+    # ── 2. Qdrant set_payload (sync executor) ──
+    def _sync_qdrant_apply() -> int:
+        client = QdrantClient(url=settings.QDRANT_URL, check_compatibility=False)
+        ok = 0
+        for existing_id, payload_update in qdrant_updates:
+            # 빈 값 필터링 (기존 값 덮어쓰기 방지)
+            clean = {
+                k: v for k, v in payload_update.items()
+                if v not in (None, "", [], {}) and v != 0
+            }
+            if not clean:
+                continue
+
+            # Qdrant point_id 타입 추론 (숫자면 int, 아니면 str)
+            try:
+                pid: int | str = int(existing_id)
+            except (ValueError, TypeError):
+                pid = str(existing_id)
+
+            try:
+                client.set_payload(
+                    collection_name=settings.QDRANT_COLLECTION,
+                    payload=clean,
+                    points=[pid],
+                )
+                ok += 1
+            except Exception as e:
+                logger.debug(
+                    "kobis_qdrant_enrich_failed",
+                    id=existing_id, error=str(e)[:100],
+                )
+
+        client.close()
+        return ok
+
+    loop = asyncio.get_event_loop()
+    qdrant_ok = await loop.run_in_executor(None, _sync_qdrant_apply)
+    logger.info("kobis_qdrant_enriched", count=qdrant_ok)
+
+    # ── 3. Elasticsearch bulk partial update ──
+    try:
+        es_ok = await update_movies_partial_bulk(bulk_updates)
+        logger.info("kobis_es_enriched", count=es_ok)
+    except Exception as e:
+        logger.warning("kobis_es_enrich_failed", error=str(e)[:200])
+
+    # ── 4. Neo4j bulk SET 속성 ──
+    try:
+        neo4j_ok = await update_movies_properties_bulk(bulk_updates)
+        logger.info("kobis_neo4j_enriched", count=neo4j_ok)
+    except Exception as e:
+        logger.warning("kobis_neo4j_enrich_failed", error=str(e)[:200])
+
+    return qdrant_ok
+
+
+# ============================================================
 # 메인 파이프라인
 # ============================================================
 
@@ -161,6 +284,11 @@ async def run_kobis_load(
     boxoffice_days: int = 0,
     batch_size: int = DEFAULT_BATCH_SIZE,
     embed_batch_size: int = DEFAULT_EMBED_BATCH,
+    mood_provider: str = "upstage",
+    mood_model: str = "solar-pro3",
+    mood_rpm: int = 100,
+    mood_concurrency: int = 20,
+    mood_batch_size: int = 10,
 ) -> None:
     """
     KOBIS 데이터 수집 → 중복 제거 → 변환 → 임베딩 → 3DB 적재.
@@ -218,40 +346,46 @@ async def run_kobis_load(
         checkpoint["phase"] = "collect"
         _save_checkpoint(checkpoint)
 
-        # ── Step 2: 기존 DB와 중복 제거 ──
-        print("\n[Step 2] 기존 DB와 중복 제거")
+        # ── Step 2: 기존 DB 매칭 (enrichment vs 신규 분리) ──
+        # 2026-04-09: 중복 skip → split 로 변경.
+        # 기존 영화에도 KOBIS 풍부 데이터를 병합하여 데이터 유실 차단.
+        print("\n[Step 2] 기존 DB 매칭 — enrichment 대상 / 신규 영화 분리")
 
         db_movies = _get_existing_movies_from_qdrant()
-        # 기존 KOBIS 소스 ID 제외 (재적재 방지)
-        existing_kobis_ids = {
-            m["id"] for m in db_movies if m.get("source") == "kobis"
-        }
 
-        deduped_movies = dedup_kobis_movies(
+        enrichment_targets, new_movies = split_kobis_movies(
             kobis_movies=kobis_movies,
             db_movies=db_movies,
-            exclude_ids=existing_kobis_ids,
+            exclude_ids=None,
         )
 
-        checkpoint["total_after_dedup"] = len(deduped_movies)
-        checkpoint["phase"] = "dedup"
+        checkpoint["total_enrichment_targets"] = len(enrichment_targets)
+        checkpoint["total_after_dedup"] = len(new_movies)  # backwards compat: 신규 적재 대상
+        checkpoint["phase"] = "split"
         _save_checkpoint(checkpoint)
 
-        print(f"  원본: {len(kobis_movies):,}건 → 중복 제거 후: {len(deduped_movies):,}건")
+        print(f"  원본:           {len(kobis_movies):,}건")
+        print(f"  enrichment 대상: {len(enrichment_targets):,}건 (기존 영화에 KOBIS 병합)")
+        print(f"  신규 적재 대상:  {len(new_movies):,}건")
 
-        if not deduped_movies:
-            print("  적재할 새 영화가 없습니다.")
-            return
-
-        # ── Step 3: 상세정보 수집 (선택) ──
+        # ── Step 3: 상세정보 수집 (enrichment + 신규 모두) ──
+        # enrichment 대상에도 상세정보가 필요 — actors/staffs/watch_grade 등이 핵심.
         detail_map: dict[str, dict] = {}
 
         if detail_limit > 0 and settings.KOBIS_API_KEY:
             print(f"\n[Step 3] 상세정보 수집 (최대 {detail_limit}건)")
 
-            # 상세정보가 없는 영화의 movieCd 추출
-            movie_cds = [m.get("movieCd", "") for m in deduped_movies if m.get("movieCd")]
-            target_cds = movie_cds[:detail_limit]
+            # enrichment + 신규 합쳐서 모두 상세 수집 (enrichment 우선)
+            all_movie_cds: list[str] = []
+            for _, kobis_raw in enrichment_targets:
+                cd = kobis_raw.get("movieCd", "")
+                if cd:
+                    all_movie_cds.append(cd)
+            for kobis_raw in new_movies:
+                cd = kobis_raw.get("movieCd", "")
+                if cd:
+                    all_movie_cds.append(cd)
+            target_cds = all_movie_cds[:detail_limit]
 
             async with KOBISCollector() as collector:
                 details = await collector.collect_movie_details_batch(target_cds)
@@ -262,6 +396,8 @@ async def run_kobis_load(
                         "audits": d.audits,
                         "show_tm": d.show_tm,
                         "companys": d.companys,
+                        "directors": getattr(d, "directors", []),
+                        "genres": getattr(d, "genres", []),
                     }
                 print(f"  상세 수집 완료: {len(detail_map):,}건 (API 호출: {collector.call_count}회)")
 
@@ -293,11 +429,28 @@ async def run_kobis_load(
         else:
             print("\n[Step 4] 박스오피스 수집 스킵")
 
-        # ── Step 5: MovieDocument 변환 ──
-        print("\n[Step 5] MovieDocument 변환")
+        # ── Step 5-A: 기존 영화 KOBIS enrichment 3DB 동기화 ──
+        # 2026-04-09 신규: Qdrant/ES/Neo4j 3DB partial update.
+        # 기존 TMDB 영화에 KOBIS 의 한국 관객/매출/등급/감독/배우/스태프/제작사 병합.
+        if enrichment_targets:
+            print(f"\n[Step 5-A] 기존 영화 KOBIS enrichment ({len(enrichment_targets):,}건)")
+            enrichment_count = await _apply_kobis_enrichments_3db(
+                enrichment_targets=enrichment_targets,
+                detail_map=detail_map,
+                boxoffice_map=boxoffice_map,
+            )
+            checkpoint["total_enriched"] = enrichment_count
+            checkpoint["phase"] = "enriched"
+            _save_checkpoint(checkpoint)
+            print(f"  3DB enrichment 완료: {enrichment_count:,}건")
+        else:
+            print("\n[Step 5-A] enrichment 대상 없음")
+
+        # ── Step 5-B: 신규 영화 MovieDocument 변환 ──
+        print(f"\n[Step 5-B] 신규 영화 MovieDocument 변환 ({len(new_movies):,}건)")
 
         documents = convert_kobis_movies(
-            kobis_movies=deduped_movies,
+            kobis_movies=new_movies,
             detail_map=detail_map,
             boxoffice_map=boxoffice_map,
         )
@@ -306,14 +459,33 @@ async def run_kobis_load(
         checkpoint["phase"] = "convert"
         _save_checkpoint(checkpoint)
 
-        print(f"  변환 성공: {len(documents):,}건 / {len(deduped_movies):,}건")
+        print(f"  변환 성공: {len(documents):,}건 / {len(new_movies):,}건")
 
         if not documents:
-            print("  변환된 문서가 없습니다.")
+            print("  신규 적재 영화가 없습니다. (enrichment 는 완료됨)")
             return
 
-        # ── Step 6 & 7: 배치 단위 임베딩 → 적재 ──
-        print(f"\n[Step 6-7] 임베딩 + 3DB 적재 (배치: {batch_size}건)")
+        # ── Step 6 & 7: 배치 단위 mood 보강 → 임베딩 → 적재 ──
+        # Phase ML-4 일관성 (2026-04-08): 배치 단위로 Solar Pro 3 정밀 mood 적용 후
+        # build_embedding_text 재생성 → Solar embedding → 적재. TMDB run_full_reload와 동일 패턴.
+        print(f"\n[Step 6-7] 배치 mood + 임베딩 + 3DB 적재 (배치: {batch_size}건)")
+
+        # mood_provider 사전 검증: API 키 없으면 fallback (기존 fallback mood 유지)
+        upstage_api_key: str | None = None
+        if mood_provider == "upstage":
+            upstage_api_key = (
+                settings.UPSTAGE_API_KEY
+                if hasattr(settings, "UPSTAGE_API_KEY") and settings.UPSTAGE_API_KEY
+                else None
+            )
+            if upstage_api_key:
+                print(
+                    f"  무드 모드: upstage ({mood_model}, "
+                    f"rpm={mood_rpm}, concurrency={mood_concurrency}, batch={mood_batch_size})"
+                )
+            else:
+                logger.warning("kobis_upstage_api_key_missing_fallback")
+                mood_provider = "fallback"
 
         total_loaded = 0
         start_offset = checkpoint.get("batch_offset", 0)
@@ -326,14 +498,44 @@ async def run_kobis_load(
             batch = documents[batch_start:batch_end]
             batch_start_time = time.time()
 
-            # 임베딩 (executor로 이벤트 루프 블로킹 방지)
+            # ── Step 6a (신규): Solar Pro 3 배치 mood 보강 ──
+            # convert_kobis_movies()가 fallback mood로 채운 mood_tags를
+            # Solar Pro 3로 덮어쓰고 embedding_text를 재생성한다.
+            if mood_provider == "upstage" and upstage_api_key:
+                try:
+                    mood_stats = await enrich_documents_with_solar_mood(
+                        documents=batch,
+                        api_key=upstage_api_key,
+                        model=mood_model,
+                        rpm=mood_rpm,
+                        concurrency=mood_concurrency,
+                        batch_size=mood_batch_size,
+                        rebuild_embedding_text=True,
+                    )
+                    logger.info(
+                        "kobis_batch_mood_enriched",
+                        batch_idx=batch_idx,
+                        total=mood_stats["total"],
+                        enriched=mood_stats["enriched"],
+                        elapsed_s=mood_stats["elapsed_s"],
+                    )
+                except Exception as e:
+                    # mood 실패는 치명적 X — fallback mood로 진행
+                    logger.error(
+                        "kobis_batch_mood_failed_continue_with_fallback",
+                        batch_idx=batch_idx,
+                        error=str(e)[:200],
+                    )
+
+            # ── Step 6b: 임베딩 (Solar embedding 4096차원) ──
+            # mood 보강 후 재생성된 embedding_text를 사용 (정밀 mood 반영)
             texts = [doc.embedding_text for doc in batch]
             loop = asyncio.get_event_loop()
             embeddings = await loop.run_in_executor(
                 None, embed_texts, texts, embed_batch_size
             )
 
-            # 3DB 적재
+            # ── Step 7: 3DB 적재 ──
             qdrant_count = await load_to_qdrant(batch, embeddings)
             await load_to_neo4j(batch)
             es_count = await load_to_elasticsearch(batch)
@@ -433,6 +635,33 @@ if __name__ == "__main__":
         "--embed-batch-size", type=int, default=DEFAULT_EMBED_BATCH,
         help=f"Upstage 임베딩 배치 크기 (기본: {DEFAULT_EMBED_BATCH})",
     )
+    # Phase ML-4 일관성: 청크 단위 Solar Pro 3 무드태그 통합
+    parser.add_argument(
+        "--mood-provider",
+        choices=["upstage", "fallback"],
+        default="upstage",
+        help=(
+            "청크 단위 무드태그 생성 방식. "
+            "'upstage' (기본): Solar Pro 3 배치 API + embedding_text 재생성, "
+            "'fallback': convert_kobis_movies()의 fallback mood 유지"
+        ),
+    )
+    parser.add_argument(
+        "--mood-model", type=str, default="solar-pro3",
+        help="Upstage 모델명 (기본: solar-pro3)",
+    )
+    parser.add_argument(
+        "--mood-rpm", type=int, default=100,
+        help="Solar API 분당 호출 한도 (기본: 100)",
+    )
+    parser.add_argument(
+        "--mood-concurrency", type=int, default=20,
+        help="Solar API 동시 호출 수 (기본: 20)",
+    )
+    parser.add_argument(
+        "--mood-batch-size", type=int, default=10,
+        help="1회 Solar API 호출당 영화 수 (기본: 10)",
+    )
     parser.add_argument(
         "--status", action="store_true",
         help="현재 진행 상태만 확인",
@@ -449,5 +678,10 @@ if __name__ == "__main__":
                 boxoffice_days=args.boxoffice_days,
                 batch_size=args.batch_size,
                 embed_batch_size=args.embed_batch_size,
+                mood_provider=args.mood_provider,
+                mood_model=args.mood_model,
+                mood_rpm=args.mood_rpm,
+                mood_concurrency=args.mood_concurrency,
+                mood_batch_size=args.mood_batch_size,
             )
         )

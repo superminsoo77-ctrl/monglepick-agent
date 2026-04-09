@@ -26,10 +26,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import structlog  # noqa: E402
 
+from monglepick.config import settings  # noqa: E402
 from monglepick.data_pipeline.checkpoint import PipelineCheckpoint  # noqa: E402
 from monglepick.data_pipeline.embedder import embed_texts  # noqa: E402
 from monglepick.data_pipeline.es_loader import load_to_elasticsearch  # noqa: E402
 from monglepick.data_pipeline.kaggle_enricher import load_kaggle_movies  # noqa: E402
+# Phase ML-4 일관성: Solar Pro 3 배치 무드태그 + embedding_text 재생성
+from monglepick.data_pipeline.mood_batch import enrich_documents_with_solar_mood  # noqa: E402
 from monglepick.data_pipeline.neo4j_loader import load_to_neo4j  # noqa: E402
 from monglepick.data_pipeline.qdrant_loader import load_to_qdrant  # noqa: E402
 from monglepick.db.clients import init_all_clients, close_all_clients  # noqa: E402
@@ -85,6 +88,11 @@ async def run_kaggle_supplement(
     kaggle_dir: str,
     batch_size: int = 2000,
     embedding_batch_size: int = 50,
+    mood_provider: str = "upstage",
+    mood_model: str = "solar-pro3",
+    mood_rpm: int = 100,
+    mood_concurrency: int = 20,
+    mood_batch_size: int = 10,
 ) -> None:
     """
     Kaggle 데이터 보강 파이프라인.
@@ -130,7 +138,29 @@ async def run_kaggle_supplement(
         checkpoint.kaggle_total_available = len(documents)
         logger.info("kaggle_movies_to_load", count=len(documents))
 
-        # 4. 배치 단위로 임베딩 → 적재 → 체크포인트 저장
+        # mood_provider 사전 검증: API 키 없으면 fallback (kaggle_enricher의 fallback mood 유지)
+        upstage_api_key: str | None = None
+        if mood_provider == "upstage":
+            upstage_api_key = (
+                settings.UPSTAGE_API_KEY
+                if hasattr(settings, "UPSTAGE_API_KEY") and settings.UPSTAGE_API_KEY
+                else None
+            )
+            if upstage_api_key:
+                logger.info(
+                    "kaggle_supplement_mood_mode",
+                    provider="upstage",
+                    model=mood_model,
+                    rpm=mood_rpm,
+                    concurrency=mood_concurrency,
+                    batch=mood_batch_size,
+                )
+            else:
+                logger.warning("kaggle_upstage_api_key_missing_fallback")
+                mood_provider = "fallback"
+
+        # 4. 배치 단위로 mood 보강 → 임베딩 → 적재 → 체크포인트 저장
+        # Phase ML-4 일관성 (2026-04-08): Solar Pro 3 정밀 mood + embedding_text 재생성
         total_loaded = 0
 
         for batch_start in range(0, len(documents), batch_size):
@@ -144,11 +174,40 @@ async def run_kaggle_supplement(
                 total=len(documents),
             )
 
-            # 4a. 임베딩 생성 (Upstage API)
+            # 4a (신규). Solar Pro 3 배치 mood 보강
+            # kaggle_enricher의 fallback mood를 Solar Pro 3로 덮어쓰고
+            # build_embedding_text를 재실행하여 정밀 mood가 벡터에 반영되도록 한다.
+            if mood_provider == "upstage" and upstage_api_key:
+                try:
+                    mood_stats = await enrich_documents_with_solar_mood(
+                        documents=batch,
+                        api_key=upstage_api_key,
+                        model=mood_model,
+                        rpm=mood_rpm,
+                        concurrency=mood_concurrency,
+                        batch_size=mood_batch_size,
+                        rebuild_embedding_text=True,
+                    )
+                    logger.info(
+                        "kaggle_batch_mood_enriched",
+                        batch_start=batch_start,
+                        total=mood_stats["total"],
+                        enriched=mood_stats["enriched"],
+                        elapsed_s=mood_stats["elapsed_s"],
+                    )
+                except Exception as e:
+                    # mood 실패는 치명적 X — fallback mood 유지
+                    logger.error(
+                        "kaggle_batch_mood_failed_continue_with_fallback",
+                        batch_start=batch_start,
+                        error=str(e)[:200],
+                    )
+
+            # 4b. 임베딩 생성 (mood 보강된 embedding_text 사용)
             texts = [doc.embedding_text for doc in batch]
             embeddings = embed_texts(texts, batch_size=embedding_batch_size)
 
-            # 4b. Qdrant 적재
+            # 4c. Qdrant 적재
             qdrant_count = await load_to_qdrant(batch, embeddings)
 
             # 4c. Neo4j 적재
@@ -230,6 +289,33 @@ if __name__ == "__main__":
         default=50,
         help="Upstage 임베딩 API 배치 크기 (기본: 50, Rate Limit 100RPM)",
     )
+    # Phase ML-4 일관성: 청크 단위 Solar Pro 3 무드태그 통합
+    parser.add_argument(
+        "--mood-provider",
+        choices=["upstage", "fallback"],
+        default="upstage",
+        help=(
+            "청크 단위 무드태그 생성 방식. "
+            "'upstage' (기본): Solar Pro 3 배치 API + embedding_text 재생성, "
+            "'fallback': kaggle_enricher의 fallback mood 유지"
+        ),
+    )
+    parser.add_argument(
+        "--mood-model", type=str, default="solar-pro3",
+        help="Upstage 모델명 (기본: solar-pro3)",
+    )
+    parser.add_argument(
+        "--mood-rpm", type=int, default=100,
+        help="Solar API 분당 호출 한도 (기본: 100)",
+    )
+    parser.add_argument(
+        "--mood-concurrency", type=int, default=20,
+        help="Solar API 동시 호출 수 (기본: 20)",
+    )
+    parser.add_argument(
+        "--mood-batch-size", type=int, default=10,
+        help="1회 Solar API 호출당 영화 수 (기본: 10)",
+    )
     parser.add_argument(
         "--status",
         action="store_true",
@@ -245,5 +331,10 @@ if __name__ == "__main__":
                 kaggle_dir=args.kaggle_dir,
                 batch_size=args.batch_size,
                 embedding_batch_size=args.embedding_batch_size,
+                mood_provider=args.mood_provider,
+                mood_model=args.mood_model,
+                mood_rpm=args.mood_rpm,
+                mood_concurrency=args.mood_concurrency,
+                mood_batch_size=args.mood_batch_size,
             )
         )

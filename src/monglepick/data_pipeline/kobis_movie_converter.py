@@ -83,10 +83,69 @@ def _extract_year(open_dt: str, prdt_year: str) -> int:
 
 
 def _extract_director(directors: list[dict]) -> str:
-    """감독 목록에서 첫 번째 감독명을 추출한다."""
+    """감독 목록에서 첫 번째 감독명을 추출한다 (호환성 유지용 — 한글만)."""
     if directors and directors[0].get("peopleNm"):
         return directors[0]["peopleNm"]
     return ""
+
+
+def _extract_director_bilingual(directors: list[dict]) -> tuple[str, str]:
+    """
+    감독의 한글 + 영문 이름을 튜플로 반환한다 (Phase ML-2 일관성).
+
+    KOBIS API의 directors[0].peopleNm (한글) + peopleNmEn (영문)을 모두 활용한다.
+    한영이 같으면 영문은 빈 문자열 반환 (TMDB extract_director_names와 동일 정책).
+
+    Args:
+        directors: KOBIS API의 directors 배열
+            예: [{"peopleNm": "봉준호", "peopleNmEn": "BONG Joon-ho"}]
+
+    Returns:
+        (director_kr, director_original_name) 튜플.
+        - 한글 이름이 없으면 ("", "") 반환
+        - 한영이 같으면 영문은 "" 반환 (중복 저장 방지)
+    """
+    if not directors or not directors[0].get("peopleNm"):
+        return ("", "")
+    name_kr = directors[0]["peopleNm"]
+    name_en = directors[0].get("peopleNmEn", "") or ""
+    if name_en == name_kr:
+        return (name_kr, "")
+    return (name_kr, name_en)
+
+
+def _extract_cast_bilingual(actors: list[dict], top_n: int = 5) -> list[str]:
+    """
+    배우 상위 N명을 한영 이중 리스트로 반환한다 (Phase ML-2 일관성).
+
+    KOBIS API의 actors[].peopleNm (한글) + peopleNmEn (영문)을 모두 추출하여
+    중복 제거된 리스트를 반환한다. TMDB의 extract_cast_names()와 동일 정책으로
+    "송강호" / "SONG Kang-ho" 어느 쪽으로 검색해도 매칭되도록 한다.
+
+    Args:
+        actors: KOBIS API의 actors 배열
+            예: [{"peopleNm": "송강호", "peopleNmEn": "SONG Kang-ho", "cast": "기택"}]
+        top_n: 상위 N명 (기본 5)
+
+    Returns:
+        한영 이중 리스트 (최대 top_n*2개)
+        예: ["송강호", "SONG Kang-ho", "이병헌", "LEE Byung-hun", ...]
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for actor in actors[:top_n]:
+        name_kr = (actor.get("peopleNm", "") or "").strip()
+        name_en = (actor.get("peopleNmEn", "") or "").strip()
+
+        if name_kr and name_kr not in seen:
+            result.append(name_kr)
+            seen.add(name_kr)
+        if name_en and name_en != name_kr and name_en not in seen:
+            result.append(name_en)
+            seen.add(name_en)
+
+    return result
 
 
 def _build_embedding_text(
@@ -95,22 +154,38 @@ def _build_embedding_text(
     director: str,
     actors: list[str] | None = None,
     nation: str = "",
+    title_en: str = "",
+    director_original_name: str = "",
 ) -> str:
     """
     KOBIS 영화용 임베딩 텍스트를 생성한다.
 
-    TMDB와 달리 overview/keywords/mood_tags가 없으므로
-    제목, 장르, 감독, 배우, 국가만으로 구성한다.
+    Phase ML-2 일관성 (2026-04-08 보강):
+        - title_en 추가: 영문 제목 검색 매칭
+        - director_original_name 추가: "BONG Joon-ho" 검색 매칭
+        - actors 인자는 _extract_cast_bilingual()이 한영 이중으로 채우므로
+          [출연] 섹션에 한영 이름이 자동 포함됨
 
-    형식: [제목] {title} [장르] {genres} [감독] {director} [출연] {actors} [국가] {nation}
+    TMDB와 달리 overview/keywords/mood_tags가 없으므로 제목/장르/감독/배우/국가만으로
+    구성하지만, Phase ML-2의 한영 이중 정책을 동일하게 따른다.
+
+    형식: [제목] {title} [영문제목] {title_en} [장르] {genres}
+          [감독] {director} [감독원어] {director_original_name}
+          [출연] {actors} [국가] {nation}
     """
     parts = [f"[제목] {title}"]
+    # Phase ML-2: 영문 제목이 있고 한글과 다르면 추가
+    if title_en and title_en != title:
+        parts.append(f"[영문제목] {title_en}")
     if genres:
         parts.append(f"[장르] {', '.join(genres)}")
     if director:
         parts.append(f"[감독] {director}")
+    # Phase ML-2: 감독 원어 이름이 있으면 추가
+    if director_original_name and director_original_name != director:
+        parts.append(f"[감독원어] {director_original_name}")
     if actors:
-        parts.append(f"[출연] {', '.join(actors[:5])}")
+        parts.append(f"[출연] {', '.join(actors[:10])}")  # 한영 이중이므로 top_n*2 수용
     if nation:
         parts.append(f"[국가] {nation}")
     return " ".join(parts)
@@ -157,9 +232,9 @@ def kobis_list_to_movie_document(
     rep_nation = kobis_movie.get("repNationNm", "")
     type_nm = kobis_movie.get("typeNm", "")
 
-    # 감독 추출
+    # 감독 추출 — Phase ML-2 일관성: 한영 이중 (peopleNm + peopleNmEn)
     directors_raw = kobis_movie.get("directors", [])
-    director = _extract_director(directors_raw)
+    director, director_original_name = _extract_director_bilingual(directors_raw)
 
     # 제작사 추출
     companies_raw = kobis_movie.get("companys", [])
@@ -189,9 +264,9 @@ def kobis_list_to_movie_document(
     kobis_genres_detail: list[str] = []
 
     if detail_data:
-        # 배우 추출
+        # 배우 추출 — Phase ML-2 일관성: 한영 이중 (peopleNm + peopleNmEn)
         actors_raw = detail_data.get("actors", [])
-        cast = [a.get("peopleNm", "") for a in actors_raw[:5] if a.get("peopleNm")]
+        cast = _extract_cast_bilingual(actors_raw, top_n=5)
         cast_characters = [
             {
                 "name": a.get("peopleNm", ""),
@@ -258,10 +333,10 @@ def kobis_list_to_movie_document(
             if not genres:
                 genres = _parse_genres(",".join(kobis_genres_detail))
 
-        # 감독 (상세 API에서 더 정확한 정보)
+        # 감독 (상세 API에서 더 정확한 정보) — Phase ML-2: 한영 이중
         directors_detail = detail_data.get("directors", [])
         if directors_detail:
-            director = directors_detail[0].get("peopleNm", director)
+            director, director_original_name = _extract_director_bilingual(directors_detail)
             kobis_directors = [
                 {"peopleNm": d.get("peopleNm", ""), "peopleNmEn": d.get("peopleNmEn", "")}
                 for d in directors_detail
@@ -277,11 +352,13 @@ def kobis_list_to_movie_document(
         sales_acc = boxoffice_data.get("sales_acc", 0)
         screen_count = boxoffice_data.get("scrn_cnt", 0)
 
-    # ── 임베딩 텍스트 생성 ──
+    # ── 임베딩 텍스트 생성 — Phase ML-2: title_en + director_original_name 포함 ──
     embedding_text = _build_embedding_text(
         title=title,
+        title_en=title_en,
         genres=genres,
         director=director,
+        director_original_name=director_original_name,
         actors=cast,
         nation=nation_alt or rep_nation,
     )
@@ -302,6 +379,7 @@ def kobis_list_to_movie_document(
             runtime=runtime,
             genres=genres,
             director=director,
+            director_original_name=director_original_name,  # Phase ML-2: 한영 이중
             cast=cast,
             cast_characters=cast_characters,
             certification=certification,
@@ -482,6 +560,337 @@ def dedup_kobis_movies(
     )
 
     return deduped
+
+
+def split_kobis_movies(
+    kobis_movies: list[dict],
+    db_movies: list[dict],
+    exclude_ids: set[str | int] | None = None,
+) -> tuple[list[tuple[str, dict]], list[dict]]:
+    """
+    KOBIS 영화 목록을 (enrichment_targets, new_movies) 로 분리한다.
+
+    기존 dedup_kobis_movies 와 동일한 매칭 로직을 사용하지만,
+    중복 영화를 "skip" 대신 **"enrichment_targets"** 로 보존하여
+    기존 DB 영화에 KOBIS 풍부 데이터 (한국 개봉일, 관객수, 한국 제작사,
+    한국어 감독/배우/스태프, 한국 등급 등) 를 **병합** 할 수 있게 한다.
+
+    매칭 기준:
+        1. ID 기반 (movieCd 가 exclude_ids 에 있음)
+        2. 정규화 한국어 제목 + 연도 ±1
+        3. 정규화 영문 제목 + 연도 ±1
+
+    2026-04-09 신규: 사용자의 "데이터 품질 우선" 원칙에 따라,
+    기존 영화에 KOBIS 정보 유실 차단. run_kobis_load.py 가 이 함수로
+    분리한 enrichment_targets 를 Qdrant + ES + Neo4j 3DB partial update 로 반영.
+
+    Args:
+        kobis_movies: KOBIS searchMovieList 응답 리스트
+        db_movies: Qdrant 에서 로드한 기존 DB 영화 리스트
+            각 항목: {'id': '157336', 'title': '인터스텔라', 'title_en': '...', 'release_year': 2014}
+        exclude_ids: 추가 제외 ID 집합 (현재는 skip 대신 enrichment 후보로 분류)
+
+    Returns:
+        (enrichment_targets, new_movies)
+        - enrichment_targets: [(existing_movie_id, kobis_raw_dict), ...]
+          기존 영화 ID + 병합할 KOBIS 원본 데이터 쌍
+        - new_movies: [kobis_raw_dict, ...]
+          DB 에 없는 신규 영화 (KOBIS 에만 있는 한국 영화)
+    """
+    # ── db_movies 인덱스 구축 (제목+연도 → movie_id) ──
+    # dedup_kobis_movies 는 set 만 사용했지만 split 에서는 매칭 시
+    # 기존 movie_id 를 찾아야 하므로 dict 로 유지한다.
+    db_index_kr: dict[tuple[str, int], str] = {}
+    db_index_en: dict[tuple[str, int], str] = {}
+
+    for movie in db_movies:
+        year = int(movie.get("release_year", 0)) if movie.get("release_year") else 0
+        if year < 1900:
+            continue
+
+        mid = str(movie.get("id", ""))
+        if not mid:
+            continue
+
+        title_kr = _normalize_title(movie.get("title", ""))
+        if title_kr:
+            db_index_kr.setdefault((title_kr, year), mid)
+
+        title_en = _normalize_title(movie.get("title_en", ""))
+        if title_en:
+            db_index_en.setdefault((title_en, year), mid)
+
+    # ID 기반 기존 영화 lookup (KOBIS movieCd → db movie_id)
+    # exclude_ids 가 db_movies 와 동일 범위라고 가정할 수 없으므로,
+    # kobis_movie_cd 가 이미 db 에 저장된 경우 매칭
+    db_index_by_kobis_cd: dict[str, str] = {}
+    for movie in db_movies:
+        k_cd = str(movie.get("kobis_movie_cd", "") or "")
+        if k_cd:
+            db_index_by_kobis_cd[k_cd] = str(movie.get("id", ""))
+
+    logger.info(
+        "kobis_split_index_built",
+        kr_index=len(db_index_kr),
+        en_index=len(db_index_en),
+        kobis_cd_index=len(db_index_by_kobis_cd),
+        db_movies_total=len(db_movies),
+    )
+
+    enrichment_targets: list[tuple[str, dict]] = []
+    new_movies: list[dict] = []
+    id_matched = 0
+    title_matched = 0
+
+    for kobis in kobis_movies:
+        movie_cd = kobis.get("movieCd", "")
+        matched_id: str | None = None
+
+        # 1차: KOBIS movieCd 기반 매칭 (이미 KOBIS 로 보강된 영화)
+        if movie_cd and movie_cd in db_index_by_kobis_cd:
+            matched_id = db_index_by_kobis_cd[movie_cd]
+            id_matched += 1
+
+        # 연도 추출 (제목 매칭 준비)
+        if not matched_id:
+            open_dt = kobis.get("openDt", "")
+            prdt_year = kobis.get("prdtYear", "")
+            year = 0
+            if open_dt and len(open_dt) >= 4:
+                try:
+                    year = int(open_dt[:4])
+                except ValueError:
+                    pass
+            if not year and prdt_year:
+                try:
+                    year = int(prdt_year)
+                except ValueError:
+                    pass
+
+            # 연도 없으면 신규 처리
+            if year < 1900 or year > 2100:
+                new_movies.append(kobis)
+                continue
+
+            # 2차: 한국어 제목 + 연도 ±1
+            kobis_title_kr = _normalize_title(kobis.get("movieNm", ""))
+            if kobis_title_kr:
+                for y_offset in (0, -1, 1):
+                    key = (kobis_title_kr, year + y_offset)
+                    if key in db_index_kr:
+                        matched_id = db_index_kr[key]
+                        title_matched += 1
+                        break
+
+            # 3차: 영문 제목 + 연도 ±1
+            if not matched_id:
+                kobis_title_en = _normalize_title(kobis.get("movieNmEn", ""))
+                if kobis_title_en:
+                    for y_offset in (0, -1, 1):
+                        key = (kobis_title_en, year + y_offset)
+                        if key in db_index_en:
+                            matched_id = db_index_en[key]
+                            title_matched += 1
+                            break
+
+        if matched_id:
+            enrichment_targets.append((matched_id, kobis))
+        else:
+            new_movies.append(kobis)
+
+    logger.info(
+        "kobis_split_complete",
+        total_kobis=len(kobis_movies),
+        enrichment_targets=len(enrichment_targets),
+        new_movies=len(new_movies),
+        id_matched=id_matched,
+        title_matched=title_matched,
+    )
+
+    return enrichment_targets, new_movies
+
+
+def build_kobis_enrichment_payload(
+    kobis_raw: dict,
+    detail_data: dict | None = None,
+    boxoffice_data: dict | None = None,
+) -> dict:
+    """
+    KOBIS 원본 데이터를 기존 영화 (이미 TMDB 로 적재됨) 에 병합할
+    enrichment payload dict 로 변환한다.
+
+    KOBIS 고유 데이터 (한국 관객/매출, 한국 제작사/감독/배우/스태프,
+    한국 개봉일, 한국 등급) 만 포함한다. TMDB 에 이미 있는 필드
+    (title/overview/genres/director 등) 는 기존 값 보존 우선이므로 제외.
+
+    단, 기존 영화에 **비어있던 필드** 는 KOBIS 가 채워준다:
+    - director_original_name (TMDB 외국어 데이터가 없거나 한국어만 있는 경우)
+    - cast_original_names (한국인 배우의 영문명)
+
+    Args:
+        kobis_raw: KOBIS searchMovieList 원본 dict
+        detail_data: searchMovieInfo 응답 (actors/staffs/watch_grade 등, 선택)
+        boxoffice_data: 박스오피스 집계 (audi_acc/sales_acc/scrn_cnt, 선택)
+
+    Returns:
+        Qdrant set_payload / ES update / Neo4j SET 에 바로 쓸 수 있는 dict.
+        list[dict] 필드 (kobis_directors 등) 는 그대로 포함 — 각 DB loader 가
+        자체 직렬화 (es_loader._serialize_enrichment_for_es,
+        neo4j_loader._filter_neo4j_props) 로 알맞게 처리.
+    """
+    movie_cd = kobis_raw.get("movieCd", "")
+    out: dict = {
+        "kobis_movie_cd": movie_cd,
+    }
+
+    # ── Phase ML-1 한영 이중 핵심: 영문 제목 보강 ──
+    # 한국 영화의 title_en 이 TMDB preprocessor 버그로 한국어로 저장된 경우,
+    # KOBIS movieNmEn 으로 덮어쓴다. (예: 기생충 → Parasite / PARASITE)
+    movie_nm_en = (kobis_raw.get("movieNmEn", "") or "").strip()
+    if movie_nm_en:
+        # PARASITE → Parasite (title case, 가독성)
+        out["title_en"] = movie_nm_en.title() if movie_nm_en.isupper() else movie_nm_en
+
+    # ── 개봉일 ──
+    open_dt = (kobis_raw.get("openDt", "") or "").replace("-", "")
+    if open_dt:
+        out["kobis_open_dt"] = open_dt
+
+    # ── 국가/유형 ──
+    nation_alt = kobis_raw.get("nationAlt", "") or kobis_raw.get("repNationNm", "")
+    if nation_alt:
+        out["kobis_nation"] = nation_alt
+    type_nm = kobis_raw.get("typeNm", "")
+    if type_nm:
+        out["kobis_type_nm"] = type_nm
+
+    # ── 목록 API 감독 (한영 이중) ──
+    directors_raw = kobis_raw.get("directors", []) or []
+    if directors_raw:
+        out["kobis_directors"] = [
+            {
+                "peopleNm": d.get("peopleNm", ""),
+                "peopleNmEn": d.get("peopleNmEn", ""),
+            }
+            for d in directors_raw
+        ]
+
+    # ── 목록 API 제작사 ──
+    companies_raw = kobis_raw.get("companys", []) or []
+    if companies_raw:
+        out["kobis_companies"] = [
+            {
+                "companyCd": c.get("companyCd", ""),
+                "companyNm": c.get("companyNm", ""),
+                "companyNmEn": c.get("companyNmEn", ""),
+                "companyPartNm": c.get("companyPartNm", ""),
+            }
+            for c in companies_raw
+        ]
+
+    # ── 목록 API 장르 ──
+    genre_alt = kobis_raw.get("genreAlt", "")
+    if genre_alt:
+        out["kobis_genres"] = [g.strip() for g in genre_alt.split(",") if g.strip()]
+
+    # ── 상세 API 보강 (detail_data) ──
+    if detail_data:
+        # 배우 — Phase ML-1 한영 이중
+        actors_raw = detail_data.get("actors", []) or []
+        if actors_raw:
+            out["kobis_actors"] = [
+                {
+                    "peopleNm": a.get("peopleNm", ""),
+                    "peopleNmEn": a.get("peopleNmEn", ""),
+                    "cast": a.get("cast", ""),
+                    "castEn": a.get("castEn", ""),
+                }
+                for a in actors_raw
+            ]
+
+            # Phase ML-1 핵심: 주요 배우 영문명 추출 (TMDB cast 한글 저장 버그 보강)
+            # (예: 기생충 → ['Song Kang-ho', 'Lee Sun-kyun', 'Cho Yeo-jeong', ...])
+            cast_original = [
+                (a.get("peopleNmEn", "") or "").strip()
+                for a in actors_raw[:10]
+                if (a.get("peopleNmEn", "") or "").strip()
+            ]
+            if cast_original:
+                out["cast_original_names"] = cast_original
+
+        # 감독 (상세 API 가 더 정확) — 기존 list 대체
+        directors_detail = detail_data.get("directors", []) or []
+        if directors_detail:
+            out["kobis_directors"] = [
+                {
+                    "peopleNm": d.get("peopleNm", ""),
+                    "peopleNmEn": d.get("peopleNmEn", ""),
+                }
+                for d in directors_detail
+            ]
+            # 기존 영화의 director_original_name 이 비어있으면 보강
+            dir_en = (directors_detail[0].get("peopleNmEn", "") or "").strip()
+            if dir_en:
+                out["director_original_name"] = dir_en
+
+        # 회사 (상세)
+        companys_detail = detail_data.get("companys", []) or []
+        if companys_detail:
+            out["kobis_companies"] = [
+                {
+                    "companyCd": c.get("companyCd", ""),
+                    "companyNm": c.get("companyNm", ""),
+                    "companyNmEn": c.get("companyNmEn", ""),
+                    "companyPartNm": c.get("companyPartNm", ""),
+                }
+                for c in companys_detail
+            ]
+
+        # 스태프 (각본/촬영/음악/편집 등)
+        staffs_raw = detail_data.get("staffs", []) or []
+        if staffs_raw:
+            out["kobis_staffs"] = [
+                {
+                    "peopleNm": s.get("peopleNm", ""),
+                    "peopleNmEn": s.get("peopleNmEn", ""),
+                    "staffRoleNm": s.get("staffRoleNm", ""),
+                }
+                for s in staffs_raw
+            ]
+
+        # 장르 (상세)
+        genres_detail = detail_data.get("genres", []) or []
+        if genres_detail:
+            out["kobis_genres"] = [
+                g.get("genreNm", "") for g in genres_detail if g.get("genreNm")
+            ]
+
+        # 관람등급
+        audits_raw = detail_data.get("audits", []) or []
+        if audits_raw:
+            grade = audits_raw[0].get("watchGradeNm", "")
+            if grade:
+                out["kobis_watch_grade"] = grade
+
+        # 상영시간 (기존 영화에 runtime 이 비어있을 때만 보강)
+        # detail_map 키는 run_kobis_load 가 KOBISRawMovie.show_tm (snake_case) 로 저장
+        show_tm = detail_data.get("show_tm", "") or detail_data.get("showTm", "")
+        if show_tm:
+            try:
+                out["runtime_kobis"] = int(show_tm)
+            except (ValueError, TypeError):
+                pass
+
+    # ── 박스오피스 보강 ──
+    if boxoffice_data:
+        if boxoffice_data.get("audi_acc"):
+            out["audience_count"] = int(boxoffice_data["audi_acc"])
+        if boxoffice_data.get("sales_acc"):
+            out["sales_acc"] = int(boxoffice_data["sales_acc"])
+        if boxoffice_data.get("scrn_cnt"):
+            out["screen_count"] = int(boxoffice_data["scrn_cnt"])
+
+    return out
 
 
 def convert_kobis_movies(

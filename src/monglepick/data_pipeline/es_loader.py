@@ -205,3 +205,171 @@ async def load_to_elasticsearch(
     )
 
     return success_count
+
+
+# ============================================================
+# Partial update 헬퍼 (Phase 2 enrichment 3DB 동기화용)
+# ============================================================
+
+
+def _serialize_enrichment_for_es(payload: dict) -> dict:
+    """
+    KOBIS/KMDb enrichment payload 를 ES 매핑에 맞게 직렬화한다.
+
+    ES 는 list[dict] 를 직접 저장하지 못하므로 (nested/object 타입 지정 안 됨)
+    KOBIS list[dict] 필드들을 BM25 토큰화 가능한 텍스트로 변환한다.
+    기존 _movie_to_es_doc() 의 변환 로직과 동일 규칙.
+
+    Args:
+        payload: KOBIS/KMDb enricher 가 생성한 부분 업데이트 dict.
+                 값은 str/int/float/list[str]/list[dict] 모두 가능.
+
+    Returns:
+        ES update body 의 `doc` 에 바로 들어갈 수 있는 dict.
+    """
+    out: dict = {}
+    for key, value in payload.items():
+        if value is None or value == "" or value == 0:
+            continue
+
+        # KOBIS list[dict] 필드 → 공백 구분 텍스트
+        if key == "kobis_directors" and isinstance(value, list):
+            out[key] = " ".join(
+                d.get("peopleNm", "") for d in value if isinstance(d, dict)
+            )
+            continue
+        if key == "kobis_actors" and isinstance(value, list):
+            out[key] = " ".join(
+                f"{a.get('peopleNm', '')}({a.get('cast', '')})"
+                for a in value if isinstance(a, dict)
+            )
+            continue
+        if key == "kobis_companies" and isinstance(value, list):
+            out[key] = " ".join(
+                f"{c.get('companyNm', '')}({c.get('companyPartNm', '')})"
+                for c in value if isinstance(c, dict)
+            )
+            continue
+        if key == "kobis_staffs" and isinstance(value, list):
+            out[key] = " ".join(
+                f"{s.get('peopleNm', '')}({s.get('staffRoleNm', '')})"
+                for s in value if isinstance(s, dict)
+            )
+            continue
+        if key == "production_companies" and isinstance(value, list):
+            out[key] = " ".join(
+                c.get("name", "") for c in value if isinstance(c, dict)
+            )
+            continue
+        if key == "alternative_titles" and isinstance(value, list):
+            out[key] = [
+                t.get("title", "") for t in value
+                if isinstance(t, dict) and t.get("title")
+            ]
+            continue
+        if key == "cast_characters" and isinstance(value, list):
+            out[key] = " ".join(
+                f"{c.get('name', '')}({c.get('character', '')})"
+                for c in value if isinstance(c, dict)
+            )
+            continue
+        # cast / cast_original_names / keywords: list[str] → 공백 구분
+        if key in ("cast", "cast_members", "cast_original_names", "keywords") and isinstance(value, list):
+            out[key] = " ".join(str(x) for x in value if x)
+            continue
+
+        # 나머지 (기본 타입 + list[str] + list[numeric]) 그대로
+        out[key] = value
+
+    return out
+
+
+async def update_movie_partial(movie_id: str, enrichment: dict) -> bool:
+    """
+    단일 영화의 특정 필드만 부분 업데이트 (ES Update API).
+
+    KOBIS/KMDb enrichment 를 기존 ES 문서에 병합할 때 사용한다.
+    문서가 없으면 404 → False 반환 (new movie 는 load_to_elasticsearch 경유).
+
+    Args:
+        movie_id: ES `_id` (보통 TMDB ID 문자열)
+        enrichment: 업데이트할 필드 dict. KOBIS list[dict] 등은 자동 직렬화.
+
+    Returns:
+        성공 True, 문서 없음/실패 False
+    """
+    if not enrichment:
+        return False
+
+    client = await get_elasticsearch()
+    es_doc = _serialize_enrichment_for_es(enrichment)
+    if not es_doc:
+        return False
+
+    try:
+        await client.update(
+            index=ES_INDEX_NAME,
+            id=movie_id,
+            body={"doc": es_doc},
+        )
+        return True
+    except Exception as e:
+        msg = str(e)
+        if "not_found" in msg or "404" in msg:
+            logger.debug("es_update_not_found", movie_id=movie_id)
+            return False
+        logger.warning("es_update_failed", movie_id=movie_id, error=msg[:200])
+        return False
+
+
+async def update_movies_partial_bulk(updates: list[tuple[str, dict]]) -> int:
+    """
+    여러 영화의 부분 업데이트를 bulk API 로 일괄 처리.
+
+    Args:
+        updates: [(movie_id, enrichment_dict), ...]
+
+    Returns:
+        성공 건수
+    """
+    if not updates:
+        return 0
+
+    client = await get_elasticsearch()
+
+    actions = []
+    for movie_id, enrichment in updates:
+        es_doc = _serialize_enrichment_for_es(enrichment)
+        if not es_doc:
+            continue
+        actions.append({
+            "_op_type": "update",
+            "_index": ES_INDEX_NAME,
+            "_id": movie_id,
+            "doc": es_doc,
+            "doc_as_upsert": False,  # 존재하지 않는 doc 은 무시
+        })
+
+    if not actions:
+        return 0
+
+    success, errors = await async_bulk(
+        client,
+        actions,
+        chunk_size=500,
+        raise_on_error=False,
+        raise_on_exception=False,
+    )
+
+    if errors:
+        # not_found 는 정상 (enrichment 대상이 아직 적재 안 됨)
+        real_errors = [
+            e for e in errors
+            if "not_found" not in str(e) and "404" not in str(e)
+        ]
+        if real_errors:
+            logger.warning("es_bulk_update_errors", count=len(real_errors))
+
+    await client.indices.refresh(index=ES_INDEX_NAME)
+    logger.info("es_partial_bulk_done", success=success, total=len(actions))
+    return success

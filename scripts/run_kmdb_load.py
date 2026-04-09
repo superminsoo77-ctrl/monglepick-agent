@@ -42,13 +42,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import structlog  # noqa: E402
 
 from monglepick.data_pipeline.embedder import embed_texts  # noqa: E402
-from monglepick.data_pipeline.es_loader import load_to_elasticsearch  # noqa: E402
+from monglepick.data_pipeline.es_loader import (  # noqa: E402
+    load_to_elasticsearch,
+    update_movies_partial_bulk,
+)
 from monglepick.data_pipeline.kmdb_collector import KMDbCollector  # noqa: E402
 from monglepick.data_pipeline.kmdb_enricher import (  # noqa: E402
+    build_kmdb_full_enrichment_payload,
     build_title_index,
     process_kmdb_batch,
 )
-from monglepick.data_pipeline.neo4j_loader import load_to_neo4j  # noqa: E402
+# Phase ML-4 일관성: Solar Pro 3 배치 무드태그 + embedding_text 재생성
+from monglepick.data_pipeline.mood_batch import enrich_documents_with_solar_mood  # noqa: E402
+from monglepick.data_pipeline.neo4j_loader import (  # noqa: E402
+    load_to_neo4j,
+    update_movies_properties_bulk,
+)
 from monglepick.data_pipeline.qdrant_loader import load_to_qdrant  # noqa: E402
 from monglepick.db.clients import init_all_clients, close_all_clients  # noqa: E402
 from monglepick.config import settings  # noqa: E402
@@ -148,45 +157,65 @@ def _get_existing_movies_from_qdrant() -> list[dict]:
 # Qdrant payload 보강 (기존 영화에 KMDb 데이터 추가)
 # ============================================================
 
-async def _apply_enrichments(enrichments: list[dict]) -> int:
+async def _apply_enrichments_3db(enrichments: list[dict]) -> int:
     """
-    기존 Qdrant 포인트에 KMDb 보강 데이터를 추가한다.
+    기존 영화에 KMDb 풍부 데이터를 Qdrant + Elasticsearch + Neo4j 3DB 에
+    partial update 한다 (2026-04-09 확장).
 
-    set_payload로 기존 payload를 덮어쓰지 않고 필드 단위로 갱신한다.
-    빈 문자열이나 0인 값은 갱신하지 않는다.
-    동기 QdrantClient를 executor에서 실행하여 이벤트 루프 블로킹을 방지한다.
+    기존 `_apply_enrichments` 는 Qdrant 만 갱신했으나, ES/Neo4j 가 뒤처져
+    3DB 불일치가 발생했다. 본 함수는 3DB 를 동시에 갱신하여 일관성 보장.
+
+    MySQL 은 Phase 3 의 run_mysql_sync.py 가 Qdrant → MySQL 로 sync 하므로
+    여기서는 제외 (Qdrant payload 갱신 → MySQL 자동 전파).
 
     Args:
         enrichments: [{"existing_id": str, "data": {...}}, ...]
+                     process_kmdb_batch 가 반환하는 형식.
+                     data 는 extract_enrichment_data 또는
+                     build_kmdb_full_enrichment_payload 의 결과.
 
     Returns:
-        보강 완료 건수
+        Qdrant 에서 실제 업데이트된 건수 (3DB 중 가장 보수적)
     """
-    def _sync_apply() -> int:
-        """동기 환경에서 set_payload를 배치 실행한다."""
+    if not enrichments:
+        return 0
+
+    # ── 1. enrichment item 을 (movie_id, enrichment_dict) 형태로 정규화 ──
+    bulk_updates: list[tuple[str, dict]] = []
+    for item in enrichments:
+        existing_id = item["existing_id"]
+        data = item["data"] or {}
+
+        # 빈 값 필터링
+        clean_data = {
+            k: v for k, v in data.items()
+            if v not in (None, "", [], {}) and v != 0
+        }
+        if not clean_data:
+            continue
+
+        # 특수 키 재매핑 (_kmdb 접미어 등 호출 측 보강)
+        # - plot_korean / overview_en_kmdb / cast_original_names_kmdb /
+        #   certification_kmdb / trailer_url_kmdb 는 호출 측에서
+        #   기존 값이 비어있을 때만 적용해야 하므로 여기서 결정하지 않음.
+        #   Qdrant payload 에 _kmdb 필드로 그대로 저장한다.
+
+        bulk_updates.append((str(existing_id), clean_data))
+
+    if not bulk_updates:
+        return 0
+
+    # ── 2. Qdrant set_payload (sync executor) ──
+    def _sync_qdrant_apply() -> int:
         from qdrant_client import QdrantClient
 
         sync_client = QdrantClient(url=settings.QDRANT_URL, check_compatibility=False)
-        enriched = 0
+        ok = 0
 
-        for item in enrichments:
-            existing_id = item["existing_id"]
-            data = item["data"]
-
-            # 빈 값 필터링 (빈 문자열, 0, 빈 리스트는 갱신하지 않음)
-            payload_update = {}
-            for key, value in data.items():
-                if value and value != 0:
-                    payload_update[key] = value
-
-            if not payload_update:
-                continue
-
+        for existing_id, payload_update in bulk_updates:
             try:
-                # Qdrant ID 타입 결정 (숫자면 int, 아니면 그대로)
-                point_id: int | str
                 try:
-                    point_id = int(existing_id)
+                    point_id: int | str = int(existing_id)
                 except (ValueError, TypeError):
                     point_id = existing_id
 
@@ -195,24 +224,53 @@ async def _apply_enrichments(enrichments: list[dict]) -> int:
                     payload=payload_update,
                     points=[point_id],
                 )
-                enriched += 1
+                ok += 1
 
             except Exception as e:
-                logger.warning("enrich_failed", id=existing_id, error=str(e))
+                logger.debug(
+                    "kmdb_qdrant_enrich_failed",
+                    id=existing_id, error=str(e)[:100],
+                )
 
-            # 1000건마다 진행률 로깅
-            if enriched > 0 and enriched % 1000 == 0:
-                logger.info("enrich_progress", enriched=enriched, total=len(enrichments))
+            if ok > 0 and ok % 1000 == 0:
+                logger.info(
+                    "kmdb_qdrant_enrich_progress",
+                    enriched=ok, total=len(bulk_updates),
+                )
 
         sync_client.close()
-        return enriched
+        return ok
 
-    # executor에서 동기 함수 실행 (이벤트 루프 블로킹 방지)
     loop = asyncio.get_event_loop()
-    enriched = await loop.run_in_executor(None, _sync_apply)
+    qdrant_ok = await loop.run_in_executor(None, _sync_qdrant_apply)
+    logger.info("kmdb_qdrant_enriched", count=qdrant_ok)
 
-    logger.info("enrichments_applied", count=enriched, total=len(enrichments))
-    return enriched
+    # ── 3. Elasticsearch bulk partial update ──
+    try:
+        es_ok = await update_movies_partial_bulk(bulk_updates)
+        logger.info("kmdb_es_enriched", count=es_ok)
+    except Exception as e:
+        logger.warning("kmdb_es_enrich_failed", error=str(e)[:200])
+
+    # ── 4. Neo4j bulk SET 속성 ──
+    try:
+        neo4j_ok = await update_movies_properties_bulk(bulk_updates)
+        logger.info("kmdb_neo4j_enriched", count=neo4j_ok)
+    except Exception as e:
+        logger.warning("kmdb_neo4j_enrich_failed", error=str(e)[:200])
+
+    logger.info(
+        "kmdb_enrichments_applied_3db",
+        qdrant=qdrant_ok,
+        total=len(bulk_updates),
+    )
+    return qdrant_ok
+
+
+# Backwards-compat alias — 기존 호출부 보존
+async def _apply_enrichments(enrichments: list[dict]) -> int:
+    """Legacy wrapper — 이제 3DB sync 를 수행한다 (2026-04-09)."""
+    return await _apply_enrichments_3db(enrichments)
 
 
 # ============================================================
@@ -255,6 +313,11 @@ async def run_kmdb_load(
     use_cache: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
     embed_batch_size: int = DEFAULT_EMBED_BATCH,
+    mood_provider: str = "upstage",
+    mood_model: str = "solar-pro3",
+    mood_rpm: int = 100,
+    mood_concurrency: int = 20,
+    mood_batch_size: int = 10,
 ) -> None:
     """
     KMDb 데이터 수집 → 매칭 → 보강/신규 적재.
@@ -359,9 +422,28 @@ async def run_kmdb_load(
         else:
             print("\n[Step 4] 보강 대상 없음")
 
-        # ── Step 5 & 6: 신규 영화 임베딩 + 적재 ──
+        # ── Step 5 & 6: 신규 영화 mood 보강 + 임베딩 + 적재 ──
+        # Phase ML-4 일관성 (2026-04-08): 배치 단위 Solar Pro 3 정밀 mood 적용 후
+        # build_embedding_text 재생성 → Solar embedding → 적재. TMDB run_full_reload와 동일.
         if new_documents:
-            print(f"\n[Step 5-6] 신규 영화 임베딩 + 적재 ({len(new_documents):,}건)")
+            print(f"\n[Step 5-6] 신규 영화 mood 보강 + 임베딩 + 적재 ({len(new_documents):,}건)")
+
+            # mood_provider 사전 검증: API 키 없으면 fallback
+            upstage_api_key: str | None = None
+            if mood_provider == "upstage":
+                upstage_api_key = (
+                    settings.UPSTAGE_API_KEY
+                    if hasattr(settings, "UPSTAGE_API_KEY") and settings.UPSTAGE_API_KEY
+                    else None
+                )
+                if upstage_api_key:
+                    print(
+                        f"  무드 모드: upstage ({mood_model}, "
+                        f"rpm={mood_rpm}, concurrency={mood_concurrency}, batch={mood_batch_size})"
+                    )
+                else:
+                    logger.warning("kmdb_upstage_api_key_missing_fallback")
+                    mood_provider = "fallback"
 
             total_loaded = 0
             start_offset = checkpoint.get("batch_offset", 0)
@@ -374,14 +456,43 @@ async def run_kmdb_load(
                 batch = new_documents[batch_start:batch_end]
                 batch_start_time = time.time()
 
-                # 임베딩 (executor로 이벤트 루프 블로킹 방지)
+                # ── Step 5a (신규): Solar Pro 3 배치 mood 보강 ──
+                # kmdb_to_movie_document()가 fallback mood로 채운 mood_tags를
+                # Solar Pro 3로 덮어쓰고 embedding_text를 재생성한다.
+                if mood_provider == "upstage" and upstage_api_key:
+                    try:
+                        mood_stats = await enrich_documents_with_solar_mood(
+                            documents=batch,
+                            api_key=upstage_api_key,
+                            model=mood_model,
+                            rpm=mood_rpm,
+                            concurrency=mood_concurrency,
+                            batch_size=mood_batch_size,
+                            rebuild_embedding_text=True,
+                        )
+                        logger.info(
+                            "kmdb_batch_mood_enriched",
+                            batch_idx=batch_idx,
+                            total=mood_stats["total"],
+                            enriched=mood_stats["enriched"],
+                            elapsed_s=mood_stats["elapsed_s"],
+                        )
+                    except Exception as e:
+                        # mood 실패는 치명적 X — fallback mood로 진행
+                        logger.error(
+                            "kmdb_batch_mood_failed_continue_with_fallback",
+                            batch_idx=batch_idx,
+                            error=str(e)[:200],
+                        )
+
+                # ── Step 5b: 임베딩 (정밀 mood 반영된 embedding_text 사용) ──
                 texts = [doc.embedding_text for doc in batch]
                 loop = asyncio.get_event_loop()
                 embeddings = await loop.run_in_executor(
                     None, embed_texts, texts, embed_batch_size
                 )
 
-                # 3DB 적재
+                # ── Step 6: 3DB 적재 ──
                 qdrant_count = await load_to_qdrant(batch, embeddings)
                 await load_to_neo4j(batch)
                 es_count = await load_to_elasticsearch(batch)
@@ -481,6 +592,33 @@ if __name__ == "__main__":
         "--embed-batch-size", type=int, default=DEFAULT_EMBED_BATCH,
         help=f"Upstage 임베딩 배치 크기 (기본: {DEFAULT_EMBED_BATCH})",
     )
+    # Phase ML-4 일관성: 청크 단위 Solar Pro 3 무드태그 통합
+    parser.add_argument(
+        "--mood-provider",
+        choices=["upstage", "fallback"],
+        default="upstage",
+        help=(
+            "청크 단위 무드태그 생성 방식. "
+            "'upstage' (기본): Solar Pro 3 배치 API + embedding_text 재생성, "
+            "'fallback': kmdb_to_movie_document()의 fallback mood 유지"
+        ),
+    )
+    parser.add_argument(
+        "--mood-model", type=str, default="solar-pro3",
+        help="Upstage 모델명 (기본: solar-pro3)",
+    )
+    parser.add_argument(
+        "--mood-rpm", type=int, default=100,
+        help="Solar API 분당 호출 한도 (기본: 100)",
+    )
+    parser.add_argument(
+        "--mood-concurrency", type=int, default=20,
+        help="Solar API 동시 호출 수 (기본: 20)",
+    )
+    parser.add_argument(
+        "--mood-batch-size", type=int, default=10,
+        help="1회 Solar API 호출당 영화 수 (기본: 10)",
+    )
     parser.add_argument(
         "--status", action="store_true",
         help="현재 진행 상태만 확인",
@@ -497,5 +635,10 @@ if __name__ == "__main__":
                 use_cache=args.use_cache,
                 batch_size=args.batch_size,
                 embed_batch_size=args.embed_batch_size,
+                mood_provider=args.mood_provider,
+                mood_model=args.mood_model,
+                mood_rpm=args.mood_rpm,
+                mood_concurrency=args.mood_concurrency,
+                mood_batch_size=args.mood_batch_size,
             )
         )

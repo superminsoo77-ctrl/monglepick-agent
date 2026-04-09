@@ -192,6 +192,53 @@ class MovieUpdateRequest(BaseModel):
     poster_url: Optional[str] = None
 
 
+def _to_camel(s: str) -> str:
+    """snake_case → camelCase 변환 (Pydantic alias_generator 용)."""
+    parts = s.split("_")
+    return parts[0] + "".join(p.title() for p in parts[1:])
+
+
+class MovieCreateRequest(BaseModel):
+    """
+    영화 신규 등록 요청.
+
+    2026-04-08 추가: Backend AdminMovieController 의 수동 등록 경로를 Agent 로 통합하면서
+    도입되었다. 현재 구현은 MySQL movies 테이블에만 INSERT 하며, Qdrant/Neo4j/ES 에는
+    다음 파이프라인 재임베딩 시점에 반영된다 (`/admin/pipeline/run` 으로 수동 트리거 가능).
+
+    필수 필드는 movieId 와 title 뿐이며 나머지는 전부 선택이다.
+    관리자 UI(MovieMasterTab)는 camelCase 필드(movieId/tmdbId/...)로 요청을 전송하므로
+    Pydantic alias_generator 로 입력 시 자동 매핑되도록 한다.
+    """
+
+    class Config:
+        # UI 가 camelCase 로 전송하므로 alias 매핑 허용
+        alias_generator = _to_camel
+        populate_by_name = True
+
+    movie_id: str = Field(..., max_length=50, description="영화 ID (movies.movie_id UNIQUE)")
+    title: str = Field(..., max_length=500, description="영화 제목")
+
+    title_en: Optional[str] = Field(None, max_length=500, description="영문 제목")
+    tmdb_id: Optional[int] = Field(None, description="TMDB ID (있으면 UNIQUE)")
+    overview: Optional[str] = Field(None, description="줄거리")
+    genres: Optional[str] = Field(
+        None, description="장르 JSON 배열 문자열 또는 쉼표 구분 문자열"
+    )
+    director: Optional[str] = Field(None, max_length=200, description="감독명")
+    release_year: Optional[int] = Field(None, ge=1800, le=2100)
+    release_date: Optional[str] = Field(None, description="ISO 날짜 (YYYY-MM-DD)")
+    runtime: Optional[int] = Field(None, ge=0, description="상영 시간(분)")
+    rating: Optional[float] = Field(None, ge=0.0, le=10.0, description="평점")
+    poster_path: Optional[str] = Field(None, max_length=1000)
+    backdrop_path: Optional[str] = Field(None, max_length=1000)
+    certification: Optional[str] = Field(None, max_length=20, description="관람등급")
+    trailer_url: Optional[str] = Field(None, max_length=1000)
+    tagline: Optional[str] = Field(None, max_length=500)
+    original_language: Optional[str] = Field(None, max_length=10)
+    adult: Optional[bool] = Field(default=False)
+
+
 # ============================================================
 # 1. 데이터 현황 (3 EP)
 # ============================================================
@@ -569,6 +616,131 @@ async def get_movie_detail(movie_id: str) -> dict:
         response["elasticsearch"] = {"error": str(e)}
 
     return response
+
+
+@admin_data_router.post(
+    "/movies",
+    summary="영화 신규 등록 (관리자 수동)",
+    description=(
+        "관리자가 영화를 수동으로 등록한다. "
+        "MySQL movies 테이블에 INSERT 하며, Qdrant/Neo4j/ES 는 "
+        "다음 파이프라인 재임베딩 시 반영된다. "
+        "source='admin' 고정."
+    ),
+)
+async def create_movie(request: MovieCreateRequest) -> dict:
+    """
+    관리자 수동 영화 등록 — MySQL INSERT 전용.
+
+    2026-04-08: 기존 Backend AdminMovieController 의 POST /admin/movies 경로를
+    단일 진실 원본 원칙에 따라 Agent 로 일원화. Backend 스텁은 삭제 대상이다.
+
+    흐름:
+        1) movie_id / tmdb_id UNIQUE 검증 (사전 조회)
+        2) movies 테이블에 INSERT (source='admin', 누락 필드는 NULL/기본값)
+        3) 검색 인덱스(Qdrant/Neo4j/ES) 반영은 다음 파이프라인 실행 시
+           자동 동기화되므로 여기서는 시도하지 않는다 (임베딩 비용 회피)
+
+    빈 DB 환경에서도 INSERT 가 정상 동작하도록 모든 값에 대해
+    명시적으로 NULL/기본값을 지정한다.
+
+    Args:
+        request: MovieCreateRequest (movie_id/title 필수)
+
+    Returns:
+        {success, movieId, message, needsReindex}
+    """
+    # 1) UNIQUE 검증: movie_id + tmdb_id
+    try:
+        pool = await get_mysql()
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                # movie_id 중복 체크
+                await cur.execute(
+                    "SELECT 1 FROM movies WHERE movie_id = %s LIMIT 1",
+                    (request.movie_id,),
+                )
+                if await cur.fetchone():
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"이미 존재하는 movie_id 입니다: {request.movie_id}",
+                    )
+
+                # tmdb_id 중복 체크 (있는 경우만)
+                if request.tmdb_id is not None:
+                    await cur.execute(
+                        "SELECT 1 FROM movies WHERE tmdb_id = %s LIMIT 1",
+                        (request.tmdb_id,),
+                    )
+                    if await cur.fetchone():
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"이미 존재하는 tmdb_id 입니다: {request.tmdb_id}",
+                        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("movie_create_unique_check_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"중복 검증 실패: {e}")
+
+    # 2) INSERT
+    #
+    # movies 테이블 칼럼 전부를 명시하지 않고 Backend @Entity 에서 실제로 쓰는 핵심 필드만 세팅한다.
+    # 모르는 칼럼이 있어도 DEFAULT 절로 처리되도록 INSERT 컬럼 목록을 관리자 폼 범위로 한정.
+    try:
+        pool = await get_mysql()
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO movies (
+                        movie_id, tmdb_id, title, original_title, overview,
+                        genres, release_date, runtime, vote_average,
+                        poster_path, backdrop_path, original_language,
+                        adult, source, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, 'admin', NOW(), NOW()
+                    )
+                    """,
+                    (
+                        request.movie_id,
+                        request.tmdb_id,
+                        request.title,
+                        request.title_en,
+                        request.overview,
+                        request.genres,
+                        request.release_date,
+                        request.runtime,
+                        request.rating,
+                        request.poster_path,
+                        request.backdrop_path,
+                        request.original_language,
+                        1 if request.adult else 0,
+                    ),
+                )
+                await conn.commit()
+    except Exception as e:
+        logger.error("movie_create_insert_failed", error=str(e), movie_id=request.movie_id)
+        raise HTTPException(status_code=500, detail=f"MySQL INSERT 실패: {e}")
+
+    logger.info(
+        "movie_create_success",
+        movie_id=request.movie_id,
+        title=request.title,
+    )
+
+    return {
+        "success": True,
+        "movieId": request.movie_id,
+        "message": (
+            "영화가 등록되었습니다. 검색 인덱스(Qdrant/Neo4j/ES) 는 "
+            "다음 파이프라인 실행 시 반영됩니다."
+        ),
+        "needsReindex": True,
+    }
 
 
 @admin_data_router.put(
