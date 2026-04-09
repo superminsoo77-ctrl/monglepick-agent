@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     ANTHROPIC_API_KEY: str = ""
     UPSTAGE_API_KEY: str = ""
+    # 백업 키. 메인 키 (UPSTAGE_API_KEY) 가 401/quota_exceeded 로 실패할 때
+    # 새 작업 (Phase 2~9 / scripts/*) 이 자동 fallback 으로 사용한다.
+    # Task #5 (이미 메모리에 메인 키 보유) 에는 영향 없음 — swap 절차는 별도.
+    UPSTAGE_API_KEY2: str = ""
     TMDB_API_KEY: str = ""
     TMDB_BASE_URL: str = "https://api.themoviedb.org/3"
     KOBIS_API_KEY: str = ""
@@ -33,6 +37,11 @@ class Settings(BaseSettings):
     # ── KMDb (한국영화 데이터베이스) ──
     KMDB_API_KEY: str = ""
     KMDB_BASE_URL: str = "http://api.koreafilm.or.kr/openapi-data2/wisenut/search_api/search_json2.jsp"
+
+    # ── OMDb (IMDb/Rotten Tomatoes/Metacritic 평점) ──
+    # Phase 6: movie_external_ratings 테이블 적재용. 무료 1000/day.
+    OMDB_API_KEY: str = ""
+    OMDB_BASE_URL: str = "http://www.omdbapi.com/"
 
     # ── Ollama (로컬 LLM 서버) ──
     # Ollama는 단일 서버에서 OLLAMA_MAX_LOADED_MODELS 수만큼 모델을 동시 로드한다.

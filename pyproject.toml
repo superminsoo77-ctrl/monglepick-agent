@@ -45,8 +45,11 @@ dependencies = [
     "pandas>=2.2.0",
     "scipy>=1.14.0",
     "scikit-learn>=1.5.0",
-    # ── Observability (LangSmith 트레이싱) ──
+    # ── Observability (LangSmith 트레이싱 + Prometheus 메트릭) ──
     "langsmith>=0.7.6",
+    # Prometheus /metrics 엔드포인트 — 요청 수/지연/응답상태 히스토그램 자동 노출.
+    # VM3 Prometheus 가 http://10.20.0.11:8000/metrics 를 15s 간격으로 스크레이프한다.
+    "prometheus-fastapi-instrumentator>=7.0.0",
     # ── Utilities ──
     "PyJWT>=2.9.0",
     "python-dotenv>=1.0.0",

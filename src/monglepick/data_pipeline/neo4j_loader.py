@@ -783,3 +783,149 @@ async def load_to_neo4j(documents: list[MovieDocument]) -> None:
     await load_recommended_relations(documents)
 
     logger.info("neo4j_load_complete", count=len(documents))
+
+
+# ============================================================
+# Partial update 헬퍼 (Phase 2 enrichment 3DB 동기화용)
+# ============================================================
+
+# Neo4j 에 직접 저장 가능한 scalar/list[scalar] 필드 화이트리스트.
+# list[dict] 필드 (kobis_directors 등) 는 Neo4j 에 저장 못하므로 제외.
+# 그래프 관계로 표현해야 하는 것은 별도 loader 가 처리.
+_NEO4J_MOVIE_SCALAR_FIELDS = {
+    "title", "title_en", "tagline",
+    "release_year", "release_date", "kr_release_date",
+    "runtime", "rating", "vote_count", "popularity_score",
+    "poster_path", "backdrop_path",
+    "certification", "trailer_url",
+    "overview", "overview_en",
+    "imdb_id", "original_language",
+    "budget", "revenue", "homepage", "status", "adult",
+    "collection_id", "collection_name",
+    "director", "director_original_name", "director_id",
+    # KOBIS scalar
+    "kobis_movie_cd", "sales_acc", "audience_count", "screen_count",
+    "kobis_nation", "kobis_watch_grade", "kobis_open_dt", "kobis_type_nm",
+    # KMDb scalar
+    "kmdb_id", "awards", "filming_location",
+    "soundtrack", "theme_song",
+    # 출처
+    "source",
+}
+
+_NEO4J_MOVIE_STRING_LIST_FIELDS = {
+    "spoken_languages", "origin_country",
+    "production_countries", "production_country_names",
+    "kobis_genres",
+}
+
+
+def _filter_neo4j_props(enrichment: dict) -> dict:
+    """
+    enrichment payload 에서 Neo4j Movie 노드에 SET 가능한 필드만 필터링.
+
+    list[dict] 필드는 그래프 관계로 별도 적재해야 하므로 제외한다
+    (예: kobis_actors → DIRECTED/ACTED_IN 관계는 run_kobis_load 에서 처리).
+
+    Args:
+        enrichment: 부분 업데이트 dict
+
+    Returns:
+        Neo4j SET 가능한 필드만 포함한 dict
+    """
+    out: dict = {}
+    for key, value in enrichment.items():
+        if value is None or value == "":
+            continue
+        if key in _NEO4J_MOVIE_SCALAR_FIELDS:
+            out[key] = value
+        elif key in _NEO4J_MOVIE_STRING_LIST_FIELDS and isinstance(value, list):
+            # 모든 요소가 str 인 경우만 저장
+            string_list = [str(x) for x in value if x]
+            if string_list:
+                out[key] = string_list
+    return out
+
+
+async def update_movie_properties(movie_id: str, enrichment: dict) -> bool:
+    """
+    단일 Movie 노드의 속성을 부분 업데이트 (`MATCH ... SET m += $props`).
+
+    노드가 없으면 SET 은 0 rows 영향 → False 반환.
+    MERGE 대신 MATCH 사용: Phase 2 enrichment 는 기존 영화 전용.
+    신규 영화는 load_to_neo4j (MERGE) 경유.
+
+    Args:
+        movie_id: Movie 노드의 id
+        enrichment: 부분 업데이트 dict (list[dict] 자동 제외)
+
+    Returns:
+        성공 True, 매칭 실패 False
+    """
+    props = _filter_neo4j_props(enrichment)
+    if not props:
+        return False
+
+    driver = await get_neo4j()
+    async with driver.session() as session:
+        result = await session.run(
+            "MATCH (m:Movie {id: $id}) SET m += $props RETURN count(m) AS c",
+            {"id": str(movie_id), "props": props},
+        )
+        record = await result.single()
+        count = (record or {}).get("c", 0) if record else 0
+        return count > 0
+
+
+async def update_movies_properties_bulk(
+    updates: list[tuple[str, dict]],
+    batch_size: int = 500,
+) -> int:
+    """
+    여러 Movie 노드 속성을 UNWIND 배치로 업데이트.
+
+    존재하지 않는 id 는 자동 skip (MATCH 기반).
+
+    Args:
+        updates: [(movie_id, enrichment_dict), ...]
+        batch_size: UNWIND 배치당 크기
+
+    Returns:
+        실제 업데이트된 노드 수 (MATCH 성공 기준)
+    """
+    if not updates:
+        return 0
+
+    # filter + rows 준비
+    rows = []
+    for movie_id, enrichment in updates:
+        props = _filter_neo4j_props(enrichment)
+        if props:
+            rows.append({"id": str(movie_id), "props": props})
+
+    if not rows:
+        return 0
+
+    total_matched = 0
+    cypher = """
+    UNWIND $batch AS row
+    MATCH (m:Movie {id: row.id})
+    SET m += row.props
+    RETURN count(m) AS matched
+    """
+
+    driver = await get_neo4j()
+    for i in range(0, len(rows), batch_size):
+        chunk = rows[i : i + batch_size]
+        async with driver.session() as session:
+            result = await session.run(cypher, {"batch": chunk})
+            record = await result.single()
+            matched = (record or {}).get("matched", 0) if record else 0
+            total_matched += matched
+
+    logger.info(
+        "neo4j_partial_bulk_done",
+        matched=total_matched,
+        total_input=len(rows),
+    )
+    return total_matched

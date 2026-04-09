@@ -28,12 +28,113 @@ import structlog
 from monglepick.data_pipeline.models import KMDbRawMovie, MovieDocument
 from monglepick.data_pipeline.preprocessor import (
     GENRE_EN_TO_KR,
+    _KEYWORD_EN_TO_KR_LOWER,  # Phase ML-2: 영문→한국어 키워드 매핑 (200개)
     build_embedding_text,
     get_fallback_mood_tags,
     validate_movie,
 )
 
 logger = structlog.get_logger()
+
+
+# ══════════════════════════════════════════════════════════════
+# Phase ML-2 일관성 헬퍼 (KMDb 한영 이중 + 키워드 매핑)
+# ══════════════════════════════════════════════════════════════
+
+
+def _extract_director_bilingual_kmdb(directors: list[dict]) -> tuple[str, str]:
+    """
+    KMDb directors 배열에서 감독의 한글 + 영문 이름을 튜플로 반환한다.
+
+    KMDb API는 `directors[].directorNm` (한글) + `directorEnNm` (영문)을 제공한다.
+    한영이 같으면 영문은 빈 문자열 반환 (TMDB extract_director_names와 동일 정책).
+
+    Args:
+        directors: KMDb API의 directors 배열
+            예: [{"directorNm": "봉준호", "directorEnNm": "BONG Joon-ho", "directorId": "..."}]
+
+    Returns:
+        (director_kr, director_original_name) 튜플.
+    """
+    if not directors:
+        return ("", "")
+    name_kr = (directors[0].get("directorNm", "") or "").strip()
+    name_en = (directors[0].get("directorEnNm", "") or "").strip()
+    if not name_kr:
+        return ("", "")
+    if name_en == name_kr:
+        return (name_kr, "")
+    return (name_kr, name_en)
+
+
+def _extract_cast_bilingual_kmdb(actors: list[dict], top_n: int = 5) -> list[str]:
+    """
+    KMDb actors 배열에서 배우 상위 N명을 한영 이중 리스트로 반환한다.
+
+    KMDb API는 `actors[].actorNm` (한글) + `actorEnNm` (영문)을 제공한다.
+    중복 제거된 리스트를 반환하여 한국어/영문 검색 양방향 매칭을 지원한다.
+
+    Args:
+        actors: KMDb API의 actors 배열
+            예: [{"actorNm": "송강호", "actorEnNm": "SONG Kang-ho"}]
+        top_n: 상위 N명 (기본 5)
+
+    Returns:
+        한영 이중 리스트 (최대 top_n*2개)
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for actor in actors[:top_n]:
+        name_kr = (actor.get("actorNm", "") or "").strip()
+        name_en = (actor.get("actorEnNm", "") or "").strip()
+
+        if name_kr and name_kr not in seen:
+            result.append(name_kr)
+            seen.add(name_kr)
+        if name_en and name_en != name_kr and name_en not in seen:
+            result.append(name_en)
+            seen.add(name_en)
+
+    return result
+
+
+def _apply_korean_mapping_to_keywords_kmdb(keywords: list[str]) -> list[str]:
+    """
+    KMDb 키워드에 Phase ML-2 한국어 매핑을 적용한다.
+
+    KMDb는 대부분 한국어 키워드를 제공하지만 일부 영문 키워드도 섞일 수 있다.
+    `preprocessor._KEYWORD_EN_TO_KR_LOWER` (200개 매핑 사전)으로 영문 키워드만
+    한국어로 변환하고, 한국어 키워드는 그대로 유지한다.
+
+    TMDB collector의 extract_keywords()와 동일 정책.
+
+    Args:
+        keywords: KMDb 키워드 리스트 (한글/영문 혼재 가능)
+
+    Returns:
+        한국어 우선 + 영문 보존 리스트 (중복 제거)
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for kw in keywords:
+        if not kw or not isinstance(kw, str):
+            continue
+        kw_stripped = kw.strip()
+        if not kw_stripped:
+            continue
+        # 한국어 매핑 시도 (영문 키워드만 매칭됨)
+        kr_name = _KEYWORD_EN_TO_KR_LOWER.get(kw_stripped.lower())
+        if kr_name and kr_name not in seen:
+            result.append(kr_name)
+            seen.add(kr_name)
+        # 원본도 추가 (한국어 키워드는 여기서 들어감)
+        if kw_stripped not in seen:
+            result.append(kw_stripped)
+            seen.add(kw_stripped)
+
+    return result
 
 # ============================================================
 # KMDb 장르 → 한국어 매핑
@@ -301,25 +402,21 @@ def kmdb_to_movie_document(raw: KMDbRawMovie) -> MovieDocument | None:
     # 장르 변환
     genres = _convert_kmdb_genres(raw.genre)
 
-    # 감독 추출 (첫 번째 감독)
-    director = ""
-    if raw.directors:
-        director = raw.directors[0].get("directorNm", "").strip()
+    # 감독 추출 — Phase ML-2 일관성: 한영 이중 (directorNm + directorEnNm)
+    director, director_original_name = _extract_director_bilingual_kmdb(raw.directors)
 
-    # 배우 추출 (상위 5명)
-    cast: list[str] = []
-    for actor in raw.actors[:5]:
-        name = actor.get("actorNm", "").strip()
-        if name:
-            cast.append(name)
+    # 배우 추출 — Phase ML-2 일관성: 한영 이중 (actorNm + actorEnNm)
+    cast = _extract_cast_bilingual_kmdb(raw.actors, top_n=5)
 
     # 줄거리
     overview = _extract_plot_korean(raw.plots)
 
-    # 키워드 파싱 (쉼표 구분)
+    # 키워드 파싱 (쉼표 구분) + Phase ML-2 한국어 매핑
     keywords_list: list[str] = []
     if raw.keywords:
-        keywords_list = [k.strip() for k in raw.keywords.split(",") if k.strip()]
+        raw_keywords = [k.strip() for k in raw.keywords.split(",") if k.strip()]
+        # KMDb 키워드는 대부분 한글이지만 일부 영문 매칭으로 한국어 보강
+        keywords_list = _apply_korean_mapping_to_keywords_kmdb(raw_keywords)
 
     # 런타임
     runtime = 0
@@ -376,6 +473,7 @@ def kmdb_to_movie_document(raw: KMDbRawMovie) -> MovieDocument | None:
         genres=genres,
         keywords=keywords_list,
         director=director,
+        director_original_name=director_original_name,  # Phase ML-2: 한영 이중
         cast=cast,
         ott_platforms=[],  # KMDb에는 OTT 정보 없음
         mood_tags=mood_tags,
@@ -462,6 +560,145 @@ def extract_enrichment_data(raw: KMDbRawMovie) -> dict[str, Any]:
     }
 
 
+def build_kmdb_full_enrichment_payload(raw: KMDbRawMovie) -> dict[str, Any]:
+    """
+    KMDb 영화의 **모든 풍부 필드** 를 기존 영화 enrichment payload 로 변환.
+
+    extract_enrichment_data() 의 확장판. 사용자의 "모든 데이터 컬럼 수집"
+    원칙에 따라 KMDb 가 제공하는 47 필드 중 Qdrant/ES/Neo4j/MySQL 에
+    저장 가능한 모든 항목을 포함한다.
+
+    TMDB 이미 있는 필드 우선순위:
+        - 덮어쓰지 않음: title, overview, poster_path, runtime (기본)
+        - 보강 (기존 비어있을 때만): director_original_name, cast_original_names,
+          certification, trailer_url
+        - KMDb 고유 (항상 추가): awards, filming_location, soundtrack, theme_song,
+          keywords(한국어), kmdb_id, audience_count
+
+    Args:
+        raw: KMDbRawMovie (KMDb API 응답 파싱 결과)
+
+    Returns:
+        Qdrant set_payload / ES update / Neo4j SET 에 바로 쓸 수 있는 dict.
+        loader 가 자체 직렬화로 알맞게 처리한다.
+    """
+    out: dict[str, Any] = {}
+
+    # ── 1. KMDb 식별자 ──
+    kmdb_id = f"{raw.movie_id}_{raw.movie_seq}"
+    if kmdb_id and kmdb_id != "_":
+        out["kmdb_id"] = kmdb_id
+
+    # ── 1-B. Phase ML-1 한영 이중 핵심: 영문 제목 ──
+    # KMDb titleEng 는 종종 "Parasite (Gi-saeng-chung)" 형태.
+    # 괄호 앞부분만 추출하여 깔끔한 영문 제목으로 보강.
+    title_eng_raw = (raw.title_eng or "").strip()
+    if title_eng_raw:
+        # 괄호 제거 (예: "Parasite (Gi-saeng-chung)" → "Parasite")
+        paren_idx = title_eng_raw.find("(")
+        title_en = (title_eng_raw[:paren_idx] if paren_idx > 0 else title_eng_raw).strip()
+        if title_en:
+            out["title_en"] = title_en
+
+    # 원제 (titleOrg — 외국 영화의 원제)
+    title_org = (raw.title_org or "").strip()
+    if title_org:
+        out["title_original"] = title_org
+
+    # ── 2. 수상내역 (awards1 + awards2 병합) ──
+    awards_parts = []
+    if raw.awards1:
+        awards_parts.append(raw.awards1)
+    if raw.awards2:
+        awards_parts.append(raw.awards2)
+    if awards_parts:
+        out["awards"] = " ".join(awards_parts)
+
+    # ── 3. 누적 관객수 ──
+    if raw.audi_acc:
+        try:
+            out["audience_count"] = int(raw.audi_acc)
+        except ValueError:
+            pass
+
+    # ── 4. 촬영장소 ──
+    if raw.f_location:
+        out["filming_location"] = raw.f_location
+
+    # ── 5. OST / 주제곡 / 삽입곡 ──
+    if raw.theme_song:
+        out["theme_song"] = raw.theme_song
+    if raw.soundtrack_field:
+        out["soundtrack"] = raw.soundtrack_field
+
+    # ── 6. 한국어 plot (기존 overview 비어있을 때만 보강) ──
+    plot_ko = _extract_plot_korean(raw.plots)
+    if plot_ko:
+        out["plot_korean"] = plot_ko  # 호출 측에서 overview 가 비었을 때만 적용
+
+    # 영어 plot
+    for p in (raw.plots or []):
+        lang = (p.get("plotLang", "") or "").strip().lower()
+        text = (p.get("plotText", "") or "").strip()
+        if text and ("eng" in lang or "영어" in lang):
+            out["overview_en_kmdb"] = text  # 호출 측 결정
+            break
+
+    # ── 7. Phase ML-1 한영 이중 감독/배우 (기존 비어있을 때만 보강) ──
+    directors = raw.directors or []
+    if directors:
+        d0 = directors[0]
+        d_en = (d0.get("directorEnNm", "") or "").strip()
+        if d_en:
+            out["director_original_name"] = d_en
+
+    actors = raw.actors or []
+    if actors:
+        # Phase ML-1 핵심: 주요 배우 영문명 추출 (기생충 등 한국 영화 한영 이중 보강).
+        # TMDB preprocessor 가 한국 영화 cast 를 한국어로만 저장한 버그 수정용.
+        # (예: 기생충 → ['Song Kang-ho', 'Lee Sun-kyun', 'Cho Yeo-jeong', ...])
+        cast_original = [
+            (a.get("actorEnNm", "") or "").strip()
+            for a in actors[:10]
+            if (a.get("actorEnNm", "") or "").strip()
+        ]
+        if cast_original:
+            out["cast_original_names"] = cast_original
+
+    # ── 8. KMDb 한국어 keywords (기존 keyword 리스트에 병합) ──
+    if raw.keywords:
+        kw_list = [k.strip() for k in raw.keywords.split(",") if k.strip()]
+        if kw_list:
+            out["kmdb_keywords"] = kw_list
+
+    # ── 9. KMDb 전체 스태프 (JSON 보존) ──
+    if raw.staffs:
+        out["kmdb_staffs"] = [
+            {
+                "peopleNm": (s.get("staffNm", "") or s.get("peopleNm", "") or "").strip(),
+                "peopleNmEn": (s.get("staffEnNm", "") or s.get("peopleNmEn", "") or "").strip(),
+                "staffRoleNm": (s.get("staffRoleNm", "") or s.get("staffRoleGroup", "") or "").strip(),
+            }
+            for s in raw.staffs
+        ]
+
+    # ── 10. KMDb 관람등급 / 예고편 (기존 비어있을 때만) ──
+    cert_kmdb = _convert_kmdb_certification(raw.rating)
+    if cert_kmdb:
+        out["certification_kmdb"] = cert_kmdb
+    trailer_kmdb = _extract_trailer_url(raw.vods)
+    if trailer_kmdb:
+        out["trailer_url_kmdb"] = trailer_kmdb
+
+    # ── 11. KMDb 포스터 / 스틸컷 ──
+    if raw.posters:
+        out["kmdb_posters"] = raw.posters[:10]
+    if raw.stills:
+        out["stills"] = raw.stills[:10]
+
+    return out
+
+
 # ============================================================
 # 배치 처리
 # ============================================================
@@ -496,9 +733,13 @@ def process_kmdb_batch(
             match = match_kmdb_to_existing(raw, title_index)
 
             if match:
-                # 매칭 성공 → KMDb 고유 데이터(수상내역/관객수/촬영장소 등)를 추출
+                # 매칭 성공 → KMDb 풀필드 데이터 추출 (2026-04-09 확장)
+                # 기존 extract_enrichment_data 는 10개 필드만 추출했으나
+                # build_kmdb_full_enrichment_payload 는 47 필드 전부 (awards,
+                # filming_location, soundtrack, theme_song, 한국어 keywords,
+                # 한영이중 director/actors, 전체 staffs, 포스터/스틸 등) 추출.
                 existing_id = match.get("id") or match.get("_id", "")
-                enrichment_data = extract_enrichment_data(raw)
+                enrichment_data = build_kmdb_full_enrichment_payload(raw)
                 enrichments.append({
                     "existing_id": str(existing_id),
                     "data": enrichment_data,

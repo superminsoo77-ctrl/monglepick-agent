@@ -23,6 +23,7 @@ import structlog
 from monglepick.data_pipeline.kaggle_loader import KaggleLoader
 from monglepick.data_pipeline.models import MovieDocument
 from monglepick.data_pipeline.preprocessor import (
+    _KEYWORD_EN_TO_KR_LOWER,  # Phase ML-2: 영문→한국어 키워드 매핑 (200개)
     build_embedding_text,
     convert_genres,
     get_fallback_mood_tags,
@@ -30,6 +31,53 @@ from monglepick.data_pipeline.preprocessor import (
 )
 
 logger = structlog.get_logger()
+
+
+# ══════════════════════════════════════════════════════════════
+# Phase ML-2 일관성 헬퍼: Kaggle 영문 키워드에 한국어 매핑 적용
+# ══════════════════════════════════════════════════════════════
+
+
+def _apply_korean_mapping_to_keywords(keywords: list[str]) -> list[str]:
+    """
+    Kaggle 영문 키워드에 Phase ML-2 한국어 매핑을 적용한다.
+
+    `preprocessor._KEYWORD_EN_TO_KR_LOWER` (200개 매핑 사전)을 활용하여
+    매칭되는 키워드는 한국어 + 영문 이중으로 저장하고,
+    매칭되지 않는 키워드는 영문 원본만 유지한다.
+
+    이는 TMDB collector의 `extract_keywords()`와 동일한 정책으로,
+    Kaggle 보강 영화도 한국어 검색 (예: "시간 여행")에서 매칭될 수 있게 한다.
+
+    Args:
+        keywords: Kaggle keywords.csv에서 추출한 영문 키워드 리스트
+
+    Returns:
+        한국어+영문 이중 리스트 (중복 제거 + 순서 유지)
+        예: ["우주 여행", "space travel", "time travel", "시간 여행", ...]
+
+    참고:
+        - Kaggle CSV에는 한국어 키워드가 없으므로 매핑 사전이 유일한 한국화 수단
+        - 매핑 사전에 없는 영문 키워드는 cross-lingual 임베딩에 의존
+        - cast/director는 Kaggle에 original_name이 없어 한영 이중 적용 불가
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for kw in keywords:
+        if not kw or not isinstance(kw, str):
+            continue
+        # 한국어 매핑이 있으면 한국어 우선 추가
+        kr_name = _KEYWORD_EN_TO_KR_LOWER.get(kw.lower())
+        if kr_name and kr_name not in seen:
+            result.append(kr_name)
+            seen.add(kr_name)
+        # 영문 원본도 추가 (cross-lingual 검색 + 매핑 누락 대비)
+        if kw not in seen:
+            result.append(kw)
+            seen.add(kw)
+
+    return result
 
 
 def load_kaggle_movies(
@@ -147,6 +195,11 @@ def _row_to_movie_document(row: pd.Series) -> MovieDocument | None:
     keywords_list = row.get("keywords_list", [])
     if not isinstance(keywords_list, list):
         keywords_list = []
+
+    # Phase ML-2 일관성: 영문 키워드에 한국어 매핑 적용 (200개 매핑 사전)
+    # TMDB collector의 extract_keywords()와 동일 정책으로
+    # Kaggle 보강 영화도 한국어 키워드 검색에서 매칭되도록 한다.
+    keywords_list = _apply_korean_mapping_to_keywords(keywords_list)
 
     # 기본 필드
     overview = str(row.get("overview", "")) if pd.notna(row.get("overview")) else ""
