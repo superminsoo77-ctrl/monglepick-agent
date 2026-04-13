@@ -76,6 +76,9 @@ from openai import AsyncOpenAI  # noqa: E402
 
 from monglepick.config import settings  # noqa: E402
 from monglepick.data_pipeline.mood_batch import RPMLimiter  # noqa: E402
+# P0-1 수정: Phase 7 LLM 보강 결과를 3DB 동기화 (Qdrant + ES + Neo4j)
+from monglepick.data_pipeline.es_loader import update_movie_partial  # noqa: E402
+from monglepick.data_pipeline.neo4j_loader import update_movie_properties  # noqa: E402
 from monglepick.db.clients import (  # noqa: E402
     init_all_clients,
     close_all_clients,
@@ -89,7 +92,11 @@ logger = structlog.get_logger()
 # 상수
 # ══════════════════════════════════════════════════════════════
 
-CHECKPOINT_FILE = Path("data/movie_llm_enrich_checkpoint.json")
+# 체크포인트 파일을 target 별로 분리 (동시 실행 시 충돌 방지)
+# 예: data/movie_llm_enrich_checkpoint_tagline.json
+#     data/movie_llm_enrich_checkpoint_category.json
+_CHECKPOINT_BASE = "data/movie_llm_enrich_checkpoint"
+CHECKPOINT_FILE = Path(f"{_CHECKPOINT_BASE}.json")  # 기본값 (단일 실행 시)
 DEFAULT_CHUNK_SIZE = 1_000   # Qdrant scroll batch
 DEFAULT_BATCH_SIZE = 5       # Solar API 1회 호출당 영화 수
 DEFAULT_RPM = 100
@@ -135,6 +142,11 @@ ENRICHMENT_SYSTEM_PROMPT = """당신은 영화 메타데이터 분석 및 한국
 # ══════════════════════════════════════════════════════════════
 
 
+def _checkpoint_path(target: str) -> Path:
+    """target 별 체크포인트 파일 경로 (동시 실행 충돌 방지)."""
+    return Path(f"{_CHECKPOINT_BASE}_{target}.json")
+
+
 def _new_checkpoint(target: str) -> dict:
     return {
         "target": target,
@@ -142,29 +154,41 @@ def _new_checkpoint(target: str) -> dict:
         "total_processed": 0,
         "total_enriched": 0,
         "total_failed": 0,
-        "last_qdrant_offset": None,    # Qdrant scroll offset (재개용)
-        "processed_ids": [],            # 이미 처리한 movie_id (중복 방지)
+        "last_qdrant_offset": None,
+        "processed_ids": [],
         "start_time": datetime.now().isoformat(),
         "last_updated": "",
     }
 
 
 def _load_checkpoint(target: str) -> dict:
+    cp_path = _checkpoint_path(target)
+    if cp_path.exists():
+        try:
+            data = json.loads(cp_path.read_text(encoding="utf-8"))
+            if data.get("target") == target:
+                data.setdefault("processed_ids", [])
+                return data
+        except Exception as e:
+            logger.warning("checkpoint_load_failed", error=str(e))
+    # 레거시 단일 파일 호환 (구 버전 체크포인트 마이그레이션)
     if CHECKPOINT_FILE.exists():
         try:
             data = json.loads(CHECKPOINT_FILE.read_text(encoding="utf-8"))
             if data.get("target") == target:
                 data.setdefault("processed_ids", [])
                 return data
-        except Exception as e:
-            logger.warning("checkpoint_load_failed", error=str(e))
+        except Exception:
+            pass
     return _new_checkpoint(target)
 
 
 def _save_checkpoint(state: dict) -> None:
-    CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    target = state.get("target", "unknown")
+    cp_path = _checkpoint_path(target)
+    cp_path.parent.mkdir(parents=True, exist_ok=True)
     state["last_updated"] = datetime.now().isoformat()
-    CHECKPOINT_FILE.write_text(
+    cp_path.write_text(
         json.dumps(state, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -179,23 +203,38 @@ async def _scroll_movies(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     skip_ids: set[str] | None = None,
     limit: int | None = None,
+    min_popularity: float | None = None,
 ):
     """
     Qdrant `movies` 컬렉션을 청크 단위로 scroll 한다.
 
+    Args:
+        min_popularity: 설정 시 popularity_score >= 이 값인 영화만 처리.
+                        서비스 노출 대상 영화 우선 보강용.
+
     Yields:
         list[dict]: [{point_id, payload}, ...]
     """
+    from qdrant_client.models import Filter, FieldCondition, Range
+
     skip_ids = skip_ids or set()
     client = await get_qdrant()
     offset = None
     yielded = 0
+
+    # popularity 기반 필터 (선택)
+    scroll_filter = None
+    if min_popularity is not None and min_popularity > 0:
+        scroll_filter = Filter(
+            must=[FieldCondition(key="popularity_score", range=Range(gte=min_popularity))]
+        )
 
     while True:
         result = await client.scroll(
             collection_name=settings.QDRANT_COLLECTION,
             limit=chunk_size,
             offset=offset,
+            scroll_filter=scroll_filter,
             with_vectors=False,
             with_payload=True,
         )
@@ -408,6 +447,7 @@ async def run_movie_llm_enrichment(
     model: str = "solar-pro3",
     limit: int | None = None,
     resume: bool = False,
+    min_popularity: float | None = None,
 ) -> None:
     """
     Qdrant `movies` 전체를 스트리밍하여 LLM 보강 적용.
@@ -466,6 +506,7 @@ async def run_movie_llm_enrichment(
             chunk_size=chunk_size,
             skip_ids=skip_ids,
             limit=limit,
+            min_popularity=min_popularity,
         ):
             chunk_idx += 1
             chunk_start = time.time()
@@ -506,15 +547,26 @@ async def run_movie_llm_enrichment(
                             target=target,
                         )
 
-                        # Qdrant payload update
+                        # 3DB 동기화: Qdrant + ES + Neo4j (P0-1 수정)
                         for m in batch:
                             mid = m["movie_id"]
                             delta = result_map.get(mid)
                             if not delta:
                                 chunk_failed += 1
                                 continue
+                            # 1. Qdrant set_payload
                             ok = await _update_qdrant_payload(m["point_id"], delta)
                             if ok:
+                                # 2. ES partial update (BM25 검색에서 tagline_ko 등 활용)
+                                try:
+                                    await update_movie_partial(mid, delta)
+                                except Exception:
+                                    pass  # ES 실패해도 Qdrant 적재는 유지
+                                # 3. Neo4j SET 속성 (scalar 필드만 자동 필터)
+                                try:
+                                    await update_movie_properties(mid, delta)
+                                except Exception:
+                                    pass
                                 chunk_enriched += 1
                                 checkpoint["processed_ids"].append(mid)
                             else:
@@ -651,6 +703,10 @@ def parse_args() -> argparse.Namespace:
         help="체크포인트 재개",
     )
     parser.add_argument(
+        "--min-popularity", type=float, default=None,
+        help="popularity_score 최소값 필터 (서비스 노출 영화만 우선 처리, 예: 2.0)",
+    )
+    parser.add_argument(
         "--status", action="store_true",
         help="현재 체크포인트 상태만 출력",
     )
@@ -672,5 +728,6 @@ if __name__ == "__main__":
                 model=args.model,
                 limit=args.limit,
                 resume=args.resume,
+                min_popularity=args.min_popularity,
             )
         )

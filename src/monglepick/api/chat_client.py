@@ -66,28 +66,35 @@ async def save_session_to_backend(
 
         if resp.status_code == 200:
             data = resp.json()
-            logger.debug(
+            logger.info(
                 "chat_session_saved_to_backend",
                 session_id=session_id,
+                user_id=user_id,
                 created=data.get("created"),
             )
             return data
 
-        logger.warning(
+        # [FIX] 저장 실패 시 로그 레벨을 error로 상향 + 상세 정보 추가.
+        # 기존 warning 레벨은 로그가 묻혀 문제 파악이 불가능했음.
+        logger.error(
             "chat_session_save_failed",
             session_id=session_id,
+            user_id=user_id,
             status=resp.status_code,
-            body=resp.text[:200],
+            body=resp.text[:500],
         )
         return None
 
     except Exception as e:
-        # 저장 실패는 대화 흐름에 영향을 주지 않는다 (로그만 남김)
-        logger.warning(
+        # [FIX] 로그 레벨 error로 상향 + 스택트레이스 포함.
+        # httpx 타임아웃, 네트워크 에러 등이 warning으로 묻혀 진단이 불가능했음.
+        logger.error(
             "chat_session_save_error",
             session_id=session_id,
+            user_id=user_id,
             error=str(e),
             error_type=type(e).__name__,
+            exc_info=True,
         )
         return None
 

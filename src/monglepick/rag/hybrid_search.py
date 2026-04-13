@@ -208,6 +208,7 @@ async def search_elasticsearch(
     origin_country_filter: list[str] | None = None,
     language_filter: str | None = None,
     production_countries_filter: list[str] | None = None,
+    year_range: tuple[int, int] | None = None,
 ) -> list[SearchResult]:
     """
     Elasticsearch BM25 검색: Nori 한국어 형태소 분석 기반 키워드 매칭.
@@ -242,6 +243,9 @@ async def search_elasticsearch(
             ],
             "type": "best_fields",
             "tie_breaker": 0.3,
+            # 한글 유사 표기 오차 허용 (예: "베트맨"→"배트맨", "쇼생크"→"쇼솅크")
+            # AUTO: 3~5자 → edit distance 1, 6자 이상 → edit distance 2
+            "fuzziness": "AUTO",
         }
     }
 
@@ -274,6 +278,11 @@ async def search_elasticsearch(
     # 평점의 신뢰도 보장: 투표 수가 너무 적은 영화를 검색 결과에서 제외
     if min_vote_count is not None:
         filter_clauses.append({"range": {"vote_count": {"gte": min_vote_count}}})
+
+    # 동적 필터: 개봉 연도 범위 (release_year between start and end)
+    # 예: "요즘 영화" → year_range=(2025, 2030), "90년대 영화" → year_range=(1990, 1999)
+    if year_range is not None:
+        filter_clauses.append({"range": {"release_year": {"gte": year_range[0], "lte": year_range[1]}}})
 
     # ── 국가/언어 필터 (한국영화, 일본 애니 등 국가 기반 추천) ──
     # origin_country: keyword 타입, 리스트 값 (예: ["KR"]) → terms 쿼리로 OR 매칭
@@ -369,6 +378,8 @@ async def search_neo4j(
     top_k: int = 15,
     origin_country_filter: list[str] | None = None,
     language_filter: str | None = None,
+    year_range: tuple[int, int] | None = None,
+    min_popularity: float | None = None,
 ) -> list[SearchResult]:
     """
     Neo4j 그래프 검색: 무드/장르/감독 관계를 기반으로 영화를 탐색한다.
@@ -430,6 +441,19 @@ async def search_neo4j(
             if language_filter:
                 where_clauses.append("m.original_language = $language_filter")
                 params["language_filter"] = language_filter
+            # ── 개봉 연도 필터: "요즘/최근" 등 시간 기반 추천 시 오래된 영화 제외 ──
+            if year_range:
+                where_clauses.append(
+                    "m.release_year >= $year_start AND m.release_year <= $year_end"
+                )
+                params["year_start"] = year_range[0]
+                params["year_end"] = year_range[1]
+            # ── 인기도 필터: "인기 있는" 등 인기 기반 추천 시 비인기 영화 제외 ──
+            if min_popularity is not None:
+                where_clauses.append(
+                    "COALESCE(m.popularity_score, 0) >= $min_popularity"
+                )
+                params["min_popularity"] = min_popularity
 
             cypher += " AND ".join(where_clauses)
 
@@ -847,6 +871,7 @@ async def hybrid_search(
                     origin_country_filter=origin_country_filter,
                     language_filter=language_filter,
                     production_countries_filter=production_countries_filter,
+                    year_range=year_range,
                 ),
                 timeout=_SEARCH_TIMEOUT,
             )
@@ -869,6 +894,8 @@ async def hybrid_search(
                     top_k=15,
                     origin_country_filter=origin_country_filter,
                     language_filter=language_filter,
+                    year_range=year_range,
+                    min_popularity=min_popularity,
                 ),
                 timeout=_SEARCH_TIMEOUT,
             )

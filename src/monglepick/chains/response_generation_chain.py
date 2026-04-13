@@ -131,42 +131,26 @@ def _build_fallback_response(
     Returns:
         폴백 응답 텍스트
     """
-    parts = ["추천 영화를 찾았어요! 🎬\n"]
+    parts = ["추천 영화를 찾았어요!\n"]
     for movie in ranked_movies:
-        genres_str = ", ".join(movie.genres[:4]) if movie.genres else "-"
-        cast_str = ", ".join(movie.cast[:3]) if movie.cast else ""
-        mood_str = ", ".join(movie.mood_tags[:3]) if movie.mood_tags else ""
-        ott_str = ", ".join(movie.ott_platforms[:3]) if movie.ott_platforms else ""
         year_str = f" ({movie.release_year})" if movie.release_year else ""
 
-        # 줄거리 (150자, 문장 단위 절단)
-        overview_text = ""
-        if movie.overview:
-            raw = movie.overview[:150]
-            last_period = raw.rfind(".")
-            if last_period > 30:
-                overview_text = raw[:last_period + 1]
-            else:
-                overview_text = raw + "..."
+        # 영화 소개: 자연스러운 문장형 (마크다운 없이)
+        card = f"<{movie.title}>{year_str}"
+        if movie.director:
+            card += f" - {movie.director} 감독"
+        card += f", 평점 {movie.rating:.1f}"
+        genres_str = ", ".join(movie.genres[:3]) if movie.genres else ""
+        if genres_str:
+            card += f" ({genres_str})"
+        card += "\n"
 
-        card = (
-            f"{movie.rank}. **{movie.title}**{year_str}\n"
-            f"   - 장르: {genres_str}\n"
-            f"   - 감독: {movie.director or '-'}\n"
-        )
-        if cast_str:
-            card += f"   - 출연: {cast_str}\n"
-        card += f"   - 평점: {movie.rating:.1f}\n"
-        if mood_str:
-            card += f"   - 분위기: {mood_str}\n"
-        if ott_str:
-            card += f"   - 시청 가능: {ott_str}\n"
-        if overview_text:
-            card += f"   - 줄거리: {overview_text}\n"
         if movie.explanation:
-            card += f"   > {movie.explanation}\n"
+            card += f"{movie.explanation}\n"
+
         parts.append(card)
 
+    parts.append("더 궁금한 점이 있으면 말씀해주세요!")
     return "\n".join(parts)
 
 

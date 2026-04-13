@@ -145,7 +145,12 @@ async def save_session(user_id: str, session_id: str, state: dict[str, Any]) -> 
         session_id: 세션 ID
         state: 그래프 실행 완료 후의 전체 State dict
     """
+    # [FIX] user_id도 빈 문자열이면 저장 불가 (Backend @NotBlank 검증 실패)
     if not session_id:
+        logger.warning("session_save_skipped_no_session_id")
+        return
+    if not user_id:
+        logger.warning("session_save_skipped_no_user_id", session_id=session_id)
         return
 
     try:
@@ -154,6 +159,11 @@ async def save_session(user_id: str, session_id: str, state: dict[str, Any]) -> 
         if len(messages) > MAX_CONVERSATION_TURNS * 2:
             # user+assistant 쌍 기준으로 최근 MAX_CONVERSATION_TURNS 턴만 유지
             messages = messages[-(MAX_CONVERSATION_TURNS * 2):]
+
+        # [FIX] messages가 비어있으면 저장하지 않음 (Backend @NotBlank 검증 실패 방지)
+        if not messages:
+            logger.warning("session_save_skipped_no_messages", session_id=session_id)
+            return
 
         # session_state: preferences, emotion, user_profile, watch_history를 묶어 저장
         session_state: dict[str, Any] = {}
@@ -196,7 +206,7 @@ async def save_session(user_id: str, session_id: str, state: dict[str, Any]) -> 
         turn_count = state.get("turn_count", 0)
 
         # Backend API로 세션 저장
-        await save_session_to_backend(
+        result = await save_session_to_backend(
             user_id=user_id,
             session_id=session_id,
             messages=messages_json,
@@ -206,20 +216,34 @@ async def save_session(user_id: str, session_id: str, state: dict[str, Any]) -> 
             intent_summary=None,
         )
 
-        logger.info(
-            "session_saved",
-            session_id=session_id,
-            turn_count=turn_count,
-            message_count=len(messages),
-            has_preferences=session_state["preferences"] is not None,
-            has_emotion=session_state["emotion"] is not None,
-        )
+        # [FIX] 저장 성공/실패를 명확히 구분하여 로깅.
+        # 기존에는 save_session_to_backend가 None을 반환해도 "session_saved"로 로깅되어
+        # 실제로 저장이 실패했는지 성공했는지 로그만으로는 구분이 불가능했음.
+        if result is not None:
+            logger.info(
+                "session_saved_ok",
+                session_id=session_id,
+                user_id=user_id,
+                turn_count=turn_count,
+                message_count=len(messages),
+                created=result.get("created", False),
+            )
+        else:
+            logger.error(
+                "session_save_returned_none",
+                session_id=session_id,
+                user_id=user_id,
+                turn_count=turn_count,
+                message_count=len(messages),
+            )
 
     except Exception as e:
-        # 세션 저장 실패는 대화 흐름에 영향을 주지 않는다 (로그만 남김)
-        logger.warning(
+        # [FIX] 로그 레벨 error + 스택트레이스
+        logger.error(
             "session_save_error",
             session_id=session_id,
+            user_id=user_id,
             error=str(e),
             error_type=type(e).__name__,
+            exc_info=True,
         )

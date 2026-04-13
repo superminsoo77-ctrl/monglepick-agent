@@ -194,11 +194,22 @@ async def _apply_enrichments_3db(enrichments: list[dict]) -> int:
         if not clean_data:
             continue
 
-        # 특수 키 재매핑 (_kmdb 접미어 등 호출 측 보강)
-        # - plot_korean / overview_en_kmdb / cast_original_names_kmdb /
-        #   certification_kmdb / trailer_url_kmdb 는 호출 측에서
-        #   기존 값이 비어있을 때만 적용해야 하므로 여기서 결정하지 않음.
-        #   Qdrant payload 에 _kmdb 필드로 그대로 저장한다.
+        # P1-2 수정: KMDb 비표준 키 → 표준 필드명 재매핑
+        # 기존 영화에 해당 필드가 비어있을 때만 KMDb 값으로 채움.
+        # _kmdb 접미어 키는 표준 키로 매핑 후 제거.
+        remap = {
+            "certification_kmdb": "certification",
+            "trailer_url_kmdb": "trailer_url",
+            "cast_original_names_kmdb": "cast_original_names",
+            "overview_en_kmdb": "overview_en",
+            "plot_korean": "overview",  # 한국어 줄거리 → overview 보강
+            "title_original": "title_org",  # KMDb 원제
+        }
+        for old_key, new_key in remap.items():
+            if old_key in clean_data:
+                val = clean_data.pop(old_key)
+                if val:
+                    clean_data[new_key] = val
 
         bulk_updates.append((str(existing_id), clean_data))
 

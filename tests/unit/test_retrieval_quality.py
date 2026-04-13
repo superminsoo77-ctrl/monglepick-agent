@@ -52,7 +52,7 @@ class TestRouteAfterRetrieval:
         assert result == "llm_reranker"
 
     def test_insufficient_candidates(self):
-        """후보 2개 (최소 3개 미만) → question_generator."""
+        """후보 2개 (최소 3개 미만, 후보 있음) → similar_fallback_search (Phase Q-3)."""
         from monglepick.agents.chat.graph import route_after_retrieval
 
         state: ChatAgentState = {
@@ -60,10 +60,11 @@ class TestRouteAfterRetrieval:
             "turn_count": 1,
         }
         result = route_after_retrieval(state)
-        assert result == "question_generator"
+        # Phase Q-3: 후보가 있지만 품질 미달 → 비슷한 영화 확장 검색
+        assert result == "similar_fallback_search"
 
     def test_low_top_score(self):
-        """Top-1 점수 낮음 (0.01 < 0.015) → question_generator."""
+        """Top-1 점수 낮음 (0.01 < 0.015), 후보 있음 → similar_fallback_search (Phase Q-3)."""
         from monglepick.agents.chat.graph import route_after_retrieval
 
         state: ChatAgentState = {
@@ -71,10 +72,11 @@ class TestRouteAfterRetrieval:
             "turn_count": 1,
         }
         result = route_after_retrieval(state)
-        assert result == "question_generator"
+        # Phase Q-3: 후보가 있지만 품질 미달 → 비슷한 영화 확장 검색
+        assert result == "similar_fallback_search"
 
     def test_low_average_score(self):
-        """Top-1은 OK이나 평균 낮음 → question_generator."""
+        """Top-1은 OK이나 평균 낮음, 후보 있음 → similar_fallback_search (Phase Q-3)."""
         from monglepick.agents.chat.graph import route_after_retrieval
 
         # Top-1=0.03, 나머지 매우 낮아 평균 < 0.01
@@ -84,7 +86,8 @@ class TestRouteAfterRetrieval:
         }
         result = route_after_retrieval(state)
         # avg = (0.03 + 0.002 + 0.001 + 0.001 + 0.001) / 5 = 0.007 < 0.01
-        assert result == "question_generator"
+        # Phase Q-3: 후보가 있지만 품질 미달 → 비슷한 영화 확장 검색
+        assert result == "similar_fallback_search"
 
     def test_empty_results(self):
         """빈 결과 → question_generator."""
@@ -125,7 +128,7 @@ class TestRouteAfterRetrieval:
         assert result == "llm_reranker"
 
     def test_boundary_just_below_threshold(self):
-        """임계값 바로 아래 → 품질 미달."""
+        """임계값 바로 아래, 후보 있음 → similar_fallback_search (Phase Q-3)."""
         from monglepick.agents.chat.graph import route_after_retrieval
 
         state: ChatAgentState = {
@@ -137,7 +140,8 @@ class TestRouteAfterRetrieval:
             "turn_count": 1,
         }
         result = route_after_retrieval(state)
-        assert result == "question_generator"
+        # Phase Q-3: 후보가 있지만 품질 미달 → 비슷한 영화 확장 검색
+        assert result == "similar_fallback_search"
 
 
 class TestRetrievalConstants:

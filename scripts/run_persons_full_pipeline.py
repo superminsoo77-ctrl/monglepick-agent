@@ -184,13 +184,20 @@ async def _load_existing_persons_ids() -> set[int]:
 # ══════════════════════════════════════════════════════════════
 
 
-def _jsonl_chunks(path: Path, chunk_size: int, skip_lines: int = 0):
+def _jsonl_chunks(
+    path: Path,
+    chunk_size: int,
+    skip_lines: int = 0,
+    min_popularity: float | None = None,
+):
     """
     JSONL 파일을 청크 단위로 yield. dict 객체 리스트.
     skip_lines 이후 라인부터 시작.
+    min_popularity: 설정 시 popularity >= 이 값인 Person만 포함 (서비스 노출 우선 보강).
     """
     chunk: list[dict] = []
     line_no = 0
+    skipped_pop = 0
 
     with path.open("r", encoding="utf-8") as f:
         for raw_line in f:
@@ -204,8 +211,15 @@ def _jsonl_chunks(path: Path, chunk_size: int, skip_lines: int = 0):
 
             try:
                 obj = json.loads(line)
-                if isinstance(obj, dict) and obj.get("id"):
-                    chunk.append(obj)
+                if not (isinstance(obj, dict) and obj.get("id")):
+                    continue
+                # popularity 필터
+                if min_popularity is not None and min_popularity > 0:
+                    pop = obj.get("popularity", 0) or 0
+                    if pop < min_popularity:
+                        skipped_pop += 1
+                        continue
+                chunk.append(obj)
             except json.JSONDecodeError:
                 continue
 
@@ -215,6 +229,9 @@ def _jsonl_chunks(path: Path, chunk_size: int, skip_lines: int = 0):
 
     if chunk:
         yield chunk, line_no
+
+    if skipped_pop > 0:
+        print(f"  [INFO] popularity < {min_popularity} skip: {skipped_pop:,}건")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -231,6 +248,7 @@ async def run_persons_full_pipeline(
     llm_model: str = "solar-pro3",
     limit: int | None = None,
     resume: bool = False,
+    min_popularity: float | None = None,
 ) -> None:
     """
     JSONL → LLM 보강 → Qdrant `persons` 적재 통합.
@@ -287,7 +305,10 @@ async def run_persons_full_pipeline(
         chunk_idx = 0
         processed_total = 0
 
-        for chunk, current_line in _jsonl_chunks(INPUT_JSONL, chunk_size, skip_lines):
+        if min_popularity:
+            print(f"  min_popularity: {min_popularity} (인기 Person 만 처리)")
+
+        for chunk, current_line in _jsonl_chunks(INPUT_JSONL, chunk_size, skip_lines, min_popularity=min_popularity):
             chunk_idx += 1
             chunk_start = time.time()
 
@@ -478,6 +499,10 @@ def parse_args() -> argparse.Namespace:
         help="체크포인트 + 기존 Qdrant ID skip",
     )
     parser.add_argument(
+        "--min-popularity", type=float, default=None,
+        help="popularity 최소값 필터 (인기 Person만 우선 보강, 예: 5.0)",
+    )
+    parser.add_argument(
         "--status", action="store_true",
         help="현재 상태 출력",
     )
@@ -499,5 +524,6 @@ if __name__ == "__main__":
                 llm_model=args.llm_model,
                 limit=args.limit,
                 resume=args.resume,
+                min_popularity=args.min_popularity,
             )
         )

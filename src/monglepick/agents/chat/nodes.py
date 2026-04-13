@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import aiomysql
+import httpx
 import structlog
 from langsmith import traceable
 
@@ -63,6 +64,7 @@ from monglepick.chains import (
 from monglepick.chains.question_chain import _get_missing_fields
 from monglepick.db.clients import ES_INDEX_NAME, get_elasticsearch, get_mysql
 from monglepick.rag.hybrid_search import SearchResult, hybrid_search
+from monglepick.utils.movie_info_enricher import enrich_movies_batch
 
 logger = structlog.get_logger()
 
@@ -1037,6 +1039,62 @@ def _search_result_to_candidate(result: SearchResult, rank: int) -> CandidateMov
     )
 
 
+# ── TMDB 포스터 보강 헬퍼 (Phase Q-3) ──
+# 포스터 없는 후보 영화의 poster_path를 TMDB API로 가져온다.
+# 포스터 없다고 추천에서 제외하지 않고, 외부에서 데이터를 보강하는 전략.
+_TMDB_POSTER_TIMEOUT = 3.0  # 개별 API 호출 타임아웃 (초)
+
+
+async def _enrich_missing_posters(candidates: list) -> None:
+    """
+    poster_path가 빈 후보 영화에 대해 TMDB API로 포스터를 가져와 보강한다.
+
+    TMDB movie ID로 /movie/{id} 를 호출하여 poster_path를 채운다.
+    실패 시 무시 (best-effort). 원본 candidates 리스트를 in-place 수정.
+    """
+    from monglepick.config import settings
+    import asyncio
+
+    if not settings.TMDB_API_KEY:
+        return
+
+    # 포스터가 없는 영화만 대상 (최대 5편으로 제한하여 지연 최소화)
+    missing = [c for c in candidates if not c.poster_path or not c.poster_path.strip()]
+    if not missing:
+        return
+
+    missing = missing[:5]
+
+    async def _fetch_poster(movie) -> None:
+        """단일 영화의 포스터를 TMDB API에서 가져온다."""
+        try:
+            # movie.id가 TMDB 숫자 ID인 경우에만 호출
+            movie_id = movie.id
+            if not movie_id or not str(movie_id).isdigit():
+                return
+
+            url = f"{settings.TMDB_BASE_URL}/movie/{movie_id}"
+            params = {"api_key": settings.TMDB_API_KEY, "language": "ko-KR"}
+
+            async with httpx.AsyncClient(timeout=_TMDB_POSTER_TIMEOUT) as client:
+                resp = await client.get(url, params=params)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    poster = data.get("poster_path", "")
+                    if poster:
+                        movie.poster_path = poster
+                        logger.info(
+                            "tmdb_poster_enriched",
+                            movie_id=movie_id,
+                            title=movie.title,
+                            poster_path=poster,
+                        )
+        except Exception:
+            pass  # best-effort: 실패해도 추천 흐름에 영향 없음
+
+    await asyncio.gather(*[_fetch_poster(m) for m in missing])
+
+
 @traceable(name="rag_retriever", run_type="retriever", metadata={"node": "7/13", "fusion": "RRF"})
 async def rag_retriever(state: ChatAgentState) -> dict:
     """
@@ -1170,6 +1228,24 @@ async def rag_retriever(state: ChatAgentState) -> dict:
             if len(filtered) >= 2:
                 candidates = filtered
 
+        # ── year_range 후처리: ES/Neo4j 필터 누락 대비 2차 검증 ──
+        if year_range and candidates:
+            filtered = [
+                c for c in candidates
+                if not c.release_year or (year_range[0] <= c.release_year <= year_range[1])
+            ]
+            if len(filtered) >= 2:
+                candidates = filtered
+
+        # ── min_popularity 후처리: Qdrant 필터 누락 대비 2차 검증 ──
+        if min_popularity is not None and candidates:
+            filtered = [
+                c for c in candidates
+                if c.popularity_score is None or c.popularity_score >= min_popularity
+            ]
+            if len(filtered) >= 2:
+                candidates = filtered
+
         if pre_filter_count != len(candidates):
             logger.info(
                 "rag_post_filter_applied",
@@ -1179,7 +1255,69 @@ async def rag_retriever(state: ChatAgentState) -> dict:
                 min_rating=min_rating,
                 origin_country=origin_country,
                 original_language=original_language,
+                year_range=year_range,
+                min_popularity=min_popularity,
             )
+
+        # ── 데이터 품질 필터링 (Phase Q-2: 충분한 메타데이터가 있는 영화만 추천) ──
+        # 문제: 포스터/줄거리/평점이 없는 무명 영화가 검색 관련성만으로 추천되는 현상
+        # 해결: 최소 데이터 품질 기준을 충족하지 못하는 후보를 사전 제거한다.
+        # 단, 필터 후 후보가 너무 적어지면 완화하여 추천 실패를 방지한다.
+        if candidates:
+            pre_quality_count = len(candidates)
+
+            def _has_sufficient_data(movie: CandidateMovie) -> bool:
+                """
+                영화가 추천에 충분한 메타데이터를 갖추고 있는지 판정한다.
+
+                필수 조건 (Phase Q-3 내용 기반):
+                - release_year > 0 (필수 — 0이면 TMDB에 개봉일 데이터 자체가 없는 항목)
+                - 줄거리 20자 이상 OR 평점 1.0 이상 (내용/평가 중 하나는 있어야 함)
+                포스터 없어도 내용이 충분하면 통과 — 포스터는 후속 TMDB 보강으로 해결.
+                """
+                # release_year 필수: 0이면 TMDB 메타데이터가 극히 불완전한 항목
+                if not movie.release_year or movie.release_year < 1900:
+                    return False
+                # 줄거리 또는 평점 중 1개 이상 존재
+                has_overview = movie.overview and len(movie.overview.strip()) >= 20
+                has_rating = movie.rating and movie.rating >= 1.0
+                return has_overview or has_rating
+
+            quality_filtered = [c for c in candidates if _has_sufficient_data(c)]
+
+            # 품질 필터 후 후보 수에 따른 적용
+            MIN_QUALITY_KEEP = 3
+            if len(quality_filtered) >= MIN_QUALITY_KEEP:
+                candidates = quality_filtered
+            elif quality_filtered:
+                # 1~2편이라도 양질이면 그것만 사용
+                candidates = quality_filtered
+            # 양질 0편이면 원본 유지 (후속 TMDB 보강 + 저품질 안내 메시지로 대응)
+
+            if pre_quality_count != len(candidates):
+                logger.info(
+                    "data_quality_filter_applied",
+                    before=pre_quality_count,
+                    after=len(candidates),
+                    removed_count=pre_quality_count - len(candidates),
+                    session_id=session_id,
+                )
+
+        # ── 포스터 보유 영화 우선 정렬 (Phase Q-2.2) ──
+        # 동일 RRF 점수 대역에서 포스터가 있는 영화를 앞으로 배치하여
+        # 프론트엔드 movie_card UI에서 "No Poster" 카드가 상위에 노출되는 것을 방지.
+        if candidates:
+            candidates.sort(
+                key=lambda c: (
+                    1 if (c.poster_path and c.poster_path.strip()) else 0,
+                    c.rrf_score,
+                ),
+                reverse=True,
+            )
+
+        # ── TMDB 포스터 보강: 포스터 없는 영화에 대해 TMDB API로 poster_path 채움 ──
+        # 포스터 없다고 추천에서 제외하지 않고, 외부에서 데이터를 보강하는 전략.
+        await _enrich_missing_posters(candidates)
 
         elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
@@ -1300,14 +1438,53 @@ async def retrieval_quality_checker(state: ChatAgentState) -> dict:
                 "retrieval_feedback": "검색 결과의 전반적인 품질이 부족해요. 장르나 분위기를 더 알려주시겠어요?",
             }
 
+        # ── 개별 영화 데이터 품질 필터링 (Phase Q-3 내용 기반) ──
+        # release_year 필수 + (줄거리 or 평점) 기준. rag_retriever와 동일.
+        # 포스터 없어도 내용이 충분하면 통과 — 포스터는 TMDB 보강으로 해결.
+        high_quality: list = []
+        low_quality: list = []
+        for c in candidates:
+            has_year = bool(c.release_year and c.release_year >= 1900)
+            has_overview = bool(c.overview and len(c.overview.strip()) >= 20)
+            has_rating = bool(c.rating and c.rating >= 1.0)
+            # 연도 필수, 줄거리/평점 중 1개 이상
+            if has_year and (has_overview or has_rating):
+                high_quality.append(c)
+            else:
+                low_quality.append(c)
+
+        low_quality_count = len(low_quality)
+
+        # 양질 후보가 최소 기준 이상이면 저품질 제거, 아니면 부족분만큼 저품질에서 보충
+        if len(high_quality) >= RETRIEVAL_MIN_CANDIDATES:
+            filtered_candidates = high_quality
+        else:
+            # 양질 후보 부족: 저품질 중 RRF 점수 상위로 보충하여 최소 기준 충족
+            need = RETRIEVAL_MIN_CANDIDATES - len(high_quality)
+            low_quality_sorted = sorted(low_quality, key=lambda c: c.rrf_score, reverse=True)
+            filtered_candidates = high_quality + low_quality_sorted[:need]
+
+        if low_quality_count > 0:
+            logger.info(
+                "retrieval_quality_filtered",
+                original_count=len(candidates),
+                filtered_count=len(filtered_candidates),
+                removed_count=len(candidates) - len(filtered_candidates),
+                low_quality_titles=[c.title for c in low_quality],
+                session_id=session_id,
+            )
+
         # 모든 조건 통과
         elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info("retrieval_quality_checked", passed=True,
                     top_score=round(top_score, 6), avg_score=round(avg_score, 6),
-                    candidate_count=len(candidates), elapsed_ms=round(elapsed_ms, 1), session_id=session_id)
+                    candidate_count=len(filtered_candidates),
+                    low_quality_removed=len(candidates) - len(filtered_candidates),
+                    elapsed_ms=round(elapsed_ms, 1), session_id=session_id)
         return {
             "retrieval_quality_passed": True,
             "retrieval_feedback": "",
+            "candidate_movies": filtered_candidates,
         }
 
     except Exception as e:
@@ -1316,6 +1493,194 @@ async def retrieval_quality_checker(state: ChatAgentState) -> dict:
                       elapsed_ms=round(elapsed_ms, 1), session_id=session_id)
         # 에러 시 통과 처리하여 추천 흐름 계속 진행
         return {"retrieval_quality_passed": True, "retrieval_feedback": ""}
+
+
+# ============================================================
+# 7.6. similar_fallback_search — 품질 미달 시 비슷한 영화 확장 검색 (Phase Q-3)
+# ============================================================
+
+@traceable(name="similar_fallback_search", run_type="retriever", metadata={"node": "7.6/16"})
+async def similar_fallback_search(state: ChatAgentState) -> dict:
+    """
+    검색 품질 미달 시, 기존 후보 영화의 장르/무드를 활용해 비슷한 영화를 확장 검색한다.
+
+    기존 후보가 있지만 품질이 낮을 때(데이터 부족, 무명 영화 등),
+    상위 후보의 장르·무드태그를 기반으로 hybrid_search를 다시 수행하여
+    충분한 데이터를 가진 유사 영화로 후보를 보강한다.
+
+    전략:
+    1. 기존 후보 상위 3편에서 장르/무드태그 추출
+    2. 추출한 장르·무드를 필터로 hybrid_search 재실행
+    3. 기존 후보의 ID는 exclude하여 중복 방지
+    4. 새 결과 + 기존 고품질 후보를 합산하여 candidate_movies 업데이트
+
+    Args:
+        state: ChatAgentState (candidate_movies, search_query 필요)
+
+    Returns:
+        dict: candidate_movies(확장된 list[CandidateMovie]) 업데이트
+    """
+    node_start = time.perf_counter()
+    session_id = state.get("session_id", "")
+    user_id = state.get("user_id", "")
+    try:
+        candidates = state.get("candidate_movies", [])
+        search_query = state.get("search_query")
+
+        if not candidates:
+            return {"candidate_movies": []}
+
+        # ── 1. 기존 후보 상위 3편에서 장르/무드 추출 ──
+        top_candidates = candidates[:3]
+        fallback_genres: list[str] = []
+        fallback_moods: list[str] = []
+        exclude_ids: list[str] = [c.id for c in candidates]
+
+        for c in top_candidates:
+            fallback_genres.extend(c.genres[:2])
+            if c.mood_tags:
+                fallback_moods.extend(c.mood_tags[:2])
+
+        # 중복 제거
+        fallback_genres = list(dict.fromkeys(fallback_genres))[:5]
+        fallback_moods = list(dict.fromkeys(fallback_moods))[:4]
+
+        # ── 2. 장르/무드 기반으로 확장 검색 ──
+        # 기존 검색어 대신 장르+무드를 의미적 쿼리로 구성
+        semantic_parts = []
+        if fallback_genres:
+            semantic_parts.append(" ".join(fallback_genres))
+        if fallback_moods:
+            semantic_parts.append(" ".join(fallback_moods))
+        # 원래 사용자 입력도 포함하여 관련성 유지
+        original_query = state.get("current_input", "")
+        if original_query:
+            semantic_parts.append(original_query[:50])
+
+        fallback_query = " ".join(semantic_parts) if semantic_parts else "인기 영화 추천"
+
+        logger.info(
+            "similar_fallback_search_start",
+            original_candidates=len(candidates),
+            fallback_genres=fallback_genres,
+            fallback_moods=fallback_moods,
+            fallback_query=fallback_query[:80],
+            exclude_count=len(exclude_ids),
+            session_id=session_id,
+        )
+
+        from monglepick.rag.hybrid_search import hybrid_search
+
+        # ── 원본 동적 필터 보존 (Phase Q-2.2) ──
+        # fallback 검색에서도 원래 사용자 쿼리의 국가/연도/인기도 필터를 유지하여
+        # "한국 영화" 요청 시 비한국 영화가 fallback으로 추천되는 것을 방지.
+        orig_filters = search_query.filters if search_query else {}
+
+        results = await hybrid_search(
+            query=fallback_query,
+            top_k=15,
+            genre_filter=fallback_genres if fallback_genres else None,
+            mood_tags=fallback_moods if fallback_moods else None,
+            exclude_ids=exclude_ids,
+            origin_country_filter=orig_filters.get("origin_country"),
+            language_filter=orig_filters.get("original_language"),
+            year_range=orig_filters.get("year_range"),
+            min_popularity=orig_filters.get("min_popularity"),
+            min_vote_count=orig_filters.get("min_vote_count"),
+            min_rating=orig_filters.get("min_rating"),
+        )
+
+        # ── 3. SearchResult → CandidateMovie 변환 ──
+        new_candidates = [
+            _search_result_to_candidate(r, i)
+            for i, r in enumerate(results)
+        ]
+
+        # ── 4. 데이터 품질 필터 적용 (Phase Q-3 내용 기반, rag_retriever와 동일 기준) ──
+        def _has_sufficient_data(movie) -> bool:
+            # release_year 필수: 0이면 TMDB 메타데이터 극히 불완전
+            if not movie.release_year or movie.release_year < 1900:
+                return False
+            # 줄거리 또는 평점 중 1개 이상
+            has_overview = movie.overview and len(movie.overview.strip()) >= 20
+            has_rating = movie.rating and movie.rating >= 1.0
+            return has_overview or has_rating
+
+        quality_new = [c for c in new_candidates if _has_sufficient_data(c)]
+
+        # ── 5. 기존 고품질 후보 + 새 결과 합산 ──
+        # 기존 후보 중 데이터 품질이 좋은 것은 유지
+        quality_existing = [c for c in candidates if _has_sufficient_data(c)]
+
+        # 합산: 기존 고품질 + 새 결과 (중복 ID 제거)
+        seen_ids: set[str] = set()
+        merged: list[CandidateMovie] = []
+        for c in quality_existing + quality_new:
+            if c.id not in seen_ids:
+                seen_ids.add(c.id)
+                merged.append(c)
+
+        # 최소 5편 확보 못하면 기존 전체 + 새 결과로 완화
+        if len(merged) < 5:
+            for c in candidates + new_candidates:
+                if c.id not in seen_ids:
+                    seen_ids.add(c.id)
+                    merged.append(c)
+
+        # ── 5편 보장: 아직 부족하면 장르 필터 없이 추가 검색 ──
+        if len(merged) < 5:
+            logger.info(
+                "similar_fallback_extra_search",
+                current_count=len(merged),
+                reason="still_under_5_after_genre_search",
+                session_id=session_id,
+            )
+            extra_exclude = list(seen_ids)
+            # 추가 검색에도 원본 국가/언어 필터 보존 (장르 필터는 해제하여 범위 확장)
+            extra_results = await hybrid_search(
+                query=original_query or "인기 영화 추천",
+                top_k=15,
+                exclude_ids=extra_exclude,
+                origin_country_filter=orig_filters.get("origin_country"),
+                language_filter=orig_filters.get("original_language"),
+            )
+            extra_candidates = [
+                _search_result_to_candidate(r, i)
+                for i, r in enumerate(extra_results)
+            ]
+            # 품질 좋은 것 우선, 부족하면 전부 추가
+            extra_quality = [c for c in extra_candidates if _has_sufficient_data(c)]
+            for c in extra_quality + extra_candidates:
+                if len(merged) >= 10:
+                    break
+                if c.id not in seen_ids:
+                    seen_ids.add(c.id)
+                    merged.append(c)
+
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.info(
+            "similar_fallback_search_done",
+            original_count=len(candidates),
+            new_found=len(quality_new),
+            merged_count=len(merged),
+            elapsed_ms=round(elapsed_ms, 1),
+            session_id=session_id,
+        )
+
+        return {"candidate_movies": merged}
+
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error(
+            "similar_fallback_search_error",
+            error=str(e),
+            error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(),
+            elapsed_ms=round(elapsed_ms, 1),
+            session_id=session_id,
+        )
+        # 에러 시 기존 후보 그대로 유지
+        return {"candidate_movies": state.get("candidate_movies", [])}
 
 
 # ============================================================
@@ -1540,6 +1905,23 @@ async def explanation_generator(state: ChatAgentState) -> dict:
         if not ranked:
             return {"ranked_movies": []}
 
+        # ── 영화 정보 외부 검색 보강 (overview 부족 시 DuckDuckGo 검색) ──
+        # overview가 250자 미만인 영화에 대해 Wikipedia/나무위키 등에서 줄거리를 수집하여
+        # LLM 추천 이유 생성의 품질을 높인다. 검색 실패 시 원본 그대로 사용 (에러 전파 금지).
+        ranked_dicts = [m.model_dump() for m in ranked]
+        enriched_dicts = await enrich_movies_batch(ranked_dicts, max_concurrent=3)
+
+        # 보강된 overview를 RankedMovie에 반영 (model_copy로 불변성 유지)
+        enriched_ranked: list[RankedMovie] = []
+        for original, enriched_dict in zip(ranked, enriched_dicts):
+            if enriched_dict.get("_enriched"):
+                # 외부 검색으로 보강된 영화 → overview 업데이트
+                enriched_ranked.append(
+                    original.model_copy(update={"overview": enriched_dict["overview"]})
+                )
+            else:
+                enriched_ranked.append(original)
+
         # 시청 이력 제목 목록 (상위 5개)
         watch_titles = [
             wh.get("title", "") for wh in watch_history[:5] if wh.get("title")
@@ -1549,9 +1931,9 @@ async def explanation_generator(state: ChatAgentState) -> dict:
         emotion_str = emotion.emotion if emotion else None
         user_mood_tags = emotion.mood_tags if emotion else None
 
-        # 배치 생성 (사용자 원문 메시지 + 무드태그 전달)
+        # 배치 생성 (보강된 영화 데이터 + 사용자 원문 메시지 + 무드태그 전달)
         explanations = await generate_explanations_batch(
-            movies=ranked,
+            movies=enriched_ranked,
             emotion=emotion_str,
             user_mood_tags=user_mood_tags,
             user_message=current_input,
@@ -1560,9 +1942,16 @@ async def explanation_generator(state: ChatAgentState) -> dict:
         )
 
         # 각 RankedMovie에 explanation 할당 (불변 모델이므로 새 인스턴스 생성)
+        # 마크다운 후처리: LLM이 **bold** 등을 쓸 경우 순수 텍스트로 정리
+        # 최종 반환에는 원본(ranked) 기반으로 생성하여 '[외부 정보]' 태그가
+        # 사용자에게 노출되지 않도록 한다 (보강 overview는 LLM 입력에만 사용).
         updated_ranked: list[RankedMovie] = []
-        for movie, explanation in zip(ranked, explanations):
-            updated = movie.model_copy(update={"explanation": explanation})
+        for original_movie, explanation in zip(ranked, explanations):
+            clean = re.sub(r"\*\*(.+?)\*\*", r"\1", explanation)
+            clean = re.sub(r"\*(.+?)\*", r"\1", clean)
+            clean = re.sub(r"^#{1,6}\s+", "", clean, flags=re.MULTILINE)
+            clean = re.sub(r"^[-*]\s+", "", clean, flags=re.MULTILINE)
+            updated = original_movie.model_copy(update={"explanation": clean})
             updated_ranked.append(updated)
 
         elapsed_ms = (time.perf_counter() - node_start) * 1000
@@ -1646,6 +2035,17 @@ async def response_formatter(state: ChatAgentState) -> dict:
                 user_message=current_input,
             )
 
+            # ── 저품질 결과 안내 (Phase Q-2.2) ──
+            # 모든 추천 영화가 포스터+줄거리 모두 부족하면 사용자에게 조건 완화 안내.
+            # 프론트엔드에서 "No Poster" + 빈 설명 카드만 보이는 최악 UX 방지.
+            high_quality_count = sum(
+                1 for m in ranked
+                if (m.poster_path and m.poster_path.strip())
+                and (m.overview and len(m.overview.strip()) >= 20)
+            )
+            if high_quality_count == 0:
+                response += "\n\n조건에 딱 맞는 영화를 찾기 어려웠어요. 조건을 조금 넓혀주시면 더 좋은 추천을 드릴 수 있을 것 같아요!"
+
         # 후속 질문 응답: 몽글이가 질문을 대화체로 전달
         elif existing_response and clarification:
             # clarification이 있으면 후속 질문 응답
@@ -1667,6 +2067,13 @@ async def response_formatter(state: ChatAgentState) -> dict:
             response = existing_response
         else:
             response = "무엇을 도와드릴까요? 영화 추천이 필요하시면 말씀해주세요!"
+
+        # ── 마크다운 후처리: LLM이 지시를 무시하고 마크다운을 쓸 경우 제거 ──
+        # **굵게**, ##제목, - 목록 등을 순수 텍스트로 정리
+        response = re.sub(r"\*\*(.+?)\*\*", r"\1", response)  # **bold** → bold
+        response = re.sub(r"\*(.+?)\*", r"\1", response)      # *italic* → italic
+        response = re.sub(r"^#{1,6}\s+", "", response, flags=re.MULTILINE)  # ## 제목 → 제목
+        response = re.sub(r"^[-*]\s+", "", response, flags=re.MULTILINE)    # - 목록 → 목록
 
         # assistant 메시지 추가 (timestamp + movies 포함 — 이전 대화 복원 시 영화 카드도 표시)
         assistant_msg: dict = {

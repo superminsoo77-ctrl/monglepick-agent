@@ -642,7 +642,9 @@ async def popularity_fallback(state: RecommendationEngineState) -> dict:
 
         for movie in candidates:
             # 평점 점수: rating / 10.0 (TMDB 평점 0~10 → 0~1), 가중치 40%
-            rating_score = min(movie.rating / 10.0, 1.0) if movie.rating > 0 else 0.3
+            # Phase Q-2: 평점 0 = 평가 데이터 없음 → 0.1로 강한 페널티 (기존 0.3)
+            # 추가로 포스터/줄거리 없는 영화도 페널티를 적용하여 데이터 부족 영화 하위 배치
+            rating_score = min(movie.rating / 10.0, 1.0) if movie.rating and movie.rating >= 1.0 else 0.1
 
             # 장르 매칭 부스트: 가중치 20%
             genre_score = 0.0
@@ -665,14 +667,28 @@ async def popularity_fallback(state: RecommendationEngineState) -> dict:
             raw_pop = movie.popularity_score if movie.popularity_score else 0.0
             popularity_score = min(math.log1p(raw_pop) / math.log1p(1000), 1.0)
 
-            # 가중 합산 (총 100%)
+            # ── Phase Q-2: 데이터 품질 페널티 ──
+            # 포스터/줄거리/평점이 부족한 영화는 최종 점수에 페널티를 적용한다.
+            # 3개 중 충족 개수로 품질 계수 결정: 3개=1.0, 2개=0.8, 1개=0.5, 0개=0.2
+            data_quality_fields = 0
+            if movie.poster_path and movie.poster_path.strip():
+                data_quality_fields += 1
+            if movie.overview and len(movie.overview.strip()) >= 20:
+                data_quality_fields += 1
+            if movie.rating and movie.rating >= 1.0:
+                data_quality_fields += 1
+            data_quality_multiplier = {3: 1.0, 2: 0.8, 1: 0.5, 0: 0.2}.get(
+                data_quality_fields, 0.2
+            )
+
+            # 가중 합산 (총 100%) × 데이터 품질 계수
             hybrid_scores[movie.id] = (
                 0.40 * rating_score
                 + 0.20 * genre_score
                 + 0.10 * mood_score
                 + 0.15 * rrf_score
                 + 0.15 * popularity_score
-            )
+            ) * data_quality_multiplier
 
         # min-max 정규화
         hybrid_scores = _min_max_normalize(hybrid_scores)
@@ -701,6 +717,27 @@ async def popularity_fallback(state: RecommendationEngineState) -> dict:
             "cf_scores": {c.id: 0.0 for c in candidates},
             "cbf_scores": {c.id: 0.0 for c in candidates},
         }
+
+
+# ── 데이터 품질 보너스 헬퍼 (Phase Q-2.1) ──
+# 포스터/줄거리/평점 완비도에 따라 0.0~0.005 가산점을 반환한다.
+# MMR 점수에 반영하여 메타데이터가 충실한 영화를 우선 추천한다.
+# 가산점 범위(0.005)는 RRF 평균(~0.01)의 절반 수준으로, 관련성을 뒤집지 않되
+# 비슷한 점수의 후보 간에 품질 좋은 쪽을 선호하도록 설계.
+DATA_QUALITY_BONUS = 0.005
+
+
+def _data_quality_bonus(movie) -> float:
+    """포스터/줄거리/평점 완비도에 따른 MMR 가산점 (0.0 ~ DATA_QUALITY_BONUS)."""
+    fields = 0
+    total = 3
+    if movie.poster_path and movie.poster_path.strip():
+        fields += 1
+    if movie.overview and len(movie.overview.strip()) >= 20:
+        fields += 1
+    if movie.rating and movie.rating >= 1.0:
+        fields += 1
+    return DATA_QUALITY_BONUS * (fields / total)
 
 
 # ============================================================
@@ -756,10 +793,14 @@ async def diversity_reranker(state: RecommendationEngineState) -> dict:
                 break
 
             if i == 0:
-                # 첫 영화: 최고 hybrid_score 선택
-                best_id = max(remaining, key=lambda mid: hybrid_scores.get(mid, 0.0))
+                # 첫 영화: 최고 hybrid_score 선택 (품질 보너스 포함)
+                best_id = max(
+                    remaining,
+                    key=lambda mid: hybrid_scores.get(mid, 0.0) + _data_quality_bonus(candidate_map[mid]),
+                )
             else:
-                # MMR_score 계산: λ × relevance - (1 - λ) × max_genre_sim
+                # MMR_score 계산: λ × relevance - (1 - λ) × max_genre_sim + quality_bonus
+                # quality_bonus: 포스터/줄거리/평점 완비도에 따른 가산점 (0.0 ~ 0.005)
                 best_id = None
                 best_mmr = float("-inf")
 
@@ -782,7 +823,9 @@ async def diversity_reranker(state: RecommendationEngineState) -> dict:
                         if sim > max_sim:
                             max_sim = sim
 
-                    mmr_score = MMR_LAMBDA * relevance - (1 - MMR_LAMBDA) * max_sim
+                    # 데이터 품질 보너스: 포스터/줄거리/평점 완비 시 가산점
+                    quality_bonus = _data_quality_bonus(movie)
+                    mmr_score = MMR_LAMBDA * relevance - (1 - MMR_LAMBDA) * max_sim + quality_bonus
 
                     if mmr_score > best_mmr:
                         best_mmr = mmr_score

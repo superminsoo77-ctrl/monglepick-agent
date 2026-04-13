@@ -43,8 +43,8 @@ MAX_RERANK_CANDIDATES = 10
 # 재랭킹 최소 통과 점수 (이 점수 미만은 제거 대상)
 MIN_RERANK_SCORE = 3.0
 
-# 재랭킹 후 최소 유지 후보 수 (너무 적으면 필터 완화)
-MIN_KEEP_CANDIDATES = 3
+# 재랭킹 후 최소 유지 후보 수 — TOP_K(5)와 동일하게 설정하여 항상 5편 추천 보장
+MIN_KEEP_CANDIDATES = 5
 
 
 def _format_candidate_for_rerank(movie: CandidateMovie, idx: int) -> str:
@@ -86,11 +86,18 @@ def _format_candidate_for_rerank(movie: CandidateMovie, idx: int) -> str:
         parts.append(f"국가: {', '.join(movie.origin_country)}")
 
     # 줄거리는 150자로 제한 (토큰 절약)
-    if movie.overview:
+    if movie.overview and len(movie.overview.strip()) >= 20:
         overview = movie.overview[:150]
         if len(movie.overview) > 150:
             overview += "..."
         parts.append(f"줄거리: {overview}")
+    else:
+        parts.append("줄거리: 없음")
+
+    # ── Phase Q-2: 데이터 품질 신호를 LLM에 명시적으로 전달 ──
+    # 포스터 유무 (없으면 LLM이 "데이터 부족" 감점 판단에 활용)
+    if not movie.poster_path or not movie.poster_path.strip():
+        parts.append("포스터: 없음")
 
     # movie_id를 마지막에 추가 (LLM이 응답에 포함하도록)
     parts.append(f"[ID: {movie.id}]")

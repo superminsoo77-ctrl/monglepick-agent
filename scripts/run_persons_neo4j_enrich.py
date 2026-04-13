@@ -200,11 +200,13 @@ def _person_to_cypher_row(person: dict) -> dict | None:
 # ══════════════════════════════════════════════════════════════
 
 
-def _jsonl_batches(path: Path, batch_size: int, skip_lines: int = 0):
-    """JSONL → batch_size 단위로 (rows, last_line, invalid_count) yield."""
+def _jsonl_batches(path: Path, batch_size: int, skip_lines: int = 0, min_popularity: float | None = None):
+    """JSONL → batch_size 단위로 (rows, last_line, invalid_count) yield.
+    min_popularity: 설정 시 popularity >= 이 값인 Person만 처리."""
     rows: list[dict] = []
     line_no = 0
     invalid_count = 0
+    pop_skipped = 0
 
     with path.open("r", encoding="utf-8") as f:
         for raw_line in f:
@@ -219,6 +221,13 @@ def _jsonl_batches(path: Path, batch_size: int, skip_lines: int = 0):
             except json.JSONDecodeError:
                 invalid_count += 1
                 continue
+
+            # popularity 필터
+            if min_popularity is not None and min_popularity > 0:
+                pop = obj.get("popularity", 0) or 0
+                if pop < min_popularity:
+                    pop_skipped += 1
+                    continue
 
             row = _person_to_cypher_row(obj)
             if row is None:
@@ -266,6 +275,7 @@ async def run_persons_neo4j_enrich(
     batch_size: int = DEFAULT_BATCH_SIZE,
     limit: int | None = None,
     resume: bool = False,
+    min_popularity: float | None = None,
 ) -> None:
     pipeline_start = time.time()
 
@@ -304,8 +314,11 @@ async def run_persons_neo4j_enrich(
 
         checkpoint["phase"] = "enriching"
 
+        if min_popularity:
+            print(f"  min_popularity: {min_popularity}")
+
         for batch_rows, last_line, invalid_count in _jsonl_batches(
-            INPUT_JSONL, batch_size, skip_lines=skip_lines
+            INPUT_JSONL, batch_size, skip_lines=skip_lines, min_popularity=min_popularity
         ):
             chunk_start = time.time()
 
@@ -442,6 +455,10 @@ def parse_args() -> argparse.Namespace:
         help="체크포인트 last_jsonl_line 부터 재개",
     )
     parser.add_argument(
+        "--min-popularity", type=float, default=None,
+        help="popularity 최소값 필터 (인기 Person만, 예: 2.0)",
+    )
+    parser.add_argument(
         "--status", action="store_true",
         help="현재 체크포인트 + Neo4j 통계만 출력",
     )
@@ -458,5 +475,6 @@ if __name__ == "__main__":
                 batch_size=args.batch_size,
                 limit=args.limit,
                 resume=args.resume,
+                min_popularity=args.min_popularity,
             )
         )

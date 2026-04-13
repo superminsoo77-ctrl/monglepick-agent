@@ -444,7 +444,7 @@ async def check_07_omdb() -> CheckResult:
                 )
                 imdb_count = (await cursor.fetchone())[0]
                 await cursor.execute(
-                    "SELECT COUNT(*) FROM movie_external_ratings WHERE rotten_tomatoes IS NOT NULL"
+                    "SELECT COUNT(*) FROM movie_external_ratings WHERE rotten_tomatoes_score IS NOT NULL"
                 )
                 rt_count = (await cursor.fetchone())[0]
                 await cursor.execute(
@@ -558,11 +558,24 @@ async def check_10_person_pipeline() -> CheckResult:
 
 
 async def check_11_movie_llm_enrichment() -> CheckResult:
-    """Movie LLM 보강 (5 target) 채움률."""
-    samples = _qdrant_scroll(2000)
+    """Movie LLM 보강 (5 target) — popularity 구간별 채움률 정밀 검증."""
+    samples = _qdrant_scroll(5000)
     n = len(samples)
     if n == 0:
         return CheckResult(11, "Movie LLM 보강", False, details={"error": "샘플 0"})
+
+    # popularity 구간별 분석
+    pop_buckets = {
+        "pop>=10 유명작": {"min": 10, "max": 999999},
+        "pop 5~10 인기": {"min": 5, "max": 10},
+        "pop 2~5 보통": {"min": 2, "max": 5},
+        "pop <2 비인기": {"min": 0, "max": 2},
+    }
+    bucket_stats: dict[str, dict] = {
+        name: {"total": 0, "tagline_ko": 0, "category_tags": 0, "overview_ko": 0,
+               "one_line_summary": 0, "llm_keywords": 0}
+        for name in pop_buckets
+    }
 
     counts = {
         "tagline_ko": 0,
@@ -573,22 +586,50 @@ async def check_11_movie_llm_enrichment() -> CheckResult:
     }
     for p in samples:
         pl = p.get("payload", {}) or {}
+        pop = pl.get("popularity_score") or 0
+
+        # 전체 카운트 + 구간별 카운트
         for k in counts:
             v = pl.get(k)
             if v and (not isinstance(v, str) or v.strip()):
                 counts[k] += 1
 
-    details = {k: f"{v}/{n} ({v*100/n:.1f}%)" for k, v in counts.items()}
-    total_any = sum(1 for p in samples if any(
-        (p.get("payload", {}) or {}).get(k) for k in counts
-    ))
-    details["any_target"] = f"{total_any}/{n} ({total_any*100/n:.1f}%)"
+        # popularity 구간별 집계
+        for bname, brange in pop_buckets.items():
+            if brange["min"] <= pop < brange["max"]:
+                bucket_stats[bname]["total"] += 1
+                for k in counts:
+                    v = pl.get(k)
+                    if v and (not isinstance(v, str) or v.strip()):
+                        bucket_stats[bname][k] += 1
+                break
 
-    # Phase 7 실행 여부 판단: 하나라도 20% 이상이면 실행됨
-    any_executed = any(v / n >= 0.2 for v in counts.values())
-    passed = any_executed
-    warn = not passed
-    return CheckResult(11, "Movie LLM 보강 (5 target)", passed, warn=warn, details=details)
+    details = {k: f"{v}/{n} ({v*100/n:.1f}%)" for k, v in counts.items()}
+
+    # popularity 구간별 채움률 (핵심 검증)
+    details["popularity 구간별"] = "---"
+    for bname, stats in bucket_stats.items():
+        bt = stats["total"]
+        if bt == 0:
+            details[f"  {bname}"] = "0건"
+            continue
+        cat_rate = stats["category_tags"] * 100 / bt
+        tag_rate = stats["tagline_ko"] * 100 / bt
+        details[f"  {bname} ({bt}건)"] = f"category={cat_rate:.0f}% tagline={tag_rate:.0f}%"
+
+    # 합격 기준 (보강):
+    # - 인기작 (pop≥2.0) 구간에서 category_tags 80% 이상이면 PASS
+    # - 비인기작은 mood_tags 100% (Task #5)로 기본 품질 보장
+    pop2_stats = {k: v for bname, v in bucket_stats.items()
+                  for k in [bname] if "비인기" not in bname}
+    pop2_total = sum(v["total"] for v in pop2_stats.values())
+    pop2_category = sum(v["category_tags"] for v in pop2_stats.values())
+    pop2_rate = pop2_category * 100 / max(pop2_total, 1)
+
+    details["인기작(pop>=2) category 채움률"] = f"{pop2_rate:.1f}%"
+    passed = pop2_rate >= 80
+    warn = not passed and pop2_rate >= 50
+    return CheckResult(11, "Movie LLM 보강 (popularity 구간별)", passed, warn=warn, details=details)
 
 
 async def check_12_redis_cf() -> CheckResult:
@@ -622,7 +663,7 @@ async def check_13_sample_movies() -> CheckResult:
     samples_to_check = [
         ("496243", "기생충", "Parasite"),
         ("157336", "인터스텔라", "Interstellar"),
-        ("385128", "부산행", "Train to Busan"),  # 2016
+        ("396535", "부산행", "Train to Busan"),  # 2016
         ("313369", "라라랜드", "La La Land"),
         ("670", "올드보이", "Oldboy"),
     ]

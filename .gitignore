@@ -74,3 +74,5 @@ CLAUDE.md
 
 # ── Python 런타임 고정 (pyenv/uv) ──
 .python-version
+
+/db_dumps

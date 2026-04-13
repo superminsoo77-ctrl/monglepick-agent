@@ -103,6 +103,9 @@ def _scroll_qdrant_payloads(
         # KMDb 풀필드
         "kmdb_id", "awards", "filming_location",
         "soundtrack", "theme_song",
+        # Phase 7 Movie LLM 보강
+        "tagline_ko", "overview_ko", "category_tags",
+        "one_line_summary", "llm_keywords",
         # 출처
         "source",
     ]
@@ -304,7 +307,13 @@ def _payload_to_mysql_row(point_id: str, payload: dict) -> tuple:
         filming_location,                                                      # 56. filming_location
         soundtrack,                                                            # 57. soundtrack
         theme_song,                                                            # 58. theme_song
-        source,                                                                # 59. source
+        # Phase 7 Movie LLM 보강
+        (payload.get("tagline_ko", "") or "")[:500] or None,                   # 59. tagline_ko
+        (payload.get("overview_ko", "") or "")[:65535] or None,                # 60. overview_ko
+        _json_or_null(payload.get("category_tags")),                           # 61. category_tags (JSON)
+        (payload.get("one_line_summary", "") or "")[:500] or None,             # 62. one_line_summary
+        _json_or_null(payload.get("llm_keywords")),                            # 63. llm_keywords (JSON)
+        source,                                                                # 64. source
     )
 
 
@@ -338,8 +347,11 @@ INSERT INTO movies (
     kobis_movie_cd, sales_acc, audience_count, screen_count, kobis_nation,
     kobis_watch_grade, kobis_open_dt, kobis_type_nm, kobis_directors, kobis_actors,
     kobis_companies, kobis_staffs, kobis_genres, kmdb_id, awards,
-    filming_location, soundtrack, theme_song, source
+    filming_location, soundtrack, theme_song,
+    tagline_ko, overview_ko, category_tags, one_line_summary, llm_keywords,
+    source
 ) VALUES (
+    %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s,
     %s, %s, %s, %s, %s,
@@ -410,6 +422,11 @@ INSERT INTO movies (
     filming_location = VALUES(filming_location),
     soundtrack = VALUES(soundtrack),
     theme_song = VALUES(theme_song),
+    tagline_ko = VALUES(tagline_ko),
+    overview_ko = VALUES(overview_ko),
+    category_tags = VALUES(category_tags),
+    one_line_summary = VALUES(one_line_summary),
+    llm_keywords = VALUES(llm_keywords),
     source = VALUES(source)
 """
 

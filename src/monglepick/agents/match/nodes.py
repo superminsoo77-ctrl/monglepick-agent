@@ -590,6 +590,7 @@ async def rag_retriever(state: MovieMatchState) -> dict:
             relaxed_query = {
                 **search_query,
                 "genre_filter": union_genres[:5] if union_genres else None,
+                "mood_filter": None,    # 무드 필터 제거 — 특수 무드 태그로 인한 0건 방지
                 "year_range": None,     # 연도 제한 제거
                 "min_rating": None,     # 최소 평점 제거
                 "top_k": 20,

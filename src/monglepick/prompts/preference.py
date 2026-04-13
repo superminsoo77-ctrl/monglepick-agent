@@ -65,10 +65,18 @@ DB에서 직접 필터링할 수 있는 조건만 추출합니다.
 
 ### 필터 추출 규칙:
 - "평점 높은" → rating >= 7.0 (명시적 수치가 없으면 합리적 기본값 사용)
-- "최신" → release_year >= 현재연도-2 (대략적 기준)
-- "인기 있는" → popularity_score >= 50.0 또는 vote_count >= 500
+- "요즘", "최근", "신작" → release_year >= {current_year} - 1 (직전 1년)
+- "최신" → release_year >= {current_year} - 2 (대략적 기준)
+- "인기 있는", "인기" → popularity_score >= 50.0 또는 vote_count >= 500
 - 필터로 변환할 수 없는 주관적 표현은 user_intent에만 반영
 - 확실하지 않은 조건은 필터로 만들지 마세요
+
+### 복합 조건 추출 예시 (반드시 각 조건을 개별 dynamic_filter로 추출):
+- "요즘 인기 있는 한국 영화" → dynamic_filters: [release_year gte {current_year}-1, popularity_score gte 50.0, origin_country contains "KR"]
+- "평점 높은 최신 일본 애니" → dynamic_filters: [rating gte 7.0, release_year gte {current_year}-2, origin_country contains "JP"], genre_preference: "애니메이션"
+- "넷플릭스에서 볼 수 있는 최근 미국 스릴러" → dynamic_filters: [release_year gte {current_year}-1, origin_country contains "US"], genre_preference: "스릴러", platform: "넷플릭스"
+
+중요: 국가/시기/인기도가 동시에 언급되면 각각을 개별 dynamic_filter로 추출하세요. 하나라도 빠뜨리면 검색 결과가 부정확해집니다.
 
 ## 3. search_keywords (검색 키워드)
 시맨틱 검색을 보강할 **핵심 키워드**를 추출하세요.
@@ -100,6 +108,8 @@ DB에서 직접 필터링할 수 있는 조건만 추출합니다.
 JSON 형식으로 모든 필드를 반환하세요."""
 
 PREFERENCE_HUMAN_PROMPT = """\
+현재 연도: {current_year}
+
 이전에 파악된 선호 조건:
 {existing_prefs}
 

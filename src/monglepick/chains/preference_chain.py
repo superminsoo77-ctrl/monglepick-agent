@@ -113,10 +113,12 @@ async def extract_preferences(
     # 이전 선호 조건을 포맷
     existing_prefs_str = _format_existing_preferences(previous_preferences)
 
-    # 입력 변수
+    # 입력 변수 — current_year: LLM이 "요즘/최근" → 정확한 release_year 필터로 변환하도록 현재 연도 주입
+    from datetime import datetime
     inputs = {
         "current_input": current_input,
         "existing_prefs": existing_prefs_str,
+        "current_year": str(datetime.now().year),
     }
 
     logger.info(

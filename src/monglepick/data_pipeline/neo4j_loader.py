@@ -276,14 +276,38 @@ async def load_person_nodes(documents: list[MovieDocument]) -> None:
 
     data = list(persons_by_name.values())
 
-    # MERGE로 중복 방지, CASE WHEN으로 기존 값이 있으면 유지 (더 상세한 정보 우선)
-    cypher = """
-    UNWIND $batch AS p
-    MERGE (person:Person {name: p.name})
-    SET person.person_id = CASE WHEN p.person_id > 0 THEN p.person_id ELSE person.person_id END,
-        person.profile_path = CASE WHEN p.profile_path <> '' THEN p.profile_path ELSE person.profile_path END
-    """
-    await _batch_execute(cypher, data, NODE_BATCH_SIZE, "person_nodes")
+    # P1-1 수정: Person 노드 MERGE 키를 person_id 기반으로 변경 (동명이인 병합 방지).
+    # - person_id > 0: TMDB person ID 기준 MERGE (정확한 식별)
+    # - person_id = 0 또는 없음: name 기준 MERGE (fallback, KOBIS/KMDb 무명 인물)
+    # 두 그룹을 분리하여 각각 다른 MERGE 쿼리 실행.
+    data_with_id = [p for p in data if p.get("person_id", 0) and p["person_id"] > 0]
+    data_name_only = [p for p in data if not p.get("person_id") or p["person_id"] <= 0]
+
+    # person_id 기반 MERGE (정확한 식별 — 동명이인 분리)
+    if data_with_id:
+        cypher_by_id = """
+        UNWIND $batch AS p
+        MERGE (person:Person {person_id: p.person_id})
+        SET person.name = CASE WHEN p.name <> '' THEN p.name ELSE person.name END,
+            person.profile_path = CASE WHEN p.profile_path <> '' THEN p.profile_path ELSE person.profile_path END
+        """
+        await _batch_execute(cypher_by_id, data_with_id, NODE_BATCH_SIZE, "person_nodes_by_id")
+
+    # name 기반 MERGE (fallback — KOBIS/KMDb 무명 인물, person_id 없음)
+    if data_name_only:
+        cypher_by_name = """
+        UNWIND $batch AS p
+        MERGE (person:Person {name: p.name})
+        SET person.profile_path = CASE WHEN p.profile_path <> '' THEN p.profile_path ELSE person.profile_path END
+        """
+        await _batch_execute(cypher_by_name, data_name_only, NODE_BATCH_SIZE, "person_nodes_by_name")
+
+    logger.info(
+        "neo4j_person_nodes_loaded",
+        by_id=len(data_with_id),
+        by_name=len(data_name_only),
+        total=len(data),
+    )
 
 
 async def load_keyword_nodes(documents: list[MovieDocument]) -> None:
@@ -303,38 +327,86 @@ async def load_keyword_nodes(documents: list[MovieDocument]) -> None:
 # ============================================================
 
 async def load_directed_relations(documents: list[MovieDocument]) -> None:
-    """DIRECTED 관계를 배치 생성한다. §11-7: director 필드가 존재하고 비어있지 않을 때."""
-    data = [
+    """
+    DIRECTED 관계를 배치 생성한다.
+
+    P1-1 수정: director_id > 0 이면 person_id 기반 MATCH (동명이인 정확 연결).
+    director_id = 0 이면 name 기반 MATCH (fallback).
+    """
+    # person_id 있는 감독 (정확한 매칭)
+    data_by_id = [
+        {"movie_id": doc.id, "director_id": doc.director_id}
+        for doc in documents
+        if doc.director and doc.director_id and doc.director_id > 0
+    ]
+    # person_id 없는 감독 (name 기반 fallback)
+    data_by_name = [
         {"movie_id": doc.id, "name": doc.director}
         for doc in documents
-        if doc.director
+        if doc.director and (not doc.director_id or doc.director_id <= 0)
     ]
 
-    cypher = """
-    UNWIND $batch AS d
-    MATCH (p:Person {name: d.name})
-    MATCH (m:Movie {id: d.movie_id})
-    MERGE (p)-[:DIRECTED]->(m)
-    """
-    await _batch_execute(cypher, data, RELATION_BATCH_SIZE, "directed_relations")
+    if data_by_id:
+        cypher_by_id = """
+        UNWIND $batch AS d
+        MATCH (p:Person {person_id: d.director_id})
+        MATCH (m:Movie {id: d.movie_id})
+        MERGE (p)-[:DIRECTED]->(m)
+        """
+        await _batch_execute(cypher_by_id, data_by_id, RELATION_BATCH_SIZE, "directed_relations_by_id")
+
+    if data_by_name:
+        cypher_by_name = """
+        UNWIND $batch AS d
+        MATCH (p:Person {name: d.name})
+        MATCH (m:Movie {id: d.movie_id})
+        MERGE (p)-[:DIRECTED]->(m)
+        """
+        await _batch_execute(cypher_by_name, data_by_name, RELATION_BATCH_SIZE, "directed_relations_by_name")
 
 
 async def load_acted_in_relations(documents: list[MovieDocument]) -> None:
-    """ACTED_IN 관계를 배치 생성한다."""
-    data = [
-        {"movie_id": doc.id, "name": actor}
-        for doc in documents
-        for actor in doc.cast
-        if actor
-    ]
-
-    cypher = """
-    UNWIND $batch AS a
-    MATCH (p:Person {name: a.name})
-    MATCH (m:Movie {id: a.movie_id})
-    MERGE (p)-[:ACTED_IN]->(m)
     """
-    await _batch_execute(cypher, data, RELATION_BATCH_SIZE, "acted_in_relations")
+    ACTED_IN 관계를 배치 생성한다.
+
+    P1-1 수정: cast_characters 에 person id 있으면 person_id 기반 MATCH.
+    id 없는 배우는 name 기반 MATCH (fallback).
+    """
+    # cast_characters 에서 person_id 추출
+    data_by_id = []
+    data_by_name = []
+    for doc in documents:
+        # cast_characters 에 id 있는 배우 → person_id 기반
+        chars_with_id = {
+            c.get("id"): c.get("name", "")
+            for c in doc.cast_characters
+            if c.get("id") and c["id"] > 0
+        }
+        for pid, name in chars_with_id.items():
+            data_by_id.append({"movie_id": doc.id, "person_id": pid})
+        # cast 배열 중 cast_characters 에 없는 배우 → name 기반
+        chars_names = set(chars_with_id.values())
+        for actor in doc.cast:
+            if actor and actor not in chars_names:
+                data_by_name.append({"movie_id": doc.id, "name": actor})
+
+    if data_by_id:
+        cypher_by_id = """
+        UNWIND $batch AS a
+        MATCH (p:Person {person_id: a.person_id})
+        MATCH (m:Movie {id: a.movie_id})
+        MERGE (p)-[:ACTED_IN]->(m)
+        """
+        await _batch_execute(cypher_by_id, data_by_id, RELATION_BATCH_SIZE, "acted_in_relations_by_id")
+
+    if data_by_name:
+        cypher_by_name = """
+        UNWIND $batch AS a
+        MATCH (p:Person {name: a.name})
+        MATCH (m:Movie {id: a.movie_id})
+        MERGE (p)-[:ACTED_IN]->(m)
+        """
+        await _batch_execute(cypher_by_name, data_by_name, RELATION_BATCH_SIZE, "acted_in_relations_by_name")
 
 
 async def load_has_genre_relations(documents: list[MovieDocument]) -> None:

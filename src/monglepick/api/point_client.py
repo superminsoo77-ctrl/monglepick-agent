@@ -92,7 +92,10 @@ async def _get_http_client():
 
             _client = httpx.AsyncClient(
                 base_url=settings.BACKEND_BASE_URL,
-                timeout=httpx.Timeout(5.0),  # 내부 통신 5초 타임아웃
+                # [FIX] 타임아웃 확장: 5초 → connect 5초 / read 15초.
+                # Backend 콜드 스타트(JPA 스키마 검증, DB 커넥션 풀 워밍업) 시
+                # 첫 요청이 5초를 초과할 수 있어 세션 저장이 실패하던 문제 해결.
+                timeout=httpx.Timeout(15.0, connect=5.0),
                 headers={"X-Service-Key": settings.SERVICE_API_KEY},
             )
     return _client
@@ -150,24 +153,30 @@ async def check_point(user_id: str, cost: int = 1) -> PointCheckResult:
                 effective_cost=data.get("effectiveCost", 0),
             )
 
-        # 4xx/5xx 응답: 로그 후 graceful degradation
+        # 4xx/5xx 응답: 쿼터 미확인 상태에서 허용하면 일일 한도가 우회되므로 차단
         logger.warning(
             "point_check_failed",
             user_id=user_id,
             status_code=resp.status_code,
             body=resp.text[:200],
         )
-        return PointCheckResult(allowed=True, balance=-1, cost=cost, message="")
+        return PointCheckResult(
+            allowed=False, balance=-1, cost=cost,
+            message="포인트 시스템 연결에 실패했습니다. 잠시 후 다시 시도해주세요.",
+        )
 
     except Exception as e:
-        # 네트워크 오류: 로그 후 graceful degradation (추천은 진행)
+        # 네트워크 오류: 쿼터 미확인 상태에서 허용하면 일일 한도가 우회되므로 차단
         logger.error(
             "point_check_error",
             user_id=user_id,
             error=str(e),
             error_type=type(e).__name__,
         )
-        return PointCheckResult(allowed=True, balance=-1, cost=cost, message="")
+        return PointCheckResult(
+            allowed=False, balance=-1, cost=cost,
+            message="포인트 시스템 연결에 실패했습니다. 잠시 후 다시 시도해주세요.",
+        )
 
 
 async def deduct_point(

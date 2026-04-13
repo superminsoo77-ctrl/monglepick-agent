@@ -71,6 +71,7 @@ from monglepick.agents.chat.nodes import (
     recommendation_ranker,
     response_formatter,
     retrieval_quality_checker,
+    similar_fallback_search,
     tool_executor_node,
 )
 from monglepick.memory.session_store import load_session, save_session
@@ -189,9 +190,11 @@ def route_after_retrieval(state: ChatAgentState) -> str:
     2. Top-1 RRF 점수 ≥ RETRIEVAL_MIN_TOP_SCORE (0.015)
     3. 상위 5개 평균 ≥ RETRIEVAL_QUALITY_MIN_AVG (0.01)
 
-    품질 미달 + turn_count < TURN_COUNT_OVERRIDE(3) → question_generator (추가 질문)
-    품질 미달 + turn_count ≥ TURN_COUNT_OVERRIDE(3) → recommendation_ranker (있는 결과로 진행)
-    품질 충족 → recommendation_ranker
+    Phase Q-3 변경: 품질 미달 시 바로 질문하지 않고 비슷한 영화 확장 검색을 먼저 시도.
+    - 후보가 1편 이상 있으면 → similar_fallback_search (비슷한 영화 재검색)
+    - 후보가 0편이면 → question_generator (추가 질문)
+    - turn_count >= TURN_COUNT_OVERRIDE(3) → 있는 결과로 진행
+    - 품질 충족 → llm_reranker → 추천 진행
 
     Args:
         state: ChatAgentState (candidate_movies, turn_count 필요)
@@ -228,10 +231,17 @@ def route_after_retrieval(state: ChatAgentState) -> str:
     if quality_passed or turn_count >= TURN_COUNT_OVERRIDE:
         # 품질 통과 또는 TURN_COUNT_OVERRIDE(3)턴 이상이면 LLM 재랭킹 → 추천 진행
         return "llm_reranker"
+    elif num_candidates > 0:
+        # Phase Q-3: 후보가 있지만 품질 미달 → 비슷한 영화로 확장 검색
+        # 기존 후보의 장르/무드를 활용해서 유사한 영화를 추가 검색한다.
+        logger.info(
+            "route_to_similar_fallback",
+            num_candidates=num_candidates,
+            reason="quality_low_but_has_candidates",
+        )
+        return "similar_fallback_search"
     else:
-        # 품질 미달: state에 피드백 메시지 설정 (question_generator에서 활용)
-        # retrieval_quality_checker 노드가 retrieval_feedback을 설정한 후
-        # 이 라우터가 호출된다. quality_ok/quality_low 분기를 결정한다. (W-3)
+        # 후보가 전혀 없으면 추가 질문
         return "question_generator"
 
 
@@ -253,7 +263,7 @@ def build_chat_graph() -> StateGraph:
     # StateGraph 생성 (ChatAgentState TypedDict 기반)
     graph = StateGraph(ChatAgentState)
 
-    # ── 노드 등록 (15개) ──
+    # ── 노드 등록 (16개) ──
     graph.add_node("context_loader", context_loader)
     graph.add_node("image_analyzer", image_analyzer)
     graph.add_node("intent_emotion_classifier", intent_emotion_classifier)
@@ -262,6 +272,7 @@ def build_chat_graph() -> StateGraph:
     graph.add_node("query_builder", query_builder)
     graph.add_node("rag_retriever", rag_retriever)
     graph.add_node("retrieval_quality_checker", retrieval_quality_checker)
+    graph.add_node("similar_fallback_search", similar_fallback_search)
     graph.add_node("llm_reranker", llm_reranker)
     graph.add_node("recommendation_ranker", recommendation_ranker)
     graph.add_node("explanation_generator", explanation_generator)
@@ -322,9 +333,13 @@ def build_chat_graph() -> StateGraph:
         route_after_retrieval,
         {
             "llm_reranker": "llm_reranker",
+            "similar_fallback_search": "similar_fallback_search",
             "question_generator": "question_generator",
         },
     )
+
+    # Phase Q-3: 비슷한 영화 확장 검색 완료 후 → LLM 재랭킹으로 진행
+    graph.add_edge("similar_fallback_search", "llm_reranker")
 
     # LLM 재랭킹 → 추천 엔진 서브그래프 → 설명 생성
     graph.add_edge("llm_reranker", "recommendation_ranker")
@@ -373,6 +388,7 @@ NODE_STATUS_MESSAGES: dict[str, str] = {
     "query_builder": "검색 조건을 구성하고 있어요...",
     "rag_retriever": "영화를 검색하고 있어요... 🔍",
     "retrieval_quality_checker": "검색 결과 품질을 확인하고 있어요...",
+    "similar_fallback_search": "비슷한 영화를 추가로 찾고 있어요...",
     "llm_reranker": "사용자님의 요청에 맞는 영화인지 검증하고 있어요...",
     "recommendation_ranker": "최적의 영화를 고르고 있어요...",
     "explanation_generator": "추천 이유를 작성하고 있어요...",
@@ -428,6 +444,9 @@ def _predict_next_node(completed_node: str, state: dict) -> tuple[str, str] | No
             next_node = "retrieval_quality_checker"
         elif completed_node == "retrieval_quality_checker":
             next_node = route_after_retrieval(state)
+        elif completed_node == "similar_fallback_search":
+            # similar_fallback_search → llm_reranker (고정 엣지)
+            next_node = "llm_reranker"
         elif completed_node == "llm_reranker":
             # llm_reranker → recommendation_ranker (고정 엣지)
             next_node = "recommendation_ranker"
@@ -730,6 +749,18 @@ async def run_chat_agent(
     except Exception as e:
         graph_elapsed_ms = (time.perf_counter() - graph_start) * 1000
         logger.error("chat_agent_stream_error", error=str(e), error_type=type(e).__name__, elapsed_ms=round(graph_elapsed_ms, 1))
+
+        # [FIX] 그래프 에러 시에도 현재까지의 대화 내용을 세션에 저장한다.
+        # 기존에는 except 블록에서 save_session이 호출되지 않아,
+        # 그래프 중간에 에러가 발생하면 세션이 MySQL에 전혀 저장되지 않았음.
+        # 사용자는 채팅 응답을 일부 받았지만 이력에는 남지 않는 문제의 원인.
+        try:
+            error_merged_state = {**initial_state, **final_state}
+            await save_session(user_id, session_id, error_merged_state)
+        except Exception as save_err:
+            logger.error("chat_agent_error_save_also_failed",
+                         session_id=session_id, save_error=str(save_err))
+
         yield _format_sse_event("error", {"message": str(e)})
         yield _format_sse_event("done", {})
 

@@ -1,7 +1,7 @@
 """
 LangChain Tools 패키지 — Phase 6 도구 모음.
 
-tool_executor_node에서 info/theater/booking 의도에 대해 호출되는 7개 도구.
+tool_executor_node에서 info/theater/booking 의도에 대해 호출되는 8개 도구.
 
 도구 목록:
 1. search_movies      — 내부 RAG(Qdrant+ES+Neo4j) 기반 영화 검색
@@ -11,6 +11,7 @@ tool_executor_node에서 info/theater/booking 의도에 대해 호출되는 7개
 5. similar_movies     — Qdrant 코사인 유사도 기반 유사 영화 검색
 6. user_history       — MySQL watch_history 사용자 시청 이력 조회
 7. graph_explorer     — Neo4j 영화 관계 그래프 탐색
+8. web_search_movie   — DuckDuckGo 외부 검색으로 영화 줄거리/정보 보강
 
 각 도구는 @tool 데코레이터가 적용된 async 함수이며,
 에러 발생 시 빈 값([], {}, 안내 문자열)을 반환하고 절대 에러를 전파하지 않는다.
@@ -30,6 +31,7 @@ from monglepick.tools.search_movies import search_movies
 from monglepick.tools.similar_movies import similar_movies
 from monglepick.tools.theater_search import theater_search
 from monglepick.tools.user_history import user_history
+from monglepick.tools.web_search_movie import web_search_movie
 
 # 도구 이름 → LangChain Tool 인스턴스 매핑
 # tool_executor_node에서 의도별 도구를 선택할 때 사용한다.
@@ -41,14 +43,15 @@ TOOL_REGISTRY: dict[str, object] = {
     "similar_movies": similar_movies,
     "user_history": user_history,
     "graph_explorer": graph_explorer,
+    "web_search_movie": web_search_movie,
 }
 
 # 의도별 기본 도구 매핑 (tool_executor_node의 intent → tool name)
-# info 의도: 영화 상세 정보 + OTT 가용성 + 유사 영화
+# info 의도: 영화 상세 정보 + OTT 가용성 + 유사 영화 + 외부 검색 보강
 # theater 의도: 영화관 검색
 # booking 의도: 영화 검색 후 상세 정보 (예매 링크 미구현, 영화 정보 제공으로 대체)
 INTENT_TOOL_MAP: dict[str, list[str]] = {
-    "info": ["movie_detail", "ott_availability", "similar_movies"],
+    "info": ["movie_detail", "ott_availability", "similar_movies", "web_search_movie"],
     "theater": ["theater_search"],
     "booking": ["movie_detail", "search_movies"],
     "search": ["search_movies", "graph_explorer"],
@@ -62,6 +65,7 @@ __all__ = [
     "similar_movies",
     "user_history",
     "graph_explorer",
+    "web_search_movie",
     "TOOL_REGISTRY",
     "INTENT_TOOL_MAP",
 ]
