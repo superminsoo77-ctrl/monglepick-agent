@@ -18,6 +18,8 @@ LangGraph StateGraph의 각 노드로 등록되는 6개 async 함수.
 
 from __future__ import annotations
 
+import asyncio
+import math
 import time
 import traceback
 from typing import Any
@@ -33,16 +35,93 @@ from monglepick.agents.match.models import (
     calculate_match_score,
     jaccard,
 )
+from monglepick.api.match_cowatch_client import fetch_cowatched_candidates
 from monglepick.chains.match_explanation_chain import (
     generate_match_explanations_batch,
     generate_similarity_summary,
 )
+from monglepick.chains.match_llm_reranker_chain import rerank_match_candidates
 from monglepick.config import settings
 from monglepick.db.clients import get_mysql, get_qdrant
-from monglepick.rag.hybrid_search import hybrid_search
+from monglepick.rag.hybrid_search import hybrid_search, reciprocal_rank_fusion
 from monglepick.utils.qdrant_helpers import to_point_id
 
 logger = structlog.get_logger()
+
+
+def _compute_embedding_centroid(
+    vec_a: list[float] | None,
+    vec_b: list[float] | None,
+) -> list[float] | None:
+    """
+    두 영화 임베딩 벡터의 centroid(평균 + L2 정규화)를 계산한다.
+
+    Movie Match 의 "둘의 공통점 찾기" 검색에서 Qdrant 벡터 검색을 수행할 때
+    텍스트를 재임베딩하는 대신, 두 영화 벡터의 중간 지점으로 직접 검색하기 위해 사용.
+    Qdrant 컬렉션이 cosine distance 를 사용하므로 결과 벡터를 L2 정규화한다.
+
+    두 벡터 중 하나라도 None/빈 리스트면 None 반환 → 호출자가 텍스트 재임베딩으로 fallback.
+
+    Args:
+        vec_a: 영화 A 임베딩 (4096차원 Upstage Solar). None/빈 리스트 가능.
+        vec_b: 영화 B 임베딩 (동일 차원). None/빈 리스트 가능.
+
+    Returns:
+        정규화된 centroid 벡터 (list[float]) 또는 None.
+    """
+    if not vec_a or not vec_b:
+        return None
+    if len(vec_a) != len(vec_b):
+        logger.warning(
+            "centroid_dim_mismatch",
+            dim_a=len(vec_a),
+            dim_b=len(vec_b),
+        )
+        return None
+
+    # 방어적 float 변환 + 평균 계산
+    try:
+        centroid = [(float(a) + float(b)) / 2.0 for a, b in zip(vec_a, vec_b)]
+    except (TypeError, ValueError):
+        return None
+
+    # L2 정규화 (Qdrant cosine 검색과 정합)
+    norm = math.sqrt(sum(x * x for x in centroid))
+    if norm <= 1e-9:
+        return None  # 영벡터 가드
+    return [x / norm for x in centroid]
+
+
+def _merge_unique_results(
+    primary: list[Any],
+    secondary: list[Any],
+) -> list[Any]:
+    """
+    두 하이브리드 검색 결과 리스트를 movie_id 기준으로 중복 제거하여 병합한다.
+
+    완화 재검색 단계에서 1차 결과를 유지하면서 새 결과를 덧붙인다.
+    이미 포함된 영화는 score/rank 를 유지하고 재등장한 영화는 무시한다.
+    단계별 완화가 누적되도록 설계되어 상위 단계의 고품질 결과가 보존된다.
+
+    Args:
+        primary: 1차(또는 기존) 결과 리스트. 우선순위 유지.
+        secondary: 2차(또는 완화된) 결과 리스트. primary 에 없는 것만 추가.
+
+    Returns:
+        중복 제거된 병합 결과 (primary 순서 유지 + secondary 신규 append).
+    """
+    if not primary:
+        return list(secondary)
+    if not secondary:
+        return list(primary)
+
+    seen_ids = {r.movie_id for r in primary}
+    merged = list(primary)
+    for r in secondary:
+        if r.movie_id not in seen_ids:
+            merged.append(r)
+            seen_ids.add(r.movie_id)
+    return merged
 
 
 def _payload_to_movie_dict(payload: dict[str, Any], point_id: Any) -> dict[str, Any]:
@@ -447,25 +526,34 @@ async def query_builder(state: MovieMatchState) -> dict:
                 f"{movie_1.get('title', '')} {movie_2.get('title', '')} 비슷한 영화"
             ).strip()
 
-        # ── [2] 장르 필터: 공통 장르 우선, 없으면 합집합 ──
-        if shared.common_genres:
-            genre_filter = shared.common_genres
+        # ── [2] 장르 필터 (Level 1-B 개선: 교집합 대신 합집합 기본) ──
+        # 기존: 교집합 우선 → 매우 다른 두 영화에서 공약수 1개만 남아 검색이 허술해짐
+        # 개선: 항상 합집합 사용 — centroid 벡터 검색이 의미적 유사성을 보장하므로
+        #       필터는 "넓게 범위 확보" 역할만 담당. 최대 6개(교집합 * 2배)까지 확장.
+        union_genres = list(
+            set(movie_1.get("genres", [])) | set(movie_2.get("genres", []))
+        )
+        if shared.common_genres and len(shared.common_genres) >= 2:
+            # 교집합이 2개 이상이면 (두 영화가 본질적으로 유사) 교집합 사용
+            genre_filter = shared.common_genres[:5]
         else:
-            # 공통 장르가 없으면 두 영화 장르 합집합으로 넓게 검색
-            all_genres = list(
-                set(movie_1.get("genres", [])) | set(movie_2.get("genres", []))
-            )
-            genre_filter = all_genres[:5]   # 최대 5개로 제한
+            # 교집합이 0~1개이면 합집합 사용 (다양성 확보)
+            genre_filter = union_genres[:6] if union_genres else None
 
-        # ── [3] 무드 필터: 공통 무드만 사용 (없으면 필터 없음) ──
-        mood_filter = shared.common_moods if shared.common_moods else None
+        # ── [3] 무드 필터 (Level 1-B 개선: 1단계 기본 비활성화) ──
+        # 공통 무드는 교집합이 매우 sparse 하고, 과도하게 specific 한 태그가 많아
+        # 1차 검색에서는 제약으로 사용하지 않는다. match_scorer 의 mood_overlap 스코어에
+        # 반영되므로 "필터"보다 "스코어링"에서 가중치를 주는 것이 합리적.
+        mood_filter = None
 
-        # ── [4] 연도 범위 필터 ──
+        # ── [4] 연도 범위 필터 (Level 1-B 개선: ±5 → ±10 확장) ──
+        # era_range 는 이미 (min-5, max+5) 로 계산되어 있으므로 추가 패딩으로 ±5 더 확장
         era_min, era_max = shared.era_range
-        year_range = (era_min, era_max)
+        year_range = (max(1900, era_min - 5), min(2030, era_max + 5))
 
-        # ── [5] 최소 평점 필터: avg_rating * 0.7 ──
-        min_rating = round(shared.avg_rating * 0.7, 1) if shared.avg_rating > 0 else None
+        # ── [5] 최소 평점 필터 (Level 1-B 개선: 0.7 → 0.6 완화) ──
+        # centroid 벡터 검색이 품질 필터 역할을 일부 담당하므로 평점 임계값을 낮춘다.
+        min_rating = round(shared.avg_rating * 0.6, 1) if shared.avg_rating > 0 else None
 
         # ── [6] 입력 영화 제외 ID 목록 ──
         movie_id_1 = state.get("movie_id_1", "")
@@ -530,16 +618,27 @@ async def query_builder(state: MovieMatchState) -> dict:
 @traceable(name="match_rag_retriever", run_type="retriever", metadata={"node": "4/6", "db": "qdrant+es+neo4j"})
 async def rag_retriever(state: MovieMatchState) -> dict:
     """
-    기존 하이브리드 검색 파이프라인으로 후보 영화를 조회한다.
+    하이브리드 검색 파이프라인으로 후보 영화를 조회한다.
 
     hybrid_search() → RRF(k=60) → 후보 movie_id 목록 확보
     → Qdrant client.retrieve(with_vectors=True)로 임베딩 벡터 일괄 조회
     (match_scorer에서 cosine similarity 계산에 사용)
 
-    후보 3편 미만 시 필터 완화 재검색:
-    1. 장르 교집합 → 합집합으로 확장
-    2. year_range 제거
-    3. min_rating 제거
+    ### Level 1-A 개선: Vector Centroid 검색
+    두 영화 임베딩의 centroid((vec_A + vec_B)/2 정규화) 를 query_vector 로 전달하여
+    Qdrant 벡터 검색이 텍스트를 재임베딩하지 않고 두 영화 "사이 지점"을 직접 탐색하게 한다.
+    기존에는 공통 장르/무드 텍스트를 다시 임베딩해 semantic 정보가 손실되었다.
+
+    ### Level 1-B 개선: 3단계 필터 완화 (기존 1회 → 3회)
+    1단계: 교집합 장르 + 무드 + 연도 + 평점 + centroid (초기 설정)
+    2단계: 무드 제거 + 평점 0.6배 (공통 무드가 sparse 한 케이스 대응)
+    3단계: 장르 합집합 + 무드/연도/평점 전부 제거 (블록버스터 교차 조합 대응)
+    4단계(absolute last): 장르만 합집합으로 2개까지 축약 + top_k=30 (최후 fallback)
+
+    ### 치명 버그 수정 (2026-04-14)
+    기존 코드는 hybrid_search 호출 시 `mood_filter=` 키워드 사용.
+    그러나 hybrid_search 시그니처는 `mood_tags=` 이므로 TypeError 발생 → try/except 가 삼켜
+    *모든* 매치 검색이 실제로는 실행되지 않고 빈 결과 반환. → `mood_tags=` 로 수정.
 
     Args:
         state: MovieMatchState (search_query 필수)
@@ -558,53 +657,142 @@ async def rag_retriever(state: MovieMatchState) -> dict:
     )
 
     try:
+        # ── [0] Vector Centroid 계산 ──
+        # 두 영화 임베딩이 모두 있으면 (Qdrant 로드 성공 케이스) centroid 를 계산.
+        # L2 정규화하여 Qdrant cosine 검색과 정합시킨다.
+        movie_1: dict = state.get("movie_1", {})
+        movie_2: dict = state.get("movie_2", {})
+        centroid_vec: list[float] | None = _compute_embedding_centroid(
+            movie_1.get("embedding"),
+            movie_2.get("embedding"),
+        )
+        if centroid_vec is not None:
+            logger.info(
+                "match_rag_retriever_centroid_ready",
+                vector_dim=len(centroid_vec),
+            )
+
         async def _do_hybrid_search(query: dict) -> list[Any]:
-            """hybrid_search() 파라미터 변환 후 호출."""
+            """hybrid_search() 파라미터 변환 후 호출.
+
+            mood_filter (내부 키) → mood_tags (hybrid_search 파라미터) 로 매핑한다.
+            query_vector 는 centroid 가 준비된 경우에만 전달 (그 외에는 semantic_query 를 재임베딩).
+            """
             return await hybrid_search(
                 query=query.get("semantic_query", "인기 영화"),
                 top_k=query.get("top_k", 20),
                 genre_filter=query.get("genre_filter"),
-                mood_filter=query.get("mood_filter"),
+                # ⚠️ 버그 수정: mood_filter= → mood_tags= (파라미터 이름 정합성)
+                mood_tags=query.get("mood_filter"),
                 ott_filter=query.get("ott_filter"),
                 min_rating=query.get("min_rating"),
                 year_range=query.get("year_range"),
                 exclude_ids=query.get("exclude_ids", []),
+                query_vector=centroid_vec,   # Level 1-A: centroid 우선 사용
             )
 
-        # ── [1] 1차 하이브리드 검색 ──
-        results = await _do_hybrid_search(search_query)
+        # ── [1] 1차 검색 + CF 병렬 실행 ──
+        # Level 2-B: Co-watched CF 후보를 Recommend FastAPI 에서 병렬 조회하고 RRF 병합.
+        # 하이브리드 검색(Qdrant/ES/Neo4j)과 CF 를 동시에 수행하여 추가 지연을 최소화.
+        movie_id_1 = state.get("movie_id_1", "")
+        movie_id_2 = state.get("movie_id_2", "")
 
-        # ── [2] 후보 3편 미만 시 필터 완화 재검색 ──
-        if len(results) < 3:
-            logger.warning(
-                "match_rag_retriever_too_few_results",
-                count=len(results),
-                action="relaxing_filters",
-            )
-            # 영화 1, 2의 장르 합집합으로 확장 (query_builder의 교집합 → 합집합)
-            movie_1: dict = state.get("movie_1", {})
-            movie_2: dict = state.get("movie_2", {})
+        hybrid_task = _do_hybrid_search(search_query)
+        cf_task = fetch_cowatched_candidates(
+            movie_id_1=movie_id_1,
+            movie_id_2=movie_id_2,
+            top_k=settings.MATCH_COWATCH_TOP_K,
+        )
+        hybrid_results, cf_results = await asyncio.gather(
+            hybrid_task, cf_task, return_exceptions=False,
+        )
+
+        logger.info(
+            "match_rag_retriever_sources",
+            hybrid_count=len(hybrid_results),
+            cf_count=len(cf_results),
+        )
+
+        # ── CF 와 하이브리드 결과 RRF 병합 (k=60, 2개 소스) ──
+        # CF 는 단일 신호(공통 사용자 선호)이므로 하이브리드 결과 비중이 자연스럽게 우세하고,
+        # CF 에서만 상위에 나오는 영화가 final 에 진입할 수 있도록 RRF 로 합친다.
+        # CF 결과가 비면 hybrid_results 를 그대로 사용 (RRF 오버헤드 회피).
+        if cf_results:
+            results = reciprocal_rank_fusion([hybrid_results, cf_results], k=60)
+            # CF-only 영화가 exclude_ids(입력 영화) 와 일치할 수 있으므로 재필터
+            exclude_set = set(search_query.get("exclude_ids", []))
+            if exclude_set:
+                results = [r for r in results if r.movie_id not in exclude_set]
+        else:
+            results = hybrid_results
+
+        stage_counts: list[tuple[str, int]] = [
+            ("stage_1_hybrid+cf", len(results)),
+        ]
+
+        # ── [2] 2단계 완화: 무드 제거 + 평점 0.6배 ──
+        # 공통 무드가 모호하게 들어간 케이스 (e.g. mood_tags 가 과도하게 specific) 대응
+        if len(results) < 5:
+            relaxed_2 = {
+                **search_query,
+                "mood_filter": None,
+                "min_rating": (
+                    round(search_query.get("min_rating", 0) * 0.6 / 0.7, 1)
+                    if search_query.get("min_rating")
+                    else None
+                ),
+                "top_k": 25,
+            }
+            results_2 = await _do_hybrid_search(relaxed_2)
+            # stage_2 결과를 기존과 합치되 중복 제거 (id 기준)
+            results = _merge_unique_results(results, results_2)
+            stage_counts.append(("stage_2_no_mood", len(results)))
+
+        # ── [3] 3단계 완화: 장르 합집합 + 무드/연도/평점 전부 제거 ──
+        if len(results) < 5:
             union_genres = list(
                 set(movie_1.get("genres", [])) | set(movie_2.get("genres", []))
             )
-            relaxed_query = {
+            relaxed_3 = {
                 **search_query,
                 "genre_filter": union_genres[:5] if union_genres else None,
-                "mood_filter": None,    # 무드 필터 제거 — 특수 무드 태그로 인한 0건 방지
-                "year_range": None,     # 연도 제한 제거
-                "min_rating": None,     # 최소 평점 제거
-                "top_k": 20,
+                "mood_filter": None,
+                "year_range": None,
+                "min_rating": None,
+                "top_k": 25,
             }
-            results = await _do_hybrid_search(relaxed_query)
+            results_3 = await _do_hybrid_search(relaxed_3)
+            results = _merge_unique_results(results, results_3)
+            stage_counts.append(("stage_3_union_all_relaxed", len(results)))
 
-            logger.info(
-                "match_rag_retriever_relaxed",
-                count=len(results),
-                union_genres=union_genres[:5],
+        # ── [4] 4단계 absolute last resort: 장르 합집합 축약 + top_k=30 ──
+        # 여기까지 와도 비어있으면 센트로이드 벡터 근접성만으로 뽑는다.
+        if len(results) < 3:
+            union_genres = list(
+                set(movie_1.get("genres", [])) | set(movie_2.get("genres", []))
             )
+            relaxed_4 = {
+                "semantic_query": (
+                    f"{movie_1.get('title', '')} {movie_2.get('title', '')} 비슷한 영화"
+                ).strip(),
+                "genre_filter": union_genres[:2] if union_genres else None,
+                "mood_filter": None,
+                "year_range": None,
+                "min_rating": None,
+                "exclude_ids": search_query.get("exclude_ids", []),
+                "top_k": 30,
+            }
+            results_4 = await _do_hybrid_search(relaxed_4)
+            results = _merge_unique_results(results, results_4)
+            stage_counts.append(("stage_4_last_resort", len(results)))
+
+        logger.info(
+            "match_rag_retriever_stage_counts",
+            stages=stage_counts,
+        )
 
         if not results:
-            logger.warning("match_rag_retriever_no_results")
+            logger.warning("match_rag_retriever_no_results_after_all_stages")
             return {"candidate_movies": []}
 
         # ── [3] 후보 movie_id 목록 추출 ──
@@ -665,6 +853,9 @@ async def rag_retriever(state: MovieMatchState) -> dict:
                 "overview": meta.get("overview", ""),
                 "ott_platforms": meta.get("ott_platforms", []),
                 "rrf_score": result.score,
+                # Match v3: CF 소스 영화면 cf_score 를 top-level 로 승격 (match_scorer 조회 용이)
+                # CF 가 아닌 영화는 None — calculate_match_score 에서 가중치 재정규화
+                "cf_score": meta.get("cf_score"),
                 "embedding": None,  # 기본값
             }
 
@@ -707,10 +898,87 @@ async def rag_retriever(state: MovieMatchState) -> dict:
 
 
 # ============================================================
-# 노드 5: match_scorer — min(simA, simB) 스코어링 + MMR 리랭킹
+# 노드 5: llm_reranker — Solar LLM 배치 점수화 (Match v3, 2026-04-14)
 # ============================================================
 
-@traceable(name="match_scorer", run_type="chain", metadata={"node": "5/6"})
+@traceable(name="match_llm_reranker", run_type="chain", metadata={"node": "5/7", "llm": "solar"})
+async def llm_reranker(state: MovieMatchState) -> dict:
+    """
+    rag_retriever 가 수집한 후보 영화들을 Solar LLM 에 배치 전달하여
+    "두 영화 A/B 를 모두 좋아할 사용자 관점" 의 점수(0~1) 를 계산한다.
+
+    ### 도입 배경 (2026-04-14)
+    기존 Match 는 Jaccard + cosine + harmonic 의 결정론적 수학만으로 순위를 매기고,
+    LLM 은 최종 설명 생성에만 쓰였다. Chat Agent 처럼 LLM 리랭커를 중간에 배치하면
+    "두 영화 동시 선호" 라는 목표에 LLM 의 세계 지식을 직접 활용할 수 있다.
+
+    ### 동작
+    1. candidates 상위 10편을 Solar 에 배치 전달 (`rerank_match_candidates`)
+    2. {movie_id: llm_score_0_to_1} 딕셔너리를 state["llm_scores"] 에 저장
+    3. match_scorer 가 이를 읽어 calculate_match_score(llm_score=...) 에 주입
+
+    ### 에러 처리 (채팅 영향 격리)
+    LLM 호출 실패/타임아웃 시 체인 레벨에서 빈 dict 반환 → 노드도 {"llm_scores": {}}.
+    match_scorer 는 빈 dict 를 보고 harmonic+cf 로 graceful fallback.
+    → Solar API 장애가 Match 그래프 전체를 막지 않음.
+
+    Args:
+        state: MovieMatchState (candidate_movies, movie_1, movie_2 필수)
+
+    Returns:
+        {"llm_scores": dict[str, float]}
+    """
+    node_start = time.perf_counter()
+    candidates: list[dict] = state.get("candidate_movies", []) or []
+    movie_1: dict = state.get("movie_1", {}) or {}
+    movie_2: dict = state.get("movie_2", {}) or {}
+    shared = state.get("shared_features")
+    shared_summary = getattr(shared, "similarity_summary", "") if shared else ""
+
+    logger.info(
+        "match_llm_reranker_node_start",
+        candidate_count=len(candidates),
+        movie_1_title=movie_1.get("title", ""),
+        movie_2_title=movie_2.get("title", ""),
+    )
+
+    # 후보가 비면 LLM 호출 없이 빈 dict 반환
+    if not candidates:
+        return {"llm_scores": {}}
+
+    try:
+        scores = await rerank_match_candidates(
+            candidates=candidates,
+            movie_1=movie_1,
+            movie_2=movie_2,
+            shared_summary=shared_summary,
+        )
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.info(
+            "match_llm_reranker_node_complete",
+            scored_count=len(scores),
+            elapsed_ms=round(elapsed_ms, 1),
+        )
+        return {"llm_scores": scores}
+    except Exception as e:
+        # rerank_match_candidates 는 내부에서 예외를 삼켜 빈 dict 를 반환하지만,
+        # 방어적으로 한 번 더 감싼다 (에이전트 graceful fallback 원칙).
+        elapsed_ms = (time.perf_counter() - node_start) * 1000
+        logger.error(
+            "match_llm_reranker_node_error",
+            error=str(e),
+            error_type=type(e).__name__,
+            elapsed_ms=round(elapsed_ms, 1),
+            stack_trace=traceback.format_exc(),
+        )
+        return {"llm_scores": {}}
+
+
+# ============================================================
+# 노드 6: match_scorer — LLM + harmonic + CF 가중합 스코어링 + MMR (Match v3)
+# ============================================================
+
+@traceable(name="match_scorer", run_type="chain", metadata={"node": "6/7", "top_k": "MATCH_TOP_K"})
 async def match_scorer(state: MovieMatchState) -> dict:
     """
     각 후보 영화와 두 입력 영화 간 유사도를 계산하고 MMR로 Top 5를 선별한다.
@@ -735,9 +1003,16 @@ async def match_scorer(state: MovieMatchState) -> dict:
     movie_1: dict = state.get("movie_1", {})
     movie_2: dict = state.get("movie_2", {})
 
+    # Match v3 (2026-04-14): llm_reranker 가 계산한 점수 + CF 후보의 cf_score 를 융합.
+    # llm_scores 는 dict[movie_id, 0~1 점수]. 없는 후보는 None 으로 전달.
+    llm_scores: dict[str, float] = state.get("llm_scores", {}) or {}
+    top_k: int = getattr(settings, "MATCH_TOP_K", 3)
+
     logger.info(
         "match_scorer_start",
         candidate_count=len(candidates),
+        llm_scored_count=len(llm_scores),
+        top_k=top_k,
     )
 
     try:
@@ -745,10 +1020,29 @@ async def match_scorer(state: MovieMatchState) -> dict:
             logger.warning("match_scorer_no_candidates")
             return {"ranked_movies": []}
 
-        # ── [1] 모든 후보에 매치 스코어 계산 ──
+        # ── [1] 모든 후보에 매치 스코어 계산 (LLM + harmonic + CF 가중합) ──
         scored: list[tuple[dict, MatchScoreDetail]] = []
         for candidate in candidates:
-            score_detail = calculate_match_score(candidate, movie_1, movie_2)
+            movie_id = candidate.get("id", "")
+            # LLM 리랭커 결과에 없는 영화는 None → calculate_match_score 에서 가중치 재정규화
+            llm_score = llm_scores.get(movie_id) if movie_id else None
+            # CF 후보는 rag_retriever 단계에서 metadata 에 cf_score 가 포함됨.
+            # RRF 병합 중 덮어쓰일 수 있으므로 방어적으로 읽어온다.
+            cf_score_raw = candidate.get("cf_score")
+            if cf_score_raw is None:
+                # 메타데이터 경로에서 직접 추출 (CF 소스 후보에만 존재)
+                cf_score_raw = (candidate.get("metadata") or {}).get("cf_score")
+            cf_score = (
+                float(cf_score_raw) if cf_score_raw is not None else None
+            )
+
+            score_detail = calculate_match_score(
+                candidate=candidate,
+                movie_1=movie_1,
+                movie_2=movie_2,
+                llm_score=llm_score,
+                cf_score=cf_score,
+            )
             scored.append((candidate, score_detail))
 
         # ── [2] match_score 내림차순 정렬 ──
@@ -756,18 +1050,20 @@ async def match_scorer(state: MovieMatchState) -> dict:
 
         logger.debug(
             "match_scorer_top_scores",
-            top_5_scores=[
+            top_scores=[
                 {
                     "title": c.get("title", ""),
                     "match_score": round(sd.match_score, 3),
+                    "llm_score": round(sd.llm_score, 3),
+                    "cf_score": round(sd.cf_score, 3),
                     "sim_1": round(sd.sim_to_movie_1, 3),
                     "sim_2": round(sd.sim_to_movie_2, 3),
                 }
-                for c, sd in scored[:5]
+                for c, sd in scored[: max(top_k, 5)]
             ],
         )
 
-        # ── [3] MMR 그리디 알고리즘으로 Top 5 선별 ──
+        # ── [3] MMR 그리디 알고리즘으로 Top K 선별 (Match v3: 기본 3편) ──
         # λ=0.7: 점수 70%, 다양성 30%
         mmr_lambda = 0.7
         selected: list[tuple[dict, MatchScoreDetail]] = []
@@ -779,8 +1075,8 @@ async def match_scorer(state: MovieMatchState) -> dict:
         else:
             remaining = []
 
-        # 2~5위: MMR 그리디 선택
-        while len(selected) < 5 and remaining:
+        # 2 ~ top_k 위: MMR 그리디 선택
+        while len(selected) < top_k and remaining:
             best_mmr = -float("inf")
             best_idx = 0
 
