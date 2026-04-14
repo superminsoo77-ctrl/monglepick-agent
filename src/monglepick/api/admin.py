@@ -761,3 +761,123 @@ async def generate_admin_quiz(request: GenerateQuizRequest) -> GenerateQuizRespo
         ),
         quizzes=generated,
     )
+
+
+# =========================================================================
+# 도장깨기 리뷰 검증 에이전트 — 2026-04-14 계약만 정의(placeholder).
+#
+# 목적:
+#     사용자가 도장깨기 코스에서 작성한 리뷰를 영화 줄거리와 비교하여 "실제 관람으로
+#     볼 수 있는가"를 판정한다. 임베딩 유사도 + 키워드 매칭 + (선택) LLM 판단 하이브리드로
+#     구현할 예정이며, 판정 결과는 Backend 의 CourseVerification 엔티티에
+#     similarity_score / matched_keywords / ai_confidence / review_status 로 업서트된다.
+#
+# 현 상태:
+#     계약(입력/출력 스키마)만 확정되었고 실제 알고리즘은 미구현. 본 엔드포인트는
+#     HTTP 503 을 반환하여 Admin UI 가 "에이전트 준비 중" 배너를 띄우도록 한다.
+#     자세한 설계는 docs/도장깨기_리뷰검증_에이전트_설계서.md 참조.
+# =========================================================================
+
+
+class ReviewVerificationRequest(BaseModel):
+    """
+    리뷰 인증 에이전트 호출 요청.
+
+    Backend 가 "이 리뷰를 AI 로 검증해달라"고 에이전트에 전달하는 payload.
+    Backend 측 CourseVerification row 에 필요한 컨텍스트(사용자/코스/영화)와
+    판정에 쓰일 원본 텍스트 2개(리뷰 본문, 영화 줄거리)를 한 번에 담는다.
+    """
+
+    verification_id: int = Field(..., description="course_verification PK — 판정 결과 upsert 대상")
+    user_id: str = Field(..., description="리뷰 작성자 user_id")
+    course_id: str = Field(..., description="도장깨기 코스 ID")
+    movie_id: str = Field(..., description="영화 ID")
+    review_id: Optional[int] = Field(
+        None,
+        description="reviews 테이블의 review_id (있다면 감사/로깅용). course_review 만 있는 경우 생략 가능.",
+    )
+    review_text: str = Field(..., description="사용자가 작성한 리뷰 본문 (원문)")
+    movie_plot: str = Field(..., description="비교 기준이 될 영화 줄거리/시놉시스")
+
+
+class ReviewVerificationResponse(BaseModel):
+    """
+    리뷰 인증 에이전트 판정 결과.
+
+    Backend 는 이 응답을 받아 CourseVerification.applyAiDecision() 을 호출하여
+    similarity_score / matched_keywords / ai_confidence / review_status / decision_reason
+    을 세팅한다. is_verified 전환은 review_status=AUTO_VERIFIED 일 때만 수행된다.
+    """
+
+    verification_id: int = Field(..., description="입력과 동일한 PK (멱등성 체크용)")
+    similarity_score: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="영화 줄거리 ↔ 리뷰 본문 유사도 (임베딩 코사인/BM25/하이브리드)",
+    )
+    matched_keywords: list[str] = Field(
+        default_factory=list,
+        description="영화 줄거리와 리뷰에서 공통으로 추출된 핵심 키워드",
+    )
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="종합 신뢰도 점수 (유사도 + 키워드 + 길이/어휘 다양성 가중합)",
+    )
+    review_status: str = Field(
+        ...,
+        description=(
+            "판정 상태: AUTO_VERIFIED / NEEDS_REVIEW / AUTO_REJECTED. "
+            "관리자 수동 오버라이드(ADMIN_APPROVED/ADMIN_REJECTED) 는 Backend 에서만 세팅된다."
+        ),
+    )
+    rationale: str = Field(
+        ...,
+        description="판정 근거 한 줄 요약 (감사 로그 및 관리자 UI 에 노출)",
+    )
+
+
+@admin_router.post(
+    "/ai/review-verification/verify",
+    response_model=ReviewVerificationResponse,
+    summary="도장깨기 리뷰 인증 AI 판정 (미구현)",
+    description=(
+        "영화 줄거리 ↔ 사용자 리뷰 유사도를 계산하여 시청 여부를 자동 인증한다. "
+        "현재는 계약만 정의되어 있고 실제 구현은 대기 중이다 — HTTP 503 을 반환한다."
+    ),
+)
+async def verify_course_review(request: ReviewVerificationRequest) -> ReviewVerificationResponse:
+    """
+    리뷰 인증 에이전트 엔드포인트 — 현 시점은 placeholder.
+
+    추후 구현 시 다음 단계를 수행할 예정:
+        1) 영화 줄거리와 리뷰 본문을 Solar 임베딩으로 벡터화 → 코사인 유사도
+        2) 동시 발생 키워드 추출 (명사 추출 + stop-word 제거 + BM25 상위 토큰)
+        3) (선택) LLM 으로 "리뷰가 영화 내용에 관한 것인가" yes/no 재검증
+        4) 임계값 (application.yml: app.ai.review-verification.threshold) 기준으로
+           AUTO_VERIFIED / NEEDS_REVIEW / AUTO_REJECTED 분기
+        5) Backend 의 CourseVerification.applyAiDecision() 를 호출하도록 결과 반환
+
+    이 함수가 구현되기 전까지 Admin UI 의 "AI 재검증" 버튼은 상태만 PENDING 으로
+    되돌리고 실제로는 이 엔드포인트를 호출하지 않는다 (Backend 측에서 단락).
+    """
+    logger.warning(
+        "review_verification_agent_not_implemented",
+        verification_id=request.verification_id,
+        user_id=request.user_id,
+    )
+    # 503 Service Unavailable — "의도적으로 현재 가용하지 않음" 의 표준 코드.
+    # Admin UI 는 이 응답 대신 agentAvailable=false 플래그(Backend 에서 단락)로 안내한다.
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": "review_verification_agent_not_implemented",
+            "message": (
+                "AI 리뷰 검증 에이전트가 아직 구현되지 않았습니다. "
+                "설계: docs/도장깨기_리뷰검증_에이전트_설계서.md"
+            ),
+            "verification_id": request.verification_id,
+        },
+    )
