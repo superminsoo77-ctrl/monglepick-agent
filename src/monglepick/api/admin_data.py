@@ -189,7 +189,9 @@ class MovieUpdateRequest(BaseModel):
     rating: Optional[float] = None
     runtime: Optional[int] = None
     director: Optional[str] = None
-    poster_url: Optional[str] = None
+    # 2026-04-14: movies 테이블 실제 컬럼명은 `poster_path` (Backend Movie.java 와 일치).
+    # 과거에 사용되던 `poster_url` 은 존재하지 않아 SQL 에러(1054)를 유발하므로 제거.
+    poster_path: Optional[str] = None
 
 
 def _to_camel(s: str) -> str:
@@ -422,7 +424,8 @@ async def get_data_quality() -> dict:
 
                 null_overview = await count_null("overview")
                 null_genres = await count_null("genres")
-                null_poster = await count_null("poster_url")
+                # 2026-04-14: 실제 컬럼명은 `poster_path` (poster_url 은 미존재 → SQL 1054 에러)
+                null_poster = await count_null("poster_path")
                 null_director = await count_null("director")
 
                 # 중복 제목 검출 (동명이인 영화)
@@ -451,7 +454,8 @@ async def get_data_quality() -> dict:
             "nullRates": {
                 "overview": {"count": null_overview, "ratio": _ratio(null_overview)},
                 "genres": {"count": null_genres, "ratio": _ratio(null_genres)},
-                "posterUrl": {"count": null_poster, "ratio": _ratio(null_poster)},
+                # 컬럼명 변경에 맞춰 키도 `posterPath` 로 일원화 (프론트엔드 표시 라벨용)
+                "posterPath": {"count": null_poster, "ratio": _ratio(null_poster)},
                 "director": {"count": null_director, "ratio": _ratio(null_director)},
             },
             "duplicateTitles": dup_titles,
@@ -502,10 +506,13 @@ async def list_movies(
                 total = (await cur.fetchone())[0]
 
                 # 페이징 조회 (selected 컬럼만 — 응답 페이로드 최소화)
+                # 2026-04-14 수정:
+                #   1) `poster_url` → `poster_path` 로 정정 (1054 에러 해결, Backend Movie.java §81 와 일치)
+                #   2) `source`, `release_date` 컬럼 추가 → MovieTable.jsx 가 원하는 필드 셋 충족
                 offset = page * size
                 list_sql = (
-                    f"SELECT movie_id, title, title_en, release_year, rating, "
-                    f"director, poster_url, runtime "
+                    f"SELECT movie_id, title, title_en, release_year, release_date, "
+                    f"rating, director, poster_path, runtime, source "
                     f"FROM movies {where_sql} "
                     f"ORDER BY release_year DESC, movie_id DESC "
                     f"LIMIT %s OFFSET %s"
@@ -513,26 +520,51 @@ async def list_movies(
                 await cur.execute(list_sql, params + [size, offset])
                 rows = await cur.fetchall()
 
-                items = [
-                    {
-                        "movieId": row[0],
-                        "title": row[1],
-                        "titleEn": row[2],
-                        "releaseYear": row[3],
-                        "rating": row[4],
-                        "director": row[5],
-                        "posterUrl": row[6],
-                        "runtime": row[7],
-                    }
-                    for row in rows
-                ]
+                # 프론트엔드(MovieTable/MovieMasterTab)는 Spring Page 스타일 필드를 기대하므로
+                # camelCase 와 snake_case 를 함께 내려준다. 중복이지만 두 컴포넌트를
+                # 한 응답으로 커버하기 위한 의도된 alias 이다.
+                items = []
+                for row in rows:
+                    movie_id, title, title_en, rel_year, rel_date, rating, director, poster_path, runtime, source = row
+                    # release_date 는 LocalDate → ISO 문자열
+                    rel_date_str = rel_date.isoformat() if rel_date is not None else None
+                    items.append(
+                        {
+                            # MovieTable.jsx 기대 필드 (snake_case + id)
+                            "id": movie_id,
+                            "title": title,
+                            "title_ko": title,  # movies 테이블에는 한국어 제목이 title 로 저장됨
+                            "title_en": title_en,
+                            "release_date": rel_date_str,
+                            "release_year": rel_year,
+                            "vote_average": rating,
+                            "source": source,
+                            "runtime": runtime,
+                            "poster_path": poster_path,
+                            "director": director,
+                            # MovieMasterTab.jsx 기대 필드 (camelCase)
+                            "movieId": movie_id,
+                            "titleEn": title_en,
+                            "releaseYear": rel_year,
+                            "rating": rating,
+                            "posterPath": poster_path,
+                        }
+                    )
 
+        total_pages = (total + size - 1) // size if size > 0 else 0
+
+        # Spring Data `Page` 와 동일한 스키마로 반환 → 관리자 UI 가 별도 어댑터 없이 바로 사용.
+        # (과거 `items/total` 형식은 프론트(`result.content`) 와 불일치하여 목록이 비어 보였음)
         return {
-            "items": items,
-            "page": page,
+            "content": items,
+            "totalElements": total,
+            "totalPages": total_pages,
+            "number": page,        # 0-base page index
             "size": size,
-            "total": total,
-            "totalPages": (total + size - 1) // size if size > 0 else 0,
+            "first": page == 0,
+            "last": page >= total_pages - 1 if total_pages > 0 else True,
+            "numberOfElements": len(items),
+            "empty": len(items) == 0,
         }
     except Exception as e:
         logger.error("list_movies_failed", error=str(e))
