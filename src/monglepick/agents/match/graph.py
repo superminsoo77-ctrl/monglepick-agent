@@ -42,11 +42,13 @@ from monglepick.agents.match.models import (
 from monglepick.agents.match.nodes import (
     explanation_generator,
     feature_extractor,
+    llm_reranker,
     match_scorer,
     movie_loader,
     query_builder,
     rag_retriever,
 )
+from monglepick.metrics import match_duration_seconds, match_requests_total
 
 logger = structlog.get_logger()
 
@@ -72,6 +74,11 @@ NODE_STATUS_MESSAGES: dict[str, dict[str, str]] = {
     "rag_retriever": {
         "phase": "searching",
         "message": "15만 편의 영화에서 검색하고 있어요...",
+    },
+    # Match v3: llm_reranker 노드의 SSE 상태 메시지
+    "llm_reranker": {
+        "phase": "reranking",
+        "message": "AI가 두 분의 취향에 맞는 영화를 고르고 있어요...",
     },
     "match_scorer": {
         "phase": "scoring",
@@ -129,7 +136,9 @@ def build_match_graph():
     """
     Movie Match Agent StateGraph를 구성하고 컴파일한다.
 
-    6개 노드와 1개 조건부 분기를 등록하여 영화 매칭 흐름을 정의한다.
+    Match v3 (2026-04-14): 7개 노드로 확장
+    - rag_retriever 와 match_scorer 사이에 llm_reranker(Solar LLM) 노드 추가
+    - "두 영화를 모두 좋아할 사용자 관점" 을 Chat Agent 수준의 LLM 리랭커로 판단
 
     Returns:
         컴파일된 StateGraph (CompiledGraph)
@@ -137,11 +146,12 @@ def build_match_graph():
     # MovieMatchState TypedDict 기반 StateGraph 생성
     graph = StateGraph(MovieMatchState)
 
-    # ── 노드 등록 (6개) ──
+    # ── 노드 등록 (7개, Match v3) ──
     graph.add_node("movie_loader", movie_loader)
     graph.add_node("feature_extractor", feature_extractor)
     graph.add_node("query_builder", query_builder)
     graph.add_node("rag_retriever", rag_retriever)
+    graph.add_node("llm_reranker", llm_reranker)            # Match v3 신규
     graph.add_node("match_scorer", match_scorer)
     graph.add_node("explanation_generator", explanation_generator)
 
@@ -161,15 +171,17 @@ def build_match_graph():
     )
 
     # 이후는 선형 파이프라인 (조건부 분기 없음)
+    # Match v3: rag_retriever → llm_reranker → match_scorer 순서로 LLM 삽입
     graph.add_edge("feature_extractor", "query_builder")
     graph.add_edge("query_builder", "rag_retriever")
-    graph.add_edge("rag_retriever", "match_scorer")
+    graph.add_edge("rag_retriever", "llm_reranker")
+    graph.add_edge("llm_reranker", "match_scorer")
     graph.add_edge("match_scorer", "explanation_generator")
     graph.add_edge("explanation_generator", END)
 
     # 그래프 컴파일
     compiled = graph.compile()
-    logger.info("match_graph_compiled", node_count=6)
+    logger.info("match_graph_compiled", node_count=7)
     return compiled
 
 
@@ -218,6 +230,7 @@ async def run_match_agent(
     SSE 이벤트 발행 시점:
     - movie_loader 완료 → status(loading) 발행
     - feature_extractor 완료 → status(analyzing) + shared_features 이벤트 발행
+    - llm_reranker 완료 → status(reranking) 발행
     - match_scorer 완료 → status(scoring) 발행
     - explanation_generator 완료 → match_result 이벤트 발행
     - 모든 완료 → done 이벤트 발행
@@ -232,6 +245,9 @@ async def run_match_agent(
         SSE 이벤트 dict {"event": str, "data": str}
     """
     graph_start = time.perf_counter()
+
+    # Prometheus outcome 추적 — finally 블록에서 최종 라벨 확정하여 기록.
+    outcome_label = "success"
 
     # 초기 State 구성
     initial_state: MovieMatchState = {
@@ -360,6 +376,7 @@ async def run_match_agent(
                         })
                     else:
                         # 추천 결과가 없음 (후보 부족 등)
+                        outcome_label = "no_results"
                         yield _format_sse_event("error", {
                             "error_code": "NO_RESULTS",
                             "message": "조건에 맞는 영화를 찾지 못했어요. 다른 영화 조합을 시도해보세요.",
@@ -374,6 +391,9 @@ async def run_match_agent(
                         error_code, detail = error_msg.split(":", 1)
                     else:
                         error_code, detail = error_msg, ""
+
+                    # Prometheus outcome: movie_loader 단계 에러 → "error" 로 분류
+                    outcome_label = "error"
 
                     # 인프라 장애와 영화 미발견을 구분하여 사용자 메시지 분리
                     if error_code == "SERVICE_UNAVAILABLE":
@@ -399,6 +419,7 @@ async def run_match_agent(
 
     except Exception as e:
         graph_elapsed_ms = (time.perf_counter() - graph_start) * 1000
+        outcome_label = "error"
         logger.error(
             "match_agent_stream_error",
             error=str(e),
@@ -420,6 +441,20 @@ async def run_match_agent(
             except (asyncio.CancelledError, Exception):
                 pass
 
+        # ── Prometheus 메트릭 기록 (항상 실행, 클라이언트 조기 종료 시에도 반영) ──
+        # outcome_label 은 실행 경로상 가장 마지막으로 확정된 값을 기록한다.
+        # - success    : explanation_generator 가 ranked_movies 를 정상 반환
+        # - no_results : 후보가 비어 NO_RESULTS 에러 발행
+        # - error      : movie_loader 실패 / 기타 예외
+        try:
+            match_requests_total.labels(outcome=outcome_label).inc()
+            match_duration_seconds.labels(outcome=outcome_label).observe(
+                time.perf_counter() - graph_start,
+            )
+        except Exception as metric_err:
+            # 메트릭 기록 실패는 서비스 중단 사유가 아니므로 경고 로그만
+            logger.warning("match_metric_record_error", error=str(metric_err))
+
 
 def _predict_next_node(completed_node: str) -> str | None:
     """
@@ -434,12 +469,13 @@ def _predict_next_node(completed_node: str) -> str | None:
     Returns:
         다음 노드 이름 (없으면 None)
     """
-    # Movie Match 그래프의 고정 선형 순서
+    # Movie Match 그래프의 고정 선형 순서 (Match v3: llm_reranker 포함)
     _NEXT_NODE: dict[str, str] = {
         "movie_loader": "feature_extractor",
         "feature_extractor": "query_builder",
         "query_builder": "rag_retriever",
-        "rag_retriever": "match_scorer",
+        "rag_retriever": "llm_reranker",
+        "llm_reranker": "match_scorer",
         "match_scorer": "explanation_generator",
     }
     return _NEXT_NODE.get(completed_node)
@@ -469,6 +505,7 @@ async def run_match_agent_sync(
         최종 MovieMatchState dict (LangGraph 출력)
     """
     sync_start = time.perf_counter()
+    outcome_label = "success"
 
     initial_state: MovieMatchState = {
         "movie_id_1": movie_id_1,
@@ -489,6 +526,15 @@ async def run_match_agent_sync(
 
         elapsed_ms = (time.perf_counter() - sync_start) * 1000
         ranked_movies = final_state.get("ranked_movies", [])
+
+        # 동기 모드도 outcome 을 세분화하여 Prometheus 에 기록
+        if final_state.get("error"):
+            outcome_label = "error"
+        elif not ranked_movies:
+            outcome_label = "no_results"
+        else:
+            outcome_label = "success"
+
         logger.info(
             "match_agent_sync_done",
             movie_id_1=movie_id_1,
@@ -497,10 +543,26 @@ async def run_match_agent_sync(
             elapsed_ms=round(elapsed_ms, 1),
         )
 
+        try:
+            match_requests_total.labels(outcome=outcome_label).inc()
+            match_duration_seconds.labels(outcome=outcome_label).observe(
+                time.perf_counter() - sync_start,
+            )
+        except Exception as metric_err:
+            logger.warning("match_metric_record_error", error=str(metric_err))
+
         return final_state
 
     except Exception as e:
         elapsed_ms = (time.perf_counter() - sync_start) * 1000
+        outcome_label = "error"
+        try:
+            match_requests_total.labels(outcome=outcome_label).inc()
+            match_duration_seconds.labels(outcome=outcome_label).observe(
+                time.perf_counter() - sync_start,
+            )
+        except Exception:
+            pass
         logger.error(
             "match_agent_sync_error",
             error=str(e),

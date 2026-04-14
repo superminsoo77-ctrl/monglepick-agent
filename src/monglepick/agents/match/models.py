@@ -81,9 +81,16 @@ class MatchScoreDetail(BaseModel):
     """
     후보 영화와 두 입력 영화 간의 유사도 상세 내역 (match_scorer 노드 출력).
 
-    핵심 원칙:
-    - match_score = min(sim_to_movie_1, sim_to_movie_2)
-    - 한쪽에만 유사한 영화는 낮은 점수 → 양쪽 모두에 유사해야 높은 점수
+    핵심 원칙 (Match v3, 2026-04-14):
+    - final = 0.5 × llm_score + 0.3 × harmonic_sim + 0.2 × cf_score
+      (LLM 점수 없으면 harmonic/cf 를 재정규화하여 누락 가중치 분배)
+    - harmonic_sim = harmonic_mean(sim_1, sim_2) × balance_bonus
+      = (2·s1·s2 / (s1+s2)) × (0.7 + 0.3 · (1 − |s1−s2|))
+    - LLM 점수는 "두 영화를 모두 좋아할 사람 관점" 에서 Solar 가 평가 (0~1 정규화)
+    - CF 점수는 "두 영화 모두 높게 평가한 사용자의 다른 영화" 공통 사용자 수 정규화
+
+    기존 Level 1-C 의 harmonic × balance 공식은 그대로 유지하되,
+    Match v3 에서 LLM 리랭커와 CF 점수를 가중합하여 최종 match_score 로 환산.
     """
 
     sim_to_movie_1: float = Field(
@@ -102,7 +109,19 @@ class MatchScoreDetail(BaseModel):
         default=0.0,
         ge=0.0,
         le=1.0,
-        description="최종 매치 스코어 = min(sim_to_movie_1, sim_to_movie_2)",
+        description="최종 매치 스코어 (LLM 50% + harmonic 30% + CF 20%, 누락 시 재정규화)",
+    )
+    llm_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="LLM 리랭커(Solar) 가 매긴 점수 (0~1), Match v3 신규. 0 은 미평가 또는 0점.",
+    )
+    cf_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Co-watched CF 점수 (0~1), Match v3 신규. 0 은 공통 사용자 없음.",
     )
     genre_overlap: float = Field(
         default=0.0,
@@ -276,9 +295,11 @@ class MovieMatchResponse(BaseModel):
 
 class MovieMatchState(TypedDict, total=False):
     """
-    Movie Match Agent LangGraph TypedDict State (§21-2).
+    Movie Match Agent LangGraph TypedDict State (§21-2, Match v3 2026-04-14 확장).
 
-    6개 노드가 이 State를 읽고 쓰며 그래프를 진행한다.
+    7개 노드(movie_loader → feature_extractor → query_builder → rag_retriever
+    → llm_reranker → match_scorer → explanation_generator) 가 이 State를 공유한다.
+
     TypedDict(total=False): 모든 키가 Optional (초기 State에 일부만 존재).
 
     입력 필드 (API에서 설정):
@@ -289,6 +310,7 @@ class MovieMatchState(TypedDict, total=False):
         shared_features           → feature_extractor
         search_query              → query_builder
         candidate_movies          → rag_retriever
+        llm_scores                → llm_reranker (Match v3 신규)
         ranked_movies             → match_scorer, explanation_generator
         error                     → movie_loader (에러 시)
     """
@@ -311,8 +333,13 @@ class MovieMatchState(TypedDict, total=False):
     # ── rag_retriever 출력 ──
     candidate_movies: list[dict[str, Any]]  # RAG 검색 결과 후보 영화 목록 (embedding 포함)
 
+    # ── llm_reranker 출력 (Match v3, 2026-04-14) ──
+    # {movie_id: llm_score_0_to_1} — LLM 이 "두 영화를 모두 좋아할 사람 관점" 에서 매긴 점수.
+    # LLM 실패 시 빈 dict ({}). match_scorer 는 이 dict 를 읽어 calculate_match_score 에 주입.
+    llm_scores: dict[str, float]
+
     # ── match_scorer / explanation_generator 출력 ──
-    ranked_movies: list[MatchedMovie]  # MMR 리랭킹 후 최종 Top 5
+    ranked_movies: list[MatchedMovie]  # Top 3 (Match v3: 5→3)
 
     # ── 에러 처리 ──
     error: str                         # 에러 메시지 (있을 경우, movie_loader에서 설정)
@@ -470,47 +497,93 @@ def calculate_match_score(
     candidate: dict[str, Any],
     movie_1: dict[str, Any],
     movie_2: dict[str, Any],
+    llm_score: float | None = None,
+    cf_score: float | None = None,
 ) -> MatchScoreDetail:
     """
-    두 영화 모두에 유사한 정도를 min() 전략으로 계산한다 (§21-5).
+    Match v3 (2026-04-14) — LLM 리랭커 + harmonic 유사도 + CF 점수 가중합.
 
-    핵심 원리:
-    - min(sim_to_movie_1, sim_to_movie_2) 사용
-    - 한쪽에만 유사한 영화는 낮은 점수 → 양쪽 모두 유사해야 높은 점수
+    ### 공식
+    - harmonic_sim = harmonic_mean(sim_1, sim_2) × balance_bonus
+      * harmonic_mean = 2·s1·s2 / (s1+s2)
+      * balance_bonus = 0.7 + 0.3·(1 − |s1−s2|)
+      * 한쪽이 0 이면 harmonic_sim = 0 (두 영화 모두와 유사 목표 보존)
+    - final = W_llm·llm_score + W_harm·harmonic_sim + W_cf·cf_score
+      * 기본 가중치: W_llm=0.5, W_harm=0.3, W_cf=0.2
+      * LLM 없으면: W_harm/W_cf 재정규화로 LLM 비중 분배 (harmonic 6/10, cf 4/10)
+      * CF 없으면: W_harm 로 CF 비중 분배 (llm 5/8 → 0.625, harmonic 3/8 → 0.375)
+      * LLM+CF 모두 없으면: harmonic_sim 100% (Level 1-C 공식과 동일 회귀)
 
-    예시:
-    - A와 0.9, B와 0.8 → match_score = 0.8 (양쪽 모두 높음 → 좋은 추천)
-    - A와 0.95, B와 0.2 → match_score = 0.2 (한쪽만 유사 → 나쁜 추천)
+    ### 설계 근거
+    - LLM 리랭커가 "두 영화를 모두 좋아할 사용자 관점" 을 가장 직접적으로 판단 → 가중치 최대
+    - harmonic 은 메타데이터/임베딩 기반 객관 지표로 LLM 보정용
+    - CF 는 "실제 같은 사용자 선호" 신호로 LLM 보완용
+    - 3축 가중합으로 단일 지표 편향 완화
+
+    ### 예시
+    - llm=0.9, harm=0.8, cf=0.6 → 0.5×0.9 + 0.3×0.8 + 0.2×0.6 = 0.810 (3축 모두 좋음)
+    - llm=0.9, harm=0.4, cf=None → W 재정규화(llm 5/8, harm 3/8) → 0.625×0.9+0.375×0.4=0.713
+    - llm=None, harm=0.8, cf=0.6 → W 재정규화(harm 6/10, cf 4/10) → 0.6×0.8+0.4×0.6=0.720
 
     Args:
-        candidate: 후보 영화 dict
-        movie_1  : 첫 번째 선택 영화 dict
-        movie_2  : 두 번째 선택 영화 dict
+        candidate : 후보 영화 dict (genres/mood_tags/keywords/embedding 포함)
+        movie_1   : 첫 번째 선택 영화 dict
+        movie_2   : 두 번째 선택 영화 dict
+        llm_score : LLM 리랭커 점수 (0~1, Match v3). None 또는 0.0 이면 미평가 간주.
+        cf_score  : Co-watched CF 점수 (0~1, Match v3). None 이면 CF 후보 아님.
 
     Returns:
-        MatchScoreDetail (sim_to_movie_1/2, match_score, genre/mood/keyword_overlap 포함)
+        MatchScoreDetail (sim_to_movie_1/2, match_score, llm_score, cf_score,
+                          genre/mood/keyword_overlap 포함)
     """
-    # 각 선택 영화와의 개별 유사도 계산
+    # 각 선택 영화와의 개별 유사도 계산 (기존 Level 1-A/B 방식 유지)
     sim_1 = calculate_similarity(candidate, movie_1)
     sim_2 = calculate_similarity(candidate, movie_2)
 
-    # 공통 장르/무드/키워드와의 겹침 비율 계산
-    # genre_overlap: 후보 장르 vs 두 영화의 공통 장르 교집합
+    # ── harmonic mean + balance (기존 Level 1-C 공식) ──
+    if sim_1 <= 0 or sim_2 <= 0:
+        harmonic_sim = 0.0
+    else:
+        harmonic = 2.0 * sim_1 * sim_2 / (sim_1 + sim_2)
+        balance = 0.7 + 0.3 * (1.0 - abs(sim_1 - sim_2))
+        harmonic_sim = max(0.0, min(1.0, harmonic * balance))
+
+    # ── LLM / CF 점수 가중 융합 (Match v3 신규) ──
+    # 값이 None 이거나 명백히 미평가(0.0) 인 경우 가중치에서 제외하고 재정규화.
+    # llm_score 는 LLM 리랭커 dict 에 movie_id 가 없으면 None; 있으면 0~1 실수값.
+    # 따라서 None 을 "미평가", 0.0 을 "실제 0점" 으로 구분한다.
+    components: list[tuple[float, float]] = []  # (weight, value) 튜플
+    # 기본 가중치 — W_llm=0.5, W_harm=0.3, W_cf=0.2
+    if llm_score is not None:
+        components.append((0.5, max(0.0, min(1.0, llm_score))))
+    # harmonic 은 항상 유효 (sim=0 인 경우에도 0.0 값으로 가중합에 포함)
+    components.append((0.3, harmonic_sim))
+    # cf_score 는 None 이면 미제공, 0.0 은 공통 사용자 없음 → 0점 valid 로 포함
+    if cf_score is not None:
+        components.append((0.2, max(0.0, min(1.0, cf_score))))
+
+    # 가중치 재정규화 (LLM 또는 CF 누락 시 분배)
+    total_weight = sum(w for w, _ in components)
+    if total_weight <= 0:
+        final_score = 0.0
+    else:
+        final_score = sum((w / total_weight) * v for w, v in components)
+        final_score = max(0.0, min(1.0, final_score))
+
+    # 공통 장르/무드/키워드와의 겹침 비율 계산 (기존 유지)
     common_genres = set(movie_1.get("genres", [])) & set(movie_2.get("genres", []))
     genre_overlap = jaccard(set(candidate.get("genres", [])), common_genres)
-
-    # mood_overlap: 후보 무드 vs 두 영화의 공통 무드 교집합
     common_moods = set(movie_1.get("mood_tags", [])) & set(movie_2.get("mood_tags", []))
     mood_overlap = jaccard(set(candidate.get("mood_tags", [])), common_moods)
-
-    # keyword_overlap: 후보 키워드 vs 두 영화의 공통 키워드 교집합
     common_keywords = set(movie_1.get("keywords", [])) & set(movie_2.get("keywords", []))
     keyword_overlap = jaccard(set(candidate.get("keywords", [])), common_keywords)
 
     return MatchScoreDetail(
         sim_to_movie_1=round(sim_1, 4),
         sim_to_movie_2=round(sim_2, 4),
-        match_score=round(min(sim_1, sim_2), 4),  # 핵심: min() 전략
+        match_score=round(final_score, 4),
+        llm_score=round(llm_score, 4) if llm_score is not None else 0.0,
+        cf_score=round(cf_score, 4) if cf_score is not None else 0.0,
         genre_overlap=round(genre_overlap, 4),
         mood_overlap=round(mood_overlap, 4),
         keyword_overlap=round(keyword_overlap, 4),

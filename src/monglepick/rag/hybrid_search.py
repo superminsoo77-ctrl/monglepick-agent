@@ -60,6 +60,7 @@ async def search_qdrant(
     origin_country_filter: list[str] | None = None,
     language_filter: str | None = None,
     production_countries_filter: list[str] | None = None,
+    query_vector: list[float] | None = None,
 ) -> list[SearchResult]:
     """
     Qdrant 벡터 검색: 쿼리의 의미적 유사도로 영화를 검색한다.
@@ -67,21 +68,39 @@ async def search_qdrant(
     §11-1 ①: 쿼리 벡터 생성 → 코사인 유사도 Top-30 + 메타데이터 필터
     동적 필터(min_rating, has_trailer, min_popularity, max_runtime, min_vote_count,
     origin_country, original_language, production_countries) 지원.
+
+    query_vector 파라미터를 전달하면 임베딩 API를 호출하지 않고 해당 벡터를 바로 사용한다
+    (Movie Match 의 centroid 검색 등 사전 계산된 벡터를 활용하는 경우).
     """
     # Qdrant 검색 타이밍 측정 시작
     qdrant_start = time.perf_counter()
     client = await get_qdrant()
 
-    # 쿼리 임베딩 — 비동기 래퍼로 event loop 블로킹 방지 (C-1)
-    # Upstage API 장애 시 무한 대기 방지를 위해 30초 타임아웃 적용
-    try:
-        query_vector = (await asyncio.wait_for(
-            embed_query_async(query),
-            timeout=30.0,
-        )).tolist()
-    except asyncio.TimeoutError:
-        logger.error("embedding_api_timeout", query_preview=query[:80], timeout_sec=30)
-        return []  # 임베딩 실패 시 빈 결과 반환 (RRF에서 다른 엔진 결과만 사용)
+    # ── 쿼리 벡터 준비 ──
+    # 사전 계산된 query_vector 가 있으면 임베딩 API 호출을 생략한다.
+    # Movie Match 에이전트는 두 영화 임베딩의 centroid 를 직접 전달한다.
+    if query_vector is not None:
+        # 방어적 복사 — 외부 mutation 차단. np.array 등 다양한 타입을 list[float] 로 통일.
+        try:
+            query_vector = [float(v) for v in query_vector]
+        except (TypeError, ValueError) as conv_err:
+            logger.error(
+                "qdrant_search_invalid_query_vector",
+                error=str(conv_err),
+                vector_type=type(query_vector).__name__,
+            )
+            return []
+    else:
+        # 쿼리 임베딩 — 비동기 래퍼로 event loop 블로킹 방지 (C-1)
+        # Upstage API 장애 시 무한 대기 방지를 위해 30초 타임아웃 적용
+        try:
+            query_vector = (await asyncio.wait_for(
+                embed_query_async(query),
+                timeout=30.0,
+            )).tolist()
+        except asyncio.TimeoutError:
+            logger.error("embedding_api_timeout", query_preview=query[:80], timeout_sec=30)
+            return []  # 임베딩 실패 시 빈 결과 반환 (RRF에서 다른 엔진 결과만 사용)
 
     # 필터 조건 구성 (§10-2-1 payload 인덱스 활용)
     conditions = []
@@ -777,6 +796,7 @@ async def hybrid_search(
     origin_country_filter: list[str] | None = None,
     language_filter: str | None = None,
     production_countries_filter: list[str] | None = None,
+    query_vector: list[float] | None = None,
 ) -> list[SearchResult]:
     """
     3개 검색 엔진을 동시 실행하고 RRF로 합산하여 최종 후보를 반환한다.
@@ -844,6 +864,7 @@ async def hybrid_search(
                     origin_country_filter=origin_country_filter,
                     language_filter=language_filter,
                     production_countries_filter=production_countries_filter,
+                    query_vector=query_vector,  # centroid 등 사전 계산 벡터 전달
                 ),
                 timeout=_SEARCH_TIMEOUT,
             )

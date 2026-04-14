@@ -163,6 +163,15 @@ class Settings(BaseSettings):
     # ── Point (포인트 시스템) ──
     # Spring Boot Backend 내부 URL (포인트 API 호출용)
     BACKEND_BASE_URL: str = "http://localhost:8080"
+    # ── Recommend FastAPI 내부 URL ──
+    # Movie Match 의 Co-watched CF 후보 조회 (/api/v2/match/co-watched) 등에 사용.
+    # Docker 네트워크에서는 http://monglepick-recommend:8001 로 오버라이드한다.
+    RECOMMEND_BASE_URL: str = "http://localhost:8001"
+    # Co-watched CF 조회 타임아웃 (초) — CF 실패 시 Qdrant/ES/Neo4j 결과만으로도
+    # 매치가 가능하도록 짧게 설정해 전체 그래프 지연을 최소화한다.
+    MATCH_COWATCH_TIMEOUT: float = 3.0
+    # Co-watched CF 조회 top_k — RRF 에 투입할 후보 수
+    MATCH_COWATCH_TOP_K: int = 20
     # AI 추천 1회당 차감할 포인트 수 (init.sql point_items 기준 100P)
     POINT_COST_PER_RECOMMENDATION: int = 100
     # 포인트 체크 활성화 여부 (False이면 포인트 체크 생략 — 개발/테스트 환경)
@@ -225,6 +234,9 @@ class Settings(BaseSettings):
     MMR_LAMBDA: float = 0.7
     # 최종 추천 영화 수
     RECOMMENDATION_TOP_K: int = 5
+    # Movie Match v3 — 커플/개인 대상 핵심 추천 개수 (2026-04-14, 5→3 축소)
+    # 3편은 커플 선택지로 과하지 않으면서 LLM 리랭커가 품질 담보하기 충분한 개수
+    MATCH_TOP_K: int = 3
 
     # ── Hybrid Search (하이브리드 검색) ──
     # RRF Reciprocal Rank Fusion 상수
