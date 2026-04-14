@@ -339,7 +339,7 @@ class MovieMatchState(TypedDict, total=False):
     llm_scores: dict[str, float]
 
     # ── match_scorer / explanation_generator 출력 ──
-    ranked_movies: list[MatchedMovie]  # Top 3 (Match v3: 5→3)
+    ranked_movies: list[MatchedMovie]  # Top 5 (Match v3: 2026-04-14 3→5 복귀)
 
     # ── 에러 처리 ──
     error: str                         # 에러 메시지 (있을 경우, movie_loader에서 설정)

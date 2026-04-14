@@ -234,9 +234,9 @@ class Settings(BaseSettings):
     MMR_LAMBDA: float = 0.7
     # 최종 추천 영화 수
     RECOMMENDATION_TOP_K: int = 5
-    # Movie Match v3 — 커플/개인 대상 핵심 추천 개수 (2026-04-14, 5→3 축소)
-    # 3편은 커플 선택지로 과하지 않으면서 LLM 리랭커가 품질 담보하기 충분한 개수
-    MATCH_TOP_K: int = 3
+    # Movie Match v3 — 커플/개인 대상 핵심 추천 개수 (2026-04-14 유저 요청: 3→5 복귀)
+    # 5편은 커플에게 선택 폭을 충분히 제공하면서 LLM 리랭커 품질도 담보 가능한 개수
+    MATCH_TOP_K: int = 5
 
     # ── Hybrid Search (하이브리드 검색) ──
     # RRF Reciprocal Rank Fusion 상수
