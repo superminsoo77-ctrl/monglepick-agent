@@ -4,6 +4,7 @@
 시스템 탭:
 - GET /api/v1/admin/system/db — 5개 DB(MySQL/Qdrant/Neo4j/ES/Redis) 상태 조회
 - GET /api/v1/admin/system/ollama — Ollama 모델 로드 상태 조회
+- GET /api/v1/admin/system/vllm   — vLLM 모델 상태 조회 (Chat/Vision 2개 엔드포인트)
 
 AI 운영 탭:
 - POST /api/v1/admin/ai/quiz/generate — LLM 기반 영화 퀴즈 자동 생성 + quizzes 테이블 PENDING INSERT
@@ -301,6 +302,189 @@ def _format_bytes(n: int) -> str:
             return f"{n:.1f}{unit}"
         n /= 1024
     return f"{n:.1f}PB"
+
+
+# ============================================================
+# GET /admin/system/vllm — vLLM 모델 상태 조회 (Chat / Vision)
+# ============================================================
+#
+# 운영서버(VM4) vLLM 상태 확인용. hybrid/api_only 모드에서 실제로 호출되는
+# LLM 서버 2종을 개별 카드로 노출한다.
+#
+# - Chat   : EXAONE 4.0 1.2B  (VLLM_CHAT_BASE_URL   기본 :18000/v1)
+# - Vision : Qwen2.5-VL-3B    (VLLM_VISION_BASE_URL 기본 :18001/v1)
+#
+# vLLM은 OpenAI 호환 API를 제공하므로 `/v1/models` 로 사용 가능 모델을,
+# `/health` 로 서버 헬스를 확인할 수 있다. (vLLM `/health` 는 /v1 을 prefix로
+# 가지지 않음 — base_url 의 `/v1` 을 제거하고 조회)
+#
+# Ollama 와 다른 점:
+# - vLLM 은 프로세스당 하나의 모델만 로드한다(모델 리스트는 보통 1건).
+# - VRAM/로드 상태를 API 로 노출하지 않으므로 "연결 여부 + 모델 ID" 만 보고한다.
+# - VLLM_ENABLED=False 면 호출을 스킵하고 enabled=False 만 반환한다.
+#
+# 실패 시 /ollama 엔드포인트와 동일하게 500이 아닌 200 JSON에 connected=False 로
+# 응답한다 (관리자 카드가 "장애" 뱃지를 띄울 수 있도록).
+
+
+async def _probe_vllm(base_url: str, expected_model: str, timeout: float = 5.0) -> dict:
+    """
+    단일 vLLM 엔드포인트의 헬스/모델 리스트를 조회한다.
+
+    base_url 예시: "http://10.20.0.10:18000/v1"
+      - /models  : OpenAI 호환 모델 리스트
+      - /health  : vLLM 기본 헬스체크 (base_url 에서 `/v1` 제거한 후 호출)
+
+    반환 필드 (프론트 카드가 기대):
+      - connected      : bool
+      - baseUrl        : 호출 대상 (디버깅용 노출)
+      - expectedModel  : .env 에 지정된 모델 ID
+      - loadedModels   : 서버가 실제로 서빙 중인 모델 ID 목록
+      - healthStatus   : "ok" | "unknown" | 에러 문자열
+      - error          : 연결 실패 시 원인
+    """
+    # /v1 suffix 를 제거해서 /health 용 root URL 을 얻는다.
+    # 일반적으로 vLLM 은 /health (v1 이 아닌 root) 를 제공한다.
+    if base_url.endswith("/v1"):
+        root_url = base_url[: -len("/v1")]
+    elif base_url.endswith("/v1/"):
+        root_url = base_url[: -len("/v1/")]
+    else:
+        root_url = base_url.rstrip("/")
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # 1) 헬스체크 — vLLM 기본 /health 는 200 OK 만 반환.
+            health_status = "unknown"
+            try:
+                health_resp = await client.get(f"{root_url}/health")
+                if health_resp.status_code == 200:
+                    health_status = "ok"
+                else:
+                    health_status = f"http_{health_resp.status_code}"
+            except Exception:
+                # /health 엔드포인트가 없어도 /models 가 응답하면 정상으로 간주한다.
+                health_status = "unknown"
+
+            # 2) 사용 가능 모델 조회 (OpenAI 호환)
+            models_resp = await client.get(f"{base_url.rstrip('/')}/models")
+            loaded_models: list[str] = []
+            if models_resp.status_code == 200:
+                data = models_resp.json()
+                for m in data.get("data", []) or []:
+                    model_id = m.get("id") or m.get("name")
+                    if model_id:
+                        loaded_models.append(model_id)
+            else:
+                return {
+                    "connected": False,
+                    "baseUrl": base_url,
+                    "expectedModel": expected_model,
+                    "loadedModels": [],
+                    "healthStatus": health_status,
+                    "error": f"/models returned HTTP {models_resp.status_code}",
+                }
+
+        return {
+            "connected": True,
+            "baseUrl": base_url,
+            "expectedModel": expected_model,
+            "loadedModels": loaded_models,
+            "healthStatus": health_status,
+            "error": None,
+        }
+
+    except Exception as e:
+        # 연결 실패 / 타임아웃 — 상세 에러를 그대로 관리자 UI 로 노출한다.
+        return {
+            "connected": False,
+            "baseUrl": base_url,
+            "expectedModel": expected_model,
+            "loadedModels": [],
+            "healthStatus": "unreachable",
+            "error": str(e),
+        }
+
+
+@admin_router.get(
+    "/system/vllm",
+    summary="vLLM 모델 상태 조회",
+    description=(
+        "운영서버 vLLM(Chat + Vision)의 연결 상태와 서빙 중인 모델 ID를 반환한다. "
+        "VLLM_ENABLED=False 인 환경에서는 enabled=False 만 반환한다."
+    ),
+)
+async def get_vllm_status():
+    """
+    vLLM Chat / Vision 2개 엔드포인트를 병렬 조회한다.
+
+    응답 구조:
+        {
+          "enabled": bool,                  # settings.VLLM_ENABLED
+          "timeoutSeconds": int,            # settings.VLLM_TIMEOUT
+          "chat":   { connected, baseUrl, expectedModel, loadedModels, healthStatus, error },
+          "vision": { connected, baseUrl, expectedModel, loadedModels, healthStatus, error }
+        }
+
+    VLLM_ENABLED 가 False 여도 baseUrl/expectedModel 만 반환하여 관리자가
+    설정값을 확인할 수 있게 한다(실제 네트워크 호출은 하지 않음).
+    """
+    import asyncio
+
+    enabled = bool(getattr(settings, "VLLM_ENABLED", False))
+    timeout = float(getattr(settings, "VLLM_TIMEOUT", 30))
+
+    chat_base = getattr(settings, "VLLM_CHAT_BASE_URL", "http://localhost:18000/v1")
+    chat_model = getattr(settings, "VLLM_CHAT_MODEL", "")
+    vision_base = getattr(settings, "VLLM_VISION_BASE_URL", "http://localhost:18001/v1")
+    vision_model = getattr(settings, "VLLM_VISION_MODEL", "")
+
+    # 비활성화 상태여도 설정값은 노출한다 (카드에서 "비활성" 뱃지로 표시).
+    if not enabled:
+        stub = lambda base, model: {
+            "connected": False,
+            "baseUrl": base,
+            "expectedModel": model,
+            "loadedModels": [],
+            "healthStatus": "disabled",
+            "error": "VLLM_ENABLED=False",
+        }
+        return {
+            "enabled": False,
+            "timeoutSeconds": int(timeout),
+            "chat": stub(chat_base, chat_model),
+            "vision": stub(vision_base, vision_model),
+        }
+
+    # Chat/Vision 을 병렬로 프로브 (서로 다른 VM 포트라 한쪽이 느려도 합산 지연 최소화)
+    probe_timeout = min(timeout, 5.0)  # 관리자 대시보드는 짧은 타임아웃이 낫다
+    try:
+        chat_result, vision_result = await asyncio.gather(
+            _probe_vllm(chat_base, chat_model, timeout=probe_timeout),
+            _probe_vllm(vision_base, vision_model, timeout=probe_timeout),
+        )
+    except Exception as e:
+        # asyncio.gather 자체가 실패할 일은 거의 없지만 방어적으로 캐치.
+        logger.warning("admin_vllm_check_failed", error=str(e))
+        return {
+            "enabled": True,
+            "timeoutSeconds": int(timeout),
+            "chat": {
+                "connected": False, "baseUrl": chat_base, "expectedModel": chat_model,
+                "loadedModels": [], "healthStatus": "error", "error": str(e),
+            },
+            "vision": {
+                "connected": False, "baseUrl": vision_base, "expectedModel": vision_model,
+                "loadedModels": [], "healthStatus": "error", "error": str(e),
+            },
+        }
+
+    return {
+        "enabled": True,
+        "timeoutSeconds": int(timeout),
+        "chat": chat_result,
+        "vision": vision_result,
+    }
 
 
 # ============================================================
