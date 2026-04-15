@@ -64,16 +64,21 @@ class TestRouteAfterRetrieval:
         assert result == "similar_fallback_search"
 
     def test_low_top_score(self):
-        """Top-1 점수 낮음 (0.01 < 0.015), 후보 있음 → similar_fallback_search (Phase Q-3)."""
+        """
+        Top-1 점수 낮음 + 초기 턴 → question_generator (soft-ambiguous, 2026-04-15).
+
+        top_score < RETRIEVAL_SOFT_AMBIGUOUS_TOP_SCORE(0.02) 이고 turn_count < 3 이면
+        의도 확인 재질문으로 우선 분기한다 (기존 Phase Q-3 similar_fallback_search 분기 우선).
+        """
         from monglepick.agents.chat.graph import route_after_retrieval
 
         state: ChatAgentState = {
-            "candidate_movies": _make_candidates([0.01, 0.008, 0.005]),
+            "candidate_movies": _make_candidates([0.009, 0.006, 0.004]),
             "turn_count": 1,
         }
         result = route_after_retrieval(state)
-        # Phase Q-3: 후보가 있지만 품질 미달 → 비슷한 영화 확장 검색
-        assert result == "similar_fallback_search"
+        # soft-ambiguous: AI 제안 카드로 의도 재확인
+        assert result == "question_generator"
 
     def test_low_average_score(self):
         """Top-1은 OK이나 평균 낮음, 후보 있음 → similar_fallback_search (Phase Q-3)."""
@@ -128,20 +133,25 @@ class TestRouteAfterRetrieval:
         assert result == "llm_reranker"
 
     def test_boundary_just_below_threshold(self):
-        """임계값 바로 아래, 후보 있음 → similar_fallback_search (Phase Q-3)."""
+        """
+        임계값 바로 아래 + 초기 턴 → question_generator (soft-ambiguous).
+
+        2026-04-15: top_score 가 RETRIEVAL_SOFT_AMBIGUOUS_TOP_SCORE 미만이고 초기 턴이면
+        similar_fallback_search 보다 의도 재확인 재질문을 우선한다.
+        """
         from monglepick.agents.chat.graph import route_after_retrieval
 
         state: ChatAgentState = {
             "candidate_movies": _make_candidates([
                 RETRIEVAL_MIN_TOP_SCORE - 0.001,
-                0.01,
-                0.01,
+                RETRIEVAL_QUALITY_MIN_AVG,
+                RETRIEVAL_QUALITY_MIN_AVG,
             ]),
             "turn_count": 1,
         }
         result = route_after_retrieval(state)
-        # Phase Q-3: 후보가 있지만 품질 미달 → 비슷한 영화 확장 검색
-        assert result == "similar_fallback_search"
+        # soft-ambiguous: AI 제안 카드로 의도 재확인
+        assert result == "question_generator"
 
 
 class TestRetrievalConstants:
@@ -152,12 +162,18 @@ class TestRetrievalConstants:
         assert RETRIEVAL_MIN_CANDIDATES == 3
 
     def test_min_top_score_value(self):
-        """Top-1 최소 점수 = 0.015 (RRF k=60 단일 엔진 최대 ~0.01639 고려)."""
-        assert RETRIEVAL_MIN_TOP_SCORE == 0.015
+        """
+        Top-1 최소 점수 = 0.010 (2026-04-15 0.015 → 0.010 하향).
+
+        "애매하면 재질문" 정책(soft-ambiguous 분기 추가)에 맞춰 품질 임계값을
+        더 관대하게 잡는다. 0.010 은 RRF(k=60) 단일 엔진 Top-1 점수(≈0.01639) 에
+        근접해 "한 엔진이 상위 2~3위" 정도만 나와도 통과한다.
+        """
+        assert RETRIEVAL_MIN_TOP_SCORE == 0.010
 
     def test_min_avg_score_value(self):
-        """평균 최소 점수 = 0.01."""
-        assert RETRIEVAL_QUALITY_MIN_AVG == 0.01
+        """평균 최소 점수 = 0.008 (2026-04-15 0.01 → 0.008 하향)."""
+        assert RETRIEVAL_QUALITY_MIN_AVG == 0.008
 
     def test_top_score_greater_than_avg(self):
         """Top-1 임계값 > 평균 임계값 (논리적 일관성)."""
@@ -209,14 +225,17 @@ class TestRetrievalQualityChecker:
 
     @pytest.mark.asyncio
     async def test_low_score_feedback_message(self):
-        """Top-1 점수 낮음 → '조건과 딱 맞는 영화를 찾기 어려웠어요' 피드백."""
+        """Top-1 점수 낮음 → '조건과 딱 맞는 영화를 찾기 어려웠어요' 피드백.
+
+        2026-04-15 임계값 하향(0.015→0.010) 반영: rrf_score 를 0.009 이하로 설정.
+        """
         from monglepick.agents.chat.nodes import retrieval_quality_checker
 
-        # 후보는 있지만 rrf_score가 RETRIEVAL_MIN_TOP_SCORE 미만
+        # 후보는 있지만 rrf_score가 RETRIEVAL_MIN_TOP_SCORE(0.010) 미만
         candidates = [
             CandidateMovie(
                 id=str(i), title=f"영화{i}",
-                rrf_score=0.01 - i * 0.001,
+                rrf_score=0.009 - i * 0.001,
                 genres=["드라마"], rating=6.0, release_year=2015,
             )
             for i in range(5)

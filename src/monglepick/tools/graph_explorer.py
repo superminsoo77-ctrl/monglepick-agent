@@ -18,7 +18,7 @@ Neo4j 스키마 (§10-3-1):
           (Movie)-[:HAS_GENRE]->(Genre)
           (Movie)-[:HAS_MOOD]->(MoodTag)
           (Movie)-[:AVAILABLE_ON]->(OTTPlatform)
-          (Movie)-[:SIMILAR_TO {score}]->(Movie)
+          (Movie)-[:SIMILAR_TO]->(Movie)  -- score property 없음 (TMDB similar 순서 저장)
 """
 
 from __future__ import annotations
@@ -354,11 +354,16 @@ async def _search_by_director(
             })
 
             # depth=2: SIMILAR_TO 관계 2홉 탐색
+            # 2026-04-15 수정: SIMILAR_TO 관계에 `score` property 가 실제로 저장되어
+            # 있지 않다 (neo4j_loader MERGE 절 기준). 기존 `r.score` ORDER BY 는 None 반환
+            # 으로 무작위 순이었고, 반환 payload 의 sim_score 도 항상 None 이었다.
+            # 실용적 대안으로 유사 영화 자체의 rating 으로 순서를 매김.
             if depth >= 2:
                 sim_cypher = """
-                MATCH (m:Movie {id: $movie_id})-[r:SIMILAR_TO]->(s:Movie)
-                RETURN s.id AS sim_id, s.title AS sim_title, r.score AS sim_score
-                ORDER BY r.score DESC
+                MATCH (m:Movie {id: $movie_id})-[:SIMILAR_TO]->(s:Movie)
+                RETURN s.id AS sim_id, s.title AS sim_title,
+                       COALESCE(s.rating, 0.0) AS sim_score
+                ORDER BY sim_score DESC
                 LIMIT 3
                 """
                 sim_result = await session.run(sim_cypher, {"movie_id": movie_id})

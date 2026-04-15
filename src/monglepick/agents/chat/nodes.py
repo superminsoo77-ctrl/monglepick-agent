@@ -51,12 +51,14 @@ from monglepick.agents.chat.models import (
     RankedMovie,
     ScoreDetail,
     SearchQuery,
+    SuggestedOption,
     is_sufficient,
 )
 from monglepick.chains import (
     analyze_image,
     classify_intent_and_emotion,
     extract_preferences,
+    generate_clarification,
     generate_explanations_batch,
     generate_general_response,
     generate_question,
@@ -667,21 +669,22 @@ async def preference_refiner(state: ChatAgentState) -> dict:
 # 5. question_generator — 후속 질문 생성
 # ============================================================
 
-@traceable(name="question_generator", run_type="chain", metadata={"node": "5/13", "llm": "exaone-32b"})
+@traceable(name="question_generator", run_type="chain", metadata={"node": "5/13", "llm": "solar-pro"})
 async def question_generator(state: ChatAgentState) -> dict:
     """
-    부족한 선호 정보를 파악하기 위한 후속 질문을 생성한다.
+    부족한 선호 정보를 파악하기 위한 후속 질문 + 제안 카드를 생성한다.
 
     needs_clarification=True 또는 검색 품질 미달 시 호출된다.
-    response 필드에도 질문 텍스트를 설정하여 response_formatter에서 바로 사용한다.
-    구조화된 힌트(ClarificationResponse)를 함께 반환하여 UI에서 칩/버튼으로 표시한다.
+    - question: 자연스러운 후속 질문 텍스트 (response 필드에도 설정)
+    - hints: 필드별 정적 옵션 칩 (기존 UX 유지)
+    - suggestions: Claude Code 스타일 AI 생성 제안 카드 2~4개 (2026-04-15 추가)
 
     검색 품질 미달로 호출된 경우(retrieval_feedback 존재 시):
-    - 피드백 메시지를 질문에 포함하여 사용자에게 안내한다.
-    - 검색된 후보의 장르 분포를 참고하여 힌트를 구성한다.
+    - 피드백 메시지를 candidate_hint 로 LLM 에 전달해 더 구체적인 제안을 유도한다.
 
     Args:
-        state: ChatAgentState (preferences, emotion, turn_count, retrieval_feedback 필요)
+        state: ChatAgentState (preferences, emotion, turn_count, retrieval_feedback,
+               candidate_movies 필요)
 
     Returns:
         dict: follow_up_question, response, clarification 업데이트
@@ -695,23 +698,42 @@ async def question_generator(state: ChatAgentState) -> dict:
         emotion = state.get("emotion")
         turn_count = state.get("turn_count", 0)
         retrieval_feedback = state.get("retrieval_feedback", "")
+        candidates = state.get("candidate_movies", []) or []
 
         emotion_str = emotion.emotion if emotion else None
 
-        # 검색 품질 미달로 호출된 경우: 피드백 메시지 포함
-        if retrieval_feedback:
+        # ── 최근 후보 요약 (LLM 제안 힌트용) ──
+        # 품질 미달 fallback 경로에서 LLM 이 "이런 영화들이 나왔는데 취향이 맞나요?"
+        # 스타일의 제안을 만들 수 있도록 상위 3편 제목만 넘긴다.
+        candidate_hint = ""
+        if candidates:
+            titles = []
+            for c in candidates[:3]:
+                title = getattr(c, "title", None) or getattr(c, "name", None)
+                if title:
+                    titles.append(str(title))
+            if titles:
+                candidate_hint = ", ".join(titles)
+
+        # ── LLM 구조화 출력: question + suggestions 동시 생성 ──
+        llm_output = await generate_clarification(
+            extracted_preferences=prefs,
+            emotion=emotion_str,
+            turn_count=turn_count,
+            retrieval_feedback=retrieval_feedback,
+            candidate_hint=candidate_hint,
+        )
+        question = llm_output.question
+        suggestions: list[SuggestedOption] = list(llm_output.suggestions or [])
+
+        # 검색 품질 미달 시 피드백 메시지를 질문 앞에 덧붙여 사용자 인지 강화
+        if retrieval_feedback and retrieval_feedback not in question:
             question = (
                 f"{retrieval_feedback} "
-                "좀 더 구체적으로 알려주시면 더 좋은 영화를 찾아드릴 수 있어요!"
-            )
-        else:
-            question = await generate_question(
-                extracted_preferences=prefs,
-                emotion=emotion_str,
-                turn_count=turn_count,
-            )
+                f"{question}"
+            ).strip()
 
-        # ── 구조화된 힌트 구성 (부족 필드 상위 3개) ──
+        # ── 정적 힌트(칩 UI) 유지 — 부족 필드 상위 3개 ──
         missing_fields = _get_missing_fields(prefs)
         hints: list[ClarificationHint] = []
         for field_name, _weight in missing_fields[:3]:
@@ -730,6 +752,8 @@ async def question_generator(state: ChatAgentState) -> dict:
             question=question,
             hints=hints,
             primary_field=primary_field,
+            suggestions=suggestions,
+            allow_custom=True,
         )
 
         elapsed_ms = (time.perf_counter() - node_start) * 1000
@@ -737,6 +761,7 @@ async def question_generator(state: ChatAgentState) -> dict:
             "question_generated_node",
             question_preview=question[:50],
             hint_count=len(hints),
+            suggestion_count=len(suggestions),
             primary_field=primary_field,
             retrieval_feedback=bool(retrieval_feedback),
             elapsed_ms=round(elapsed_ms, 1),
@@ -2046,21 +2071,17 @@ async def response_formatter(state: ChatAgentState) -> dict:
             if high_quality_count == 0:
                 response += "\n\n조건에 딱 맞는 영화를 찾기 어려웠어요. 조건을 조금 넓혀주시면 더 좋은 추천을 드릴 수 있을 것 같아요!"
 
-        # 후속 질문 응답: 몽글이가 질문을 대화체로 전달
+        # 후속 질문 응답: clarification 텍스트를 그대로 유지 (vLLM 재작성 스킵)
         elif existing_response and clarification:
-            # clarification이 있으면 후속 질문 응답
-            hints = []
-            if hasattr(clarification, "hints") and clarification.hints:
-                for hint in clarification.hints:
-                    if hasattr(hint, "options"):
-                        hints.extend(hint.options)
-            response = await generate_question_response(
-                question=existing_response,
-                hints=hints[:6] if hints else None,
-                emotion=emotion_str,
-                preferences=preferences,
-                user_message=current_input,
-            )
+            # 2026-04-15 중복 답변 제거:
+            # question_generator 가 이미 `clarification` SSE 이벤트로 question 텍스트를 송신했다.
+            # 이 자리에서 vLLM (`generate_question_response`) 으로 같은 질문을 다시 rewrite 하면
+            #   ① 동일 텍스트가 `clarification` + `token` 두 경로로 내려가 클라이언트가 중복 렌더
+            #   ② 후속 질문 턴마다 vLLM 한 번이 추가로 돌아 ~30s 레이턴시 추가
+            # 두 문제가 함께 발생했다. 질문 문장은 이미 Solar (`generate_clarification`) 가
+            # 자연스러운 대화체로 만들어 둔 상태이므로 그대로 `response` 에 넣고, SSE 레이어가
+            # clarification 존재 시 `token` 이벤트를 suppress 한다 (graph.py).
+            response = existing_response
 
         # 기존 response 사용 (일반 대화 — general_responder에서 이미 몽글이가 생성)
         elif existing_response:
@@ -2369,8 +2390,14 @@ async def graph_traversal_node(state: ChatAgentState) -> dict:
                     rrf_score=r.score,                  # 0~1 정규화된 relation_score
                     retrieval_source="neo4j_relation",
                     # metadata에서 추가 필드 복원
+                    # 2026-04-15: hybrid_search Neo4j 결과 metadata key 를 `popularity_score`
+                    # 로 통일했으므로 그대로 읽음. 하위 호환 fallback 으로 `popularity` 도 유지.
                     rating=float(r.metadata.get("rating") or 0.0),
-                    popularity_score=float(r.metadata.get("popularity") or 0.0),
+                    popularity_score=float(
+                        r.metadata.get("popularity_score")
+                        or r.metadata.get("popularity")
+                        or 0.0
+                    ),
                 )
             )
 

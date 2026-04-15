@@ -40,8 +40,15 @@ logger = structlog.get_logger()
 # 재랭킹 대상 최대 후보 수 (토큰 절약)
 MAX_RERANK_CANDIDATES = 10
 
-# 재랭킹 최소 통과 점수 (이 점수 미만은 제거 대상)
+# 재랭킹 절대 하한 점수 — Solar LLM 이 0.0 을 거의 매기지 않는 경향을 고려한 최소 컷
 MIN_RERANK_SCORE = 3.0
+
+# 상대 임계값 배율 — 평균 점수가 높을수록 컷오프도 비례해 올라간다.
+# 예) 평균 7.0 → 컷오프 = max(3.0, 7.0*0.7) = 4.9
+#     평균 4.0 → 컷오프 = max(3.0, 4.0*0.7) = 3.0 (절대 하한)
+# 이 방식이 필요한 이유: Solar 가 "애매해도 4~5점" 을 자비롭게 부여해 절대 하한만으로는
+# 거의 필터링이 되지 않는다. 평균 대비 현저히 낮은 후보만 제외하는 형태로 동작.
+RELATIVE_CUTOFF_RATIO = 0.7
 
 # 재랭킹 후 최소 유지 후보 수 — TOP_K(5)와 동일하게 설정하여 항상 5편 추천 보장
 MIN_KEEP_CANDIDATES = 5
@@ -355,8 +362,16 @@ async def rerank_candidates(
             reverse=True,
         )
 
-        # 부적합 영화 제거 (MIN_RERANK_SCORE 미만)
-        filtered = [m for m in reranked if score_map.get(m.id, 5.0) >= MIN_RERANK_SCORE]
+        # 부적합 영화 제거 — 절대 하한(MIN_RERANK_SCORE)과 상대 임계값(평균의 70%) 중 큰 값.
+        # 상대 임계값이 필요한 이유: Solar LLM 은 애매한 후보에도 4~5점을 자비롭게 부여해
+        # 절대 하한만으로는 "애매한 후보 무더기" 를 걸러내지 못한다. 평균 대비 현저히 낮은
+        # 후보만 쳐냄으로써 후보군이 전반적으로 강할 때는 컷오프가 자동으로 올라가도록 한다.
+        evaluated_scores = [score_map.get(m.id, 5.0) for m in reranked]
+        avg_score = (
+            sum(evaluated_scores) / len(evaluated_scores) if evaluated_scores else 0.0
+        )
+        effective_cutoff = max(MIN_RERANK_SCORE, avg_score * RELATIVE_CUTOFF_RATIO)
+        filtered = [m for m in reranked if score_map.get(m.id, 5.0) >= effective_cutoff]
 
         # 최소 후보 수 보장 (너무 많이 제거되면 상위 N개 유지)
         if len(filtered) < MIN_KEEP_CANDIDATES:
@@ -371,6 +386,8 @@ async def rerank_candidates(
             original_count=len(rerank_targets),
             reranked_count=len(filtered),
             removed_count=len(rerank_targets) - len(filtered),
+            avg_llm_score=round(avg_score, 2),
+            effective_cutoff=round(effective_cutoff, 2),
             top_results=[
                 {
                     "title": m.title,

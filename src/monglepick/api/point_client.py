@@ -50,6 +50,31 @@ class PointCheckResult(BaseModel):
     effective_cost: int = 0           # 실제 차감 포인트 (무료면 0)
 
 
+class PointConsumeResult(BaseModel):
+    """
+    AI 쿼터 소비 결과 (2026-04-15 신규).
+
+    Backend `POST /api/v1/point/consume` 응답. `movie_card` 발행 시점에 실제 1회 차감된 후
+    각 소스별 잔여 카운트와 안내 메시지를 Client 까지 전파한다.
+
+    - allowed: 차감 성공 여부. False 면 check/consume 사이 레이스로 한도 소진된 경우 —
+      movie_card 는 이미 생성됐으므로 graceful(SSE error 만 내려보냄)로 처리.
+    - source: GRADE_FREE / SUB_BONUS / PURCHASED / BLOCKED
+    - daily_used / daily_limit: UI "오늘 N/M" 배너 표시용
+    - sub_bonus_remaining / purchased_remaining: 각 소스별 잔여 횟수 (-1 은 미보유)
+    """
+
+    allowed: bool
+    balance: int = 0
+    source: str = "GRADE_FREE"
+    message: str = ""
+    max_input_length: int = 200
+    daily_used: int = 0
+    daily_limit: int = 3
+    sub_bonus_remaining: int = -1
+    purchased_remaining: int = 0
+
+
 class PointDeductResult(BaseModel):
     """
     포인트 차감 결과. 차감 성공 여부와 변동 후 잔액을 포함한다.
@@ -176,6 +201,72 @@ async def check_point(user_id: str, cost: int = 1) -> PointCheckResult:
         return PointCheckResult(
             allowed=False, balance=-1, cost=cost,
             message="포인트 시스템 연결에 실패했습니다. 잠시 후 다시 시도해주세요.",
+        )
+
+
+async def consume_point(user_id: str) -> PointConsumeResult:
+    """
+    AI 쿼터를 실제로 1회 차감한다 (2026-04-15 신규).
+
+    호출 시점: {@code recommendation_ranker} 완료 → {@code movie_card} 발행 직전.
+    이전까지는 {@link check_point} 가 체크 + 차감을 동시에 수행했으나, "추천 완료
+    전에 쿼터가 깎여버리는" 정책 버그를 해소하기 위해 분리되었다. 본 함수가 유일한
+    쓰기 경로이며, Backend `POST /api/v1/point/consume` 를 호출한다.
+
+    Args:
+        user_id: 사용자 ID
+
+    Returns:
+        PointConsumeResult: 차감 결과 (allowed, source, daily_used/limit, 잔여 카운트 등)
+
+    Note:
+        Backend 응답 실패 시 graceful degradation:
+        movie_card 는 이미 만들어진 상태이므로 allowed=True 반환 (추천 노출 유지).
+        다음 턴 check 에서 쿼터 상태는 다시 올바르게 조회되므로 일시적 불일치만 발생.
+    """
+    try:
+        client = await _get_http_client()
+        resp = await client.post(
+            "/api/v1/point/consume",
+            json={"userId": user_id, "cost": 0},  # v3.0 AI 무과금: cost 무시 (DTO 호환용)
+        )
+
+        if resp.status_code == 200:
+            data = resp.json()
+            return PointConsumeResult(
+                allowed=data.get("allowed", True),
+                balance=data.get("balance", 0),
+                source=data.get("source", "GRADE_FREE"),
+                message=data.get("message", ""),
+                max_input_length=data.get("maxInputLength", 200),
+                daily_used=data.get("dailyUsed", 0),
+                daily_limit=data.get("dailyLimit", 3),
+                sub_bonus_remaining=data.get("subBonusRemaining", -1),
+                purchased_remaining=data.get("purchasedRemaining", 0),
+            )
+
+        logger.error(
+            "point_consume_failed",
+            user_id=user_id,
+            status_code=resp.status_code,
+            body=resp.text[:200],
+        )
+        # movie_card 는 이미 yield 준비 중 — graceful: 노출 유지, 다음 턴에서 정정
+        return PointConsumeResult(
+            allowed=True, source="GRADE_FREE",
+            message="쿼터 차감 일시 오류 (추천은 정상 진행됩니다).",
+        )
+
+    except Exception as e:
+        logger.error(
+            "point_consume_error",
+            user_id=user_id,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        return PointConsumeResult(
+            allowed=True, source="GRADE_FREE",
+            message="쿼터 차감 일시 오류 (추천은 정상 진행됩니다).",
         )
 
 

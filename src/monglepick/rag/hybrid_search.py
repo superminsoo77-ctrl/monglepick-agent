@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass, field
 
@@ -324,16 +325,47 @@ async def search_elasticsearch(
                         "filter": filter_clauses if filter_clauses else [],
                     }
                 },
+                # function_score — BM25 점수(≈115~125)에 popularity multiplier 를 곱함.
+                # 왜 multiply 인가? 이전 sum 모드는 BM25 절대 스케일이 너무 커서(115+) 가산
+                # 부스트(0.5~5)가 거의 무시됐다. multiply 로 전환해 평점 0 / 투표수 0 영화의
+                # BM25 제목 매칭 우위를 무너뜨린다.
+                #
+                # 계산식 (script_score 단일 함수):
+                #   multiplier = 0.5
+                #              + log1p(vote_count)        × 0.20   # 신뢰도 — 포화
+                #              + rating / 10.0            × 0.30   # 평점 정규화 후 가중
+                #              + log1p(popularity_score)  × 0.10
+                #
+                # 경계값 예시:
+                #   - 평점 0.0 / 투표 0: multiplier = 0.5 (BM25 점수가 절반으로 감점)
+                #   - 평점 5.0 / 투표 50: 0.5 + log1p(50)*0.2 + 0.5*0.3 + 0 ≈ 1.43 (부스트)
+                #   - 평점 8.0 / 투표 500: 0.5 + log1p(500)*0.2 + 0.8*0.3 + 0 ≈ 1.98 (강한 부스트)
+                # 0.5 하한 덕분에 무명작도 완전히 죽지는 않음 → RRF 이후 hidden slot 경쟁 유지.
+                #
+                # ⚠ 필드명 주의 (2026-04-15): ES 인덱스에는 `rating` 으로 들어가 있다
+                # (es_loader.py 가 preprocessor 의 `rating` 을 그대로 맵핑). `vote_average`
+                # 로 참조하면 전체 문서에서 missing → 보너스 0 이 되어 평점 높은 유명작이
+                # 랭킹에 전혀 반영되지 않는다. 해당 버그 재발 방지.
                 "functions": [
                     {
-                        "field_value_factor": {
-                            "field": "popularity_score",
-                            "modifier": "log1p",
-                            "factor": 0.1,
+                        "script_score": {
+                            "script": {
+                                "source": (
+                                    "double vc = doc.containsKey('vote_count') && "
+                                    "!doc['vote_count'].empty ? doc['vote_count'].value : 0; "
+                                    "double va = doc.containsKey('rating') && "
+                                    "!doc['rating'].empty ? doc['rating'].value : 0; "
+                                    "double pop = doc.containsKey('popularity_score') && "
+                                    "!doc['popularity_score'].empty ? doc['popularity_score'].value : 0; "
+                                    "return 0.5 + Math.log1p(vc) * 0.20 + (va / 10.0) * 0.30 + "
+                                    "Math.log1p(pop) * 0.10;"
+                                )
+                            }
                         }
                     }
                 ],
-                "boost_mode": "sum",
+                "score_mode": "sum",
+                "boost_mode": "multiply",
             }
         },
         "size": top_k,
@@ -526,22 +558,28 @@ async def search_neo4j(
             )
 
         # 전략 2: SIMILAR_TO 관계 확장
+        # 2026-04-15 수정: 실 데이터 확인 결과 SIMILAR_TO 관계에 `score` property 가 없음
+        # (neo4j_loader.py 의 MERGE 절이 score 를 저장하지 않음). 기존 `r.score` 읽기는 전부
+        # None 반환 → `float(None)` TypeError 로 neo4j 결과 전체 유실되던 silent 버그였다.
+        # TMDB `similar` 관계는 이미 엄선된 추천 목록이므로 별도 가중치 없이 m.rating 으로
+        # 순위 매기는 게 실용적. rating 이 없는 영화는 하단으로 밀리도록 COALESCE 로 0 처리.
         if similar_to_movie_id:
             cypher = """
-            MATCH (source:Movie {id: $movie_id})-[r:SIMILAR_TO]->(m:Movie)
+            MATCH (source:Movie {id: $movie_id})-[:SIMILAR_TO]->(m:Movie)
             RETURN m.id AS movie_id, m.title AS title,
-                   r.score AS similarity, m.rating AS rating
-            ORDER BY r.score DESC
+                   COALESCE(m.rating, 0.0) AS rating
+            ORDER BY rating DESC
             LIMIT $top_k
             """
             result = await session.run(cypher, {"movie_id": similar_to_movie_id, "top_k": top_k})
             records = await result.data()
 
-            for record in records:
+            for i, record in enumerate(records):
                 results.append(SearchResult(
                     movie_id=str(record["movie_id"]),
                     title=record.get("title", ""),
-                    score=float(record.get("similarity", 0)),
+                    # rating DESC 순위 기반 점수 — ES/Qdrant 와 동일한 정렬 가중치 체계
+                    score=float(top_k - i),
                     source="neo4j",
                     metadata={"rating": record.get("rating")},
                 ))
@@ -691,7 +729,13 @@ async def search_neo4j_relation(
                     metadata={
                         "relation_score": relation_score_raw,
                         "rating": row.get("rating"),
-                        "popularity": row.get("popularity"),
+                        # 2026-04-15 필드명 통일: ES/Qdrant 는 payload key 를 `popularity_score`
+                        # 로 쓰므로 여기도 통일. 이전엔 `popularity` 로 저장되어
+                        # chat/nodes.py relation 분기에서 `popularity_score=0.0` 이 되는
+                        # silent-zero 버그가 있었다 (graph_traversal → recommendation_ranker
+                        # 경로에서만 발동). Cypher alias 는 `popularity` 라서 row.get("popularity")
+                        # 그대로 읽되 SearchResult.metadata key 만 통일.
+                        "popularity_score": row.get("popularity"),
                     },
                 )
             )
@@ -758,7 +802,40 @@ def reciprocal_rank_fusion(
                 metadata_cache[mid] = result.metadata
                 title_cache[mid] = result.title
 
-    # RRF 점수 내림차순 정렬
+    # ── Popularity prior 주입 (2026-04-15 신규) ──
+    # RRF 합산만으로는 "ES/Qdrant/Neo4j 세 엔진에서 모두 상위에 올라온 평점 0.0 무명작"
+    # 이 여전히 hybrid_score 최상위가 되는 구조를 막지 못한다. metadata 에 보존된
+    # vote_count / vote_average 를 바탕으로 RRF score 에 인기도 prior 를 가산해
+    # 평점·투표수 강한 영화가 최종 ranking 에서 우위를 갖도록 한다.
+    #
+    # Scale 설계:
+    #   - RRF score 범위: 1 개 엔진 1위(rank=1)일 때 1/(60+1)≈0.0164. 3 엔진 상위 누적 ≈ 0.05.
+    #   - popularity_prior 최대치: 평점 10, 투표 1000 → log1p(1000)*0.003 + 10*0.001 ≈ 0.031
+    #   - 평점 0·투표 0 영화: prior=0 (페널티 X, 중립) → hidden slot 경쟁은 그대로 유지.
+    #   - 평점 7·투표 100 영화: log1p(100)*0.003 + 7*0.001 ≈ 0.021 (RRF 수준의 ~50% 보강)
+    # 이 정도면 무명작이 최상위에서 밀려나지만 완전히 배제되지는 않는다 (slot quota 와 조화).
+    # ⚠ 필드명 주의 (2026-04-15): ES/Qdrant/Neo4j 모두 평점은 `rating` 으로 저장.
+    # `vote_average` 는 인덱스에 존재하지 않아 None 이 되어 prior 의 rating term 이
+    # 0 이 되는 버그가 있었다. `rating` 을 1순위로 읽고 `vote_average` 는 하위 호환 fallback.
+    for mid in rrf_scores:
+        meta = metadata_cache.get(mid, {})
+        try:
+            vote_count = float(meta.get("vote_count") or 0)
+        except (TypeError, ValueError):
+            vote_count = 0.0
+        try:
+            # ES/Qdrant/Neo4j 공통 필드명: `rating`. `vote_average` 는 혹시 모를 하위 호환.
+            raw_rating = meta.get("rating")
+            if raw_rating is None:
+                raw_rating = meta.get("vote_average")
+            vote_average = float(raw_rating or 0.0)
+        except (TypeError, ValueError):
+            vote_average = 0.0
+
+        popularity_prior = math.log1p(vote_count) * 0.003 + vote_average * 0.001
+        rrf_scores[mid] += popularity_prior
+
+    # RRF 점수 내림차순 정렬 (popularity prior 반영 후)
     sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
 
     return [
