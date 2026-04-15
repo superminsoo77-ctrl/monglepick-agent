@@ -329,68 +329,53 @@ def _format_bytes(n: int) -> str:
 
 async def _probe_vllm(base_url: str, expected_model: str, timeout: float = 5.0) -> dict:
     """
-    단일 vLLM 엔드포인트의 헬스/모델 리스트를 조회한다.
+    단일 vLLM 엔드포인트의 모델 리스트를 조회한다.
 
     base_url 예시: "http://10.20.0.10:18000/v1"
-      - /models  : OpenAI 호환 모델 리스트
-      - /health  : vLLM 기본 헬스체크 (base_url 에서 `/v1` 제거한 후 호출)
+      - /models  : OpenAI 호환 모델 리스트 (200 = 서버 정상 + 서빙 중인 모델)
 
     반환 필드 (프론트 카드가 기대):
-      - connected      : bool
+      - connected      : bool       (/models 200 응답 여부)
       - baseUrl        : 호출 대상 (디버깅용 노출)
       - expectedModel  : .env 에 지정된 모델 ID
       - loadedModels   : 서버가 실제로 서빙 중인 모델 ID 목록
-      - healthStatus   : "ok" | "unknown" | 에러 문자열
+      - healthStatus   : "ok" | "unreachable" | 에러 문자열
       - error          : 연결 실패 시 원인
-    """
-    # /v1 suffix 를 제거해서 /health 용 root URL 을 얻는다.
-    # 일반적으로 vLLM 은 /health (v1 이 아닌 root) 를 제공한다.
-    if base_url.endswith("/v1"):
-        root_url = base_url[: -len("/v1")]
-    elif base_url.endswith("/v1/"):
-        root_url = base_url[: -len("/v1/")]
-    else:
-        root_url = base_url.rstrip("/")
 
+    2026-04-15 성능 개선:
+    - 기존에는 `/health` + `/models` 를 순차 호출하여 endpoint 당 최대 2*timeout
+      (예: vision localhost 미연결 시 10초) 을 소모했다. `/models` 만으로도 연결
+      상태와 서빙 모델을 모두 판단 가능하므로 `/health` 호출을 제거했다.
+      이로써 관리자 대시보드 응답이 기존 ~10초 → ~5초로 단축.
+    """
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            # 1) 헬스체크 — vLLM 기본 /health 는 200 OK 만 반환.
-            health_status = "unknown"
-            try:
-                health_resp = await client.get(f"{root_url}/health")
-                if health_resp.status_code == 200:
-                    health_status = "ok"
-                else:
-                    health_status = f"http_{health_resp.status_code}"
-            except Exception:
-                # /health 엔드포인트가 없어도 /models 가 응답하면 정상으로 간주한다.
-                health_status = "unknown"
-
-            # 2) 사용 가능 모델 조회 (OpenAI 호환)
+            # 사용 가능 모델 조회 (OpenAI 호환). 응답 200 이면 서버가 모델을
+            # 서빙 중이며 네트워크 연결도 정상임을 의미한다.
             models_resp = await client.get(f"{base_url.rstrip('/')}/models")
-            loaded_models: list[str] = []
-            if models_resp.status_code == 200:
-                data = models_resp.json()
-                for m in data.get("data", []) or []:
-                    model_id = m.get("id") or m.get("name")
-                    if model_id:
-                        loaded_models.append(model_id)
-            else:
+            if models_resp.status_code != 200:
                 return {
                     "connected": False,
                     "baseUrl": base_url,
                     "expectedModel": expected_model,
                     "loadedModels": [],
-                    "healthStatus": health_status,
+                    "healthStatus": f"http_{models_resp.status_code}",
                     "error": f"/models returned HTTP {models_resp.status_code}",
                 }
+
+            data = models_resp.json()
+            loaded_models: list[str] = []
+            for m in data.get("data", []) or []:
+                model_id = m.get("id") or m.get("name")
+                if model_id:
+                    loaded_models.append(model_id)
 
         return {
             "connected": True,
             "baseUrl": base_url,
             "expectedModel": expected_model,
             "loadedModels": loaded_models,
-            "healthStatus": health_status,
+            "healthStatus": "ok",
             "error": None,
         }
 
