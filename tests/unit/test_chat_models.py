@@ -21,6 +21,7 @@ from monglepick.agents.chat.models import (
     CandidateMovie,
     EmotionResult,
     ExtractedPreferences,
+    FilterCondition,
     IntentResult,
     RankedMovie,
     ScoreDetail,
@@ -176,6 +177,37 @@ class TestMergePreferences:
         merged = merge_preferences(ExtractedPreferences(), ExtractedPreferences())
         assert merged.genre_preference is None
         assert merged.reference_movies == []
+
+    def test_merge_dynamic_filters_replace_when_curr_nonempty(self):
+        """2026-04-15 replace 전환: curr 에 filter 가 있으면 prev 는 전부 버려진다.
+
+        배경: "요즘 인기" 같은 1회성 발화에서 뽑힌 release_year/popularity 필터가
+        턴이 쌓일수록 영원히 검색 범위를 좁히던 누적 버그를 막기 위한 정책.
+        LLM 이 현재 유효한 필터를 full-extract 한다는 전제로 replace 한다.
+        """
+        prev = ExtractedPreferences(
+            dynamic_filters=[
+                FilterCondition(field="release_year", operator="gte", value=2025),
+                FilterCondition(field="popularity_score", operator="gte", value=50),
+            ]
+        )
+        curr = ExtractedPreferences(
+            dynamic_filters=[FilterCondition(field="rating", operator="gte", value=7.0)]
+        )
+        merged = merge_preferences(prev, curr)
+        # curr 의 rating 만 남고, prev 의 release_year / popularity_score 는 drop
+        fields = {f.field for f in merged.dynamic_filters}
+        assert fields == {"rating"}
+
+    def test_merge_dynamic_filters_preserve_when_curr_empty(self):
+        """curr 가 비면 prev 필터를 그대로 유지 (LLM 이 이번 턴에 필터 미추출)."""
+        prev = ExtractedPreferences(
+            dynamic_filters=[FilterCondition(field="rating", operator="gte", value=7.0)]
+        )
+        curr = ExtractedPreferences()  # dynamic_filters = []
+        merged = merge_preferences(prev, curr)
+        assert len(merged.dynamic_filters) == 1
+        assert merged.dynamic_filters[0].field == "rating"
 
 
 # ============================================================

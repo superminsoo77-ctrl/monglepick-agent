@@ -214,11 +214,18 @@ class Settings(BaseSettings):
     # 최소 후보 수: 이 값 미만이면 검색 품질 미달
     RETRIEVAL_MIN_CANDIDATES: int = 3
     # Top-1 RRF 점수 최소값
-    RETRIEVAL_MIN_TOP_SCORE: float = 0.015
-    # 상위 5개 평균 RRF 점수 최소값
-    RETRIEVAL_QUALITY_MIN_AVG: float = 0.01
+    # 2026-04-15 하향(0.015 → 0.010): "애매하면 재질문" 정책 반영.
+    # 점수가 0.01~0.015 구간이면 품질 미달로 보고 soft-ambiguous 분기로 보낸다.
+    RETRIEVAL_MIN_TOP_SCORE: float = 0.010
+    # 상위 5개 평균 RRF 점수 최소값 (같은 취지로 하향)
+    RETRIEVAL_QUALITY_MIN_AVG: float = 0.008
     # 선호 충분성 판정 임계값 (가중치 합산이 이 값 이상이면 추천 진행)
-    SUFFICIENCY_THRESHOLD: float = 2.5
+    # 2026-04-15 하향(2.5 → 2.0): 모호한 입력에서도 재질문을 더 자주 띄우도록 완화.
+    SUFFICIENCY_THRESHOLD: float = 2.0
+    # Soft-ambiguous 임계값 — route_after_retrieval 에서 "후보는 있지만 점수가 애매한"
+    # 구간을 판별할 때 사용한다. top_score 가 이 값 미만이면 similar_fallback_search 대신
+    # question_generator 로 보낸다. (turn_count < TURN_COUNT_OVERRIDE 인 경우에 한정)
+    RETRIEVAL_SOFT_AMBIGUOUS_TOP_SCORE: float = 0.020
     # 턴 카운트 오버라이드 (이 턴 이상이면 선호 부족해도 추천 진행)
     # Phase ML-3: 2→3으로 상향하여 재질문 기회를 최대 2회 제공
     # 기존(2): 턴1 모호 → 재질문 → 턴2 모호 → 강제 추천 (재질문 1회)

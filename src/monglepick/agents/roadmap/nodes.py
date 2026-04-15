@@ -286,6 +286,10 @@ async def roadmap_generator(state: RoadmapAgentState) -> dict:
                     # title, overview, genres, keywords LIKE 검색
                     # popularity 내림차순으로 충분히 가져옴
                     like_pattern = f"%{theme}%"
+                    # 2026-04-15 컬럼명 수정:
+                    # MySQL `movies` 테이블의 실제 컬럼은 `rating`/`popularity_score`.
+                    # 이전까지 `vote_average`/`popularity` 를 SELECT 해 Unknown column
+                    # 에러로 try/except 에 빠지면서 로드맵 에이전트가 사실상 동작 불능이었다.
                     await cur.execute(
                         """
                         SELECT
@@ -294,8 +298,8 @@ async def roadmap_generator(state: RoadmapAgentState) -> dict:
                             original_title,
                             genres,
                             poster_path,
-                            vote_average,
-                            popularity,
+                            rating,
+                            popularity_score,
                             release_date,
                             overview,
                             keywords
@@ -307,7 +311,7 @@ async def roadmap_generator(state: RoadmapAgentState) -> dict:
                             OR genres LIKE %s
                             OR keywords LIKE %s
                         )
-                        ORDER BY popularity DESC
+                        ORDER BY popularity_score DESC
                         LIMIT 200
                         """,
                         (
@@ -323,7 +327,7 @@ async def roadmap_generator(state: RoadmapAgentState) -> dict:
             for row in rows:
                 (
                     movie_id, title, original_title, genres_str,
-                    poster_path, vote_average, popularity,
+                    poster_path, rating_val, popularity_val,
                     release_date, overview, keywords_str,
                 ) = row
 
@@ -362,8 +366,8 @@ async def roadmap_generator(state: RoadmapAgentState) -> dict:
                     "title": title or original_title or "",
                     "genres": genres,
                     "poster_url": poster_url,
-                    "rating": float(vote_average or 0.0),
-                    "popularity": float(popularity or 0.0),
+                    "rating": float(rating_val or 0.0),
+                    "popularity": float(popularity_val or 0.0),
                     "release_year": release_year,
                 })
 

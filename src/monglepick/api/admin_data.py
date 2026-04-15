@@ -14,13 +14,15 @@
     GET  /admin/movies/{id}          — 단건 상세 (모든 필드)
     PUT  /admin/movies/{id}          — 수정 (MySQL + Qdrant + Neo4j + ES 동기 반영)
     DELETE /admin/movies/{id}        — 삭제 (4DB 동기 삭제)
-  파이프라인 (8):
+  파이프라인 (10):
     GET  /admin/pipeline             — 9개 작업 목록
     POST /admin/pipeline/run         — subprocess 실행 (백그라운드)
     POST /admin/pipeline/cancel      — 실행 중인 작업 취소 (체크포인트 저장)
     GET  /admin/pipeline/logs        — SSE 실시간 로그 스트리밍
     GET  /admin/pipeline/history     — 실행 이력 페이징
     GET  /admin/pipeline/stats       — 성공/실패 통계
+    GET  /admin/pipeline/status      — (2026-04-15) 현재(최근) 작업 단건 요약
+    GET  /admin/pipeline/checkpoint  — (2026-04-15) 가장 최근 체크포인트 1건 요약
     POST /admin/pipeline/retry-failed — 실패 건 재시도
     GET  /admin/collection/{name}/status — Qdrant 컬렉션 상태
 
@@ -1289,6 +1291,175 @@ async def retry_failed_pipeline() -> dict:
         "newJobId": response.job_id,
         "taskCode": response.task_code,
     }
+
+
+# ------------------------------------------------------------
+# 2026-04-15: 관리자 페이지(PipelineExecutor.jsx) 가 마운트 시점에 호출하는
+# `/admin/pipeline/status`, `/admin/pipeline/checkpoint` 두 EP 추가.
+#
+# 기존에는 라우트가 없어 404 가 떨어지면서 "현재 상태" 카드가 항상 빈 상태로
+# 표시되고, 체크포인트 진행 정보도 보이지 않았다. Agent 의 단일 진실 원본은
+# `PIPELINE_JOBS` (메모리) 와 `data/*_checkpoint.json` (디스크) 두 곳이므로
+# 둘을 그대로 노출하는 read-only EP 를 추가한다.
+# ------------------------------------------------------------
+
+
+def _job_summary(job: dict) -> dict:
+    """`PIPELINE_JOBS` 의 dict 1건을 프론트 친화적인 카멜케이스 요약으로 변환.
+
+    `process` / `log_lines` 같이 직렬화 불가 + 무거운 필드는 제외하고,
+    가장 최근 로그 1줄을 `currentStep` 으로 노출하여 진행 상태 가늠 단서로 쓴다.
+    """
+
+    log_lines = job.get("log_lines") or []
+    last_log = log_lines[-1] if log_lines else None
+    return {
+        "jobId": job.get("job_id"),
+        "taskCode": job.get("task_code"),
+        "taskName": job.get("task_name"),
+        # 프론트 `getPipelineStatusBadge` 매퍼는 소문자(running/success/failed/cancelled/idle)를 기준으로
+        # 매칭한다. Agent 내부는 대문자 (RUNNING/SUCCESS/...) 이므로 노출 시점에서 변환.
+        "status": (job.get("status") or "idle").lower(),
+        "startedAt": job.get("started_at"),
+        "endedAt": job.get("ended_at"),
+        "exitCode": job.get("exit_code"),
+        # 진행률은 subprocess stdout 에서 파싱해야 정확하지만, 현재 파이프라인 스크립트가
+        # 표준화된 진행률을 출력하지 않으므로 0 으로 두고 currentStep 으로만 가늠한다.
+        "progress": 0,
+        "currentStep": last_log,
+        "args": job.get("args", []),
+    }
+
+
+@admin_data_router.get(
+    "/pipeline/status",
+    summary="현재(최근) 파이프라인 상태",
+    description=(
+        "PIPELINE_JOBS 메모리에서 RUNNING 작업이 있으면 그 1건, 없으면 가장 최근에 "
+        "시작된 작업을 요약 반환한다. 작업 자체가 한 번도 없었다면 status='idle'."
+    ),
+)
+async def get_pipeline_status() -> dict:
+    """관리자 페이지의 '현재 상태' 카드용 단건 요약 EP."""
+
+    if not PIPELINE_JOBS:
+        # 한 번도 작업이 없었던 상태 — 프론트는 status='idle' 을 그대로 뱃지로 표시
+        return {"status": "idle", "jobId": None}
+
+    # 1) RUNNING 우선 — 동시에 여러 개여도 가장 최근 1건만 노출
+    running = [j for j in PIPELINE_JOBS.values() if j.get("status") == "RUNNING"]
+    if running:
+        target = max(running, key=lambda j: j.get("started_at") or "")
+        return _job_summary(target)
+
+    # 2) 그 외에는 시작 시각 기준으로 가장 최근 1건
+    latest = max(PIPELINE_JOBS.values(), key=lambda j: j.get("started_at") or "")
+    return _job_summary(latest)
+
+
+# 데이터 디렉터리 — 다양한 파이프라인이 *_checkpoint.json 형태로 진행 상태를 남긴다.
+# (예: reload_checkpoint.json, kmdb_load_checkpoint.json, mood_checkpoint.json 등)
+# 스키마는 파이프라인마다 다르므로, 가장 최근 mtime 1건을 골라 공통 필드만 추출.
+PIPELINE_CHECKPOINT_DIR = Path("data")
+
+# 각 체크포인트 파일에서 "처리 건수" 의미로 자주 쓰이는 필드 — 우선순위 순.
+# 첫 번째 값이 정수로 잡히는 키를 채택한다.
+_CHECKPOINT_COUNT_FIELDS = (
+    "total_processed",
+    "total_loaded",
+    "total_collected",
+    "total_updated",
+    "last_completed_line",
+    "last_line",
+    "batch_offset",
+)
+
+
+@admin_data_router.get(
+    "/pipeline/checkpoint",
+    summary="가장 최근 파이프라인 체크포인트",
+    description=(
+        "data/*_checkpoint.json 중 mtime 이 가장 최근인 1건을 골라 task / processedCount "
+        "/ lastUpdated 등 공통 필드만 추출하여 반환한다. 파일이 없으면 null 필드만 채운 빈 응답."
+    ),
+)
+async def get_pipeline_checkpoint() -> dict:
+    """관리자 페이지의 '체크포인트' 행 + '체크포인트부터 재개' 옵션 라벨용."""
+
+    if not PIPELINE_CHECKPOINT_DIR.exists():
+        return {"task": None, "processedCount": None, "lastUpdated": None, "raw": None}
+
+    # `*_checkpoint.json` + `checkpoint.json` 모두 후보로
+    candidates = list(PIPELINE_CHECKPOINT_DIR.glob("*checkpoint*.json"))
+    if not candidates:
+        return {"task": None, "processedCount": None, "lastUpdated": None, "raw": None}
+
+    # mtime 이 가장 큰 (= 가장 최근 갱신된) 파일 1건
+    latest_path = max(candidates, key=lambda p: p.stat().st_mtime)
+
+    try:
+        with open(latest_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        logger.warning("pipeline_checkpoint_read_failed", error=str(e), file=str(latest_path))
+        raise HTTPException(status_code=500, detail=f"체크포인트 파일 읽기 실패: {latest_path.name} — {e}")
+
+    # 파일명에서 task 추출 — 다양한 네이밍 패턴을 흡수한다.
+    #   `kmdb_load_checkpoint.json`              → `kmdb_load`
+    #   `movie_llm_enrich_checkpoint_keyword.json` → `movie_llm_enrich_keyword`
+    #   `checkpoint.json`                          → `default`
+    task_name = latest_path.stem
+    if task_name == "checkpoint":
+        task_name = "default"
+    else:
+        # `_checkpoint_` (중간) 또는 `_checkpoint` (꼬리표) 둘 다 제거.
+        task_name = task_name.replace("_checkpoint_", "_").removesuffix("_checkpoint")
+
+    # 처리 건수 — 후보 키를 우선순위대로 시도
+    processed_count: Optional[int] = None
+    if isinstance(raw, dict):
+        for key in _CHECKPOINT_COUNT_FIELDS:
+            value = raw.get(key)
+            if isinstance(value, int):
+                processed_count = value
+                break
+
+    # 마지막 갱신 시각 — 파일 안의 timestamp 우선, 없으면 파일 mtime
+    last_updated: Optional[str] = None
+    if isinstance(raw, dict):
+        for key in ("last_updated", "end_time", "last_update", "updated_at"):
+            value = raw.get(key)
+            if isinstance(value, str):
+                last_updated = value
+                break
+    if last_updated is None:
+        last_updated = datetime.utcfromtimestamp(latest_path.stat().st_mtime).isoformat() + "Z"
+
+    return {
+        "task": task_name,
+        "processedCount": processed_count,
+        "lastUpdated": last_updated,
+        "file": latest_path.name,
+        # 원본 JSON 일부도 같이 노출 — 디버깅/추가 표시 여지를 둠. 너무 큰 필드(예: tmdb_api_loaded_ids)는
+        # 응답 크기 폭주를 막기 위해 list/dict 는 길이만 요약한다.
+        "raw": _summarize_checkpoint_raw(raw) if isinstance(raw, dict) else None,
+    }
+
+
+def _summarize_checkpoint_raw(raw: dict) -> dict:
+    """체크포인트 raw dict 에서 list/dict 값은 길이만 남기고 나머지는 그대로 반환한다.
+
+    `data/checkpoint.json` 처럼 수십만 건 ID 배열을 통째로 들고 있는 경우가 있어
+    그대로 직렬화하면 응답이 수 MB 가 된다. 길이 요약으로 충분.
+    """
+
+    summary: dict = {}
+    for key, value in raw.items():
+        if isinstance(value, (list, dict)):
+            summary[key] = {"_type": type(value).__name__, "_length": len(value)}
+        else:
+            summary[key] = value
+    return summary
 
 
 @admin_data_router.get(

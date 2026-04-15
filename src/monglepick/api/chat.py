@@ -109,11 +109,17 @@ def _extract_user_id_from_jwt(raw_request: Request) -> str | None:
     token = auth_header[7:]  # "Bearer " 이후
 
     try:
-        # Backend와 동일한 HS256 알고리즘으로 검증
+        # Backend(jjwt 0.12.6) 의 `signWith(key)` 는 키 바이트 길이에 따라
+        # 알고리즘을 자동 선택한다 (≥64바이트 = HmacSHA512, ≥48바이트 = HmacSHA384,
+        # ≥32바이트 = HmacSHA256). 운영/로컬에서 JWT_SECRET 이 67바이트(HS512) 인데
+        # Agent 쪽에서 HS256 만 허용하여 InvalidAlgorithmError 로 전량 reject
+        # → user_id="" → 세션 저장 스킵 → 채팅 이력 전부 유실되던 문제의 근본원인.
+        # HMAC 계열 전 길이를 허용해 알고리즘 혼동(Algorithm Confusion) 공격은
+        # 발생하지 않으며(RS/ES 계열 미사용), 기존 발급 토큰 무효화도 없다.
         payload = jwt.decode(
             token,
             settings.JWT_SECRET,
-            algorithms=["HS256"],
+            algorithms=["HS256", "HS384", "HS512"],
         )
         # Refresh Token은 거부 (access token만 허용)
         if payload.get("type") == "refresh":
