@@ -15,7 +15,7 @@ from monglepick.chains.image_analysis_chain import analyze_image
 from monglepick.chains.intent_chain import classify_intent
 from monglepick.chains.intent_emotion_chain import classify_intent_and_emotion
 from monglepick.chains.preference_chain import extract_preferences
-from monglepick.chains.question_chain import generate_question
+from monglepick.chains.question_chain import generate_clarification, generate_question
 from monglepick.chains.rerank_chain import rerank_candidates
 from monglepick.chains.tool_executor_chain import execute_tool
 
@@ -30,6 +30,8 @@ __all__ = [
     "extract_preferences",
     # 후속 질문 — 부족 정보 파악을 위한 자연스러운 질문 생성
     "generate_question",
+    # 후속 질문 + 제안 카드 — question + suggestions 구조화 출력 (2026-04-15)
+    "generate_clarification",
     # 추천 이유 — 영화별 맞춤 설명 (단건/배치)
     "generate_explanation",
     "generate_explanations_batch",

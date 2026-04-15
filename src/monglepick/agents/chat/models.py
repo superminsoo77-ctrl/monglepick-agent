@@ -340,12 +340,33 @@ class ClarificationHint(BaseModel):
     options: list[str] = Field(default_factory=list, description="선택 가능한 옵션 목록")
 
 
+class SuggestedOption(BaseModel):
+    """
+    Claude Code 스타일 제안 옵션 카드 (2026-04-15 신설).
+
+    question_generator 가 LLM 으로 생성하는 "한 번에 고를 수 있는" 자연어 옵션.
+    ClarificationHint(필드별 칩 묶음)와 달리 이 구조는 문장 단위의 자연스러운
+    제안이며, 사용자가 카드를 클릭하면 `value` 가 그대로 채팅 입력으로 전송된다.
+
+    - text: 사용자에게 표시할 짧은 라벨 (예: "잔잔한 힐링 일본 영화")
+    - value: 클릭 시 채팅 입력창에 삽입될 실제 문자열
+    - reason: 왜 이 옵션인지 짧은 부제 (선택)
+    - tags: 부족 필드명 등 디버깅/분석용 태그
+    """
+
+    text: str = Field(..., description="옵션 카드 타이틀 (짧은 라벨)")
+    value: str = Field(..., description="클릭 시 입력으로 삽입될 문자열")
+    reason: str = Field(default="", description="옵션 선택 근거 (선택적 부제)")
+    tags: list[str] = Field(default_factory=list, description="부족 필드명 등 분석용 태그")
+
+
 class ClarificationResponse(BaseModel):
     """
-    후속 질문 + 힌트 구조화 응답.
+    후속 질문 + 힌트 + 제안 옵션 구조화 응답.
 
     question_generator 노드가 생성하여 SSE clarification 이벤트로 발행한다.
-    기존 텍스트 질문에 구조화된 힌트를 추가하여 UX를 향상한다.
+    - hints: 필드별 선택 칩 (기존 UX)
+    - suggestions: Claude Code 스타일 문장 단위 제안 카드 (2026-04-15 추가)
     """
 
     question: str = Field(default="", description="후속 질문 텍스트")
@@ -356,6 +377,14 @@ class ClarificationResponse(BaseModel):
     primary_field: str = Field(
         default="",
         description="가장 중요한 부족 필드명",
+    )
+    suggestions: list[SuggestedOption] = Field(
+        default_factory=list,
+        description="자연어 제안 카드 2~4개 (LLM 생성, Claude Code 스타일)",
+    )
+    allow_custom: bool = Field(
+        default=True,
+        description="사용자가 제안 외 자유 입력을 할 수 있는지 여부 (UI 힌트)",
     )
 
 
@@ -413,6 +442,10 @@ RETRIEVAL_MIN_CANDIDATES: int = _settings.RETRIEVAL_MIN_CANDIDATES
 RETRIEVAL_MIN_TOP_SCORE: float = _settings.RETRIEVAL_MIN_TOP_SCORE
 # 상위 5개 평균 RRF 점수 최소값
 RETRIEVAL_QUALITY_MIN_AVG: float = _settings.RETRIEVAL_QUALITY_MIN_AVG
+# Soft-ambiguous 임계값 — 후보는 있지만 점수가 애매한 구간(top_score < 이 값)에서
+# turn_count < TURN_COUNT_OVERRIDE 이면 similar_fallback_search 대신 question_generator 로 보낸다.
+# "애매하면 재질문" UX 정책 (2026-04-15 추가).
+RETRIEVAL_SOFT_AMBIGUOUS_TOP_SCORE: float = _settings.RETRIEVAL_SOFT_AMBIGUOUS_TOP_SCORE
 
 
 # ============================================================
@@ -584,6 +617,14 @@ class RankedMovie(BaseModel):
         default=None,
         description="배경 이미지 경로 — 영화 상세/추천 카드 배너 이미지 표시용",
     )
+    # 2026-04-15 신규: Backend `POST /api/v1/recommendations/internal/batch` 호출 후 채워지는
+    # recommendation_log PK. SSE `movie_card` payload 로 Client 까지 실어 보내야
+    # 마이픽 피드백(관심없음/좋아요) 버튼이 FK 로 사용할 수 있다.
+    # 저장 실패/movieId FK 부재 시 None 유지 (graceful — 피드백 버튼만 비활성, 추천 노출은 유지).
+    recommendation_log_id: int | None = Field(
+        default=None,
+        description="recommendation_log PK — 저장 후 채워짐 (Client 피드백 FK)",
+    )
 
 
 # ============================================================
@@ -639,7 +680,8 @@ class ChatAgentState(TypedDict, total=False):
     # ── response_formatter 출력 ──
     response: str
 
-    # ── question_generator 출력 (Part 2: 구조화된 힌트) ──
+    # ── question_generator 출력 (Part 2: 구조화된 힌트 + 제안 옵션) ──
+    # clarification.suggestions 에 Claude Code 스타일 제안 카드가 포함된다 (2026-04-15).
     clarification: ClarificationResponse | None  # 후속 질문 힌트 (SSE clarification 이벤트)
 
     # ── RAG 검색 품질 판정 (Part 3) ──
@@ -837,7 +879,8 @@ def merge_preferences(
     - mood: 합집합 (Phase ML-3, "웅장" + "잔잔" = "웅장, 잔잔")
     - 기타 단일값 필드: 새 값이 있으면 덮어쓰기, 없으면 이전 유지
     - reference_movies: 합집합 (중복 제거)
-    - dynamic_filters: 현재 턴 필터 우선, 이전 필터 중 다른 필드의 것만 추가
+    - dynamic_filters: 2026-04-15 replace 전환 — curr 가 필터를 하나라도 가지면
+      curr 를 그대로 사용, 비어있으면 prev 유지 (아래 상세 참고)
     - search_keywords: 합집합 (중복 제거)
     - user_intent: 현재 턴 것이 있으면 덮어쓰기 (최신 의도 우선)
 
@@ -851,12 +894,23 @@ def merge_preferences(
     if prev is None:
         return curr
 
-    # ── dynamic_filters 병합: 현재 턴 필터 우선, 이전 필터 중 겹치지 않는 필드만 추가 ──
-    curr_filter_fields = {f.field for f in curr.dynamic_filters}
-    merged_filters = list(curr.dynamic_filters)
-    for prev_filter in prev.dynamic_filters:
-        if prev_filter.field not in curr_filter_fields:
-            merged_filters.append(prev_filter)
+    # ── dynamic_filters 병합 (2026-04-15 replace 전환) ──
+    # 이전에는 "curr 우선 + 서로 다른 field 의 prev 추가" 누적 방식이었으나,
+    # 프롬프트가 "이미 파악된 조건은 생략하세요" 로 지시하기 때문에 prev 의 필터가
+    # curr 에서 재확인 없이도 영원히 유지되어 턴이 쌓일수록 검색 범위가 과도하게
+    # 좁아지는 버그가 있었다. 예: 턴1 "요즘 인기 SF" → release_year>=2025 +
+    # popularity_score>=50 이 영구 고정 → 턴3 에서 무명 인디만 통과하는 상태가 됨.
+    #
+    # 새 정책:
+    #   - curr 가 필터를 하나라도 뽑았다 → 그 필터셋을 "현재 유효한 전체"로 간주해 replace.
+    #     LLM 은 existing_prefs 를 프롬프트로 받기 때문에 유효한 이전 필터를 계속
+    #     유지하고 싶으면 재추출하도록 프롬프트 지시를 함께 조정한다 (preference.py).
+    #   - curr 가 비었다 → prev 그대로 유지 (LLM 이 이번 턴에 필터 미추출).
+    # 이렇게 하면 필터는 언제든 "LLM 이 본 최신 스냅샷" 이 되므로 stale 누적이 사라진다.
+    if curr.dynamic_filters:
+        merged_filters = list(curr.dynamic_filters)
+    else:
+        merged_filters = list(prev.dynamic_filters)
 
     # ── search_keywords 병합: 합집합 (중복 제거, 순서 유지) ──
     merged_keywords = list(dict.fromkeys(

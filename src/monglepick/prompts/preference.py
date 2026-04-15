@@ -65,18 +65,23 @@ DB에서 직접 필터링할 수 있는 조건만 추출합니다.
 
 ### 필터 추출 규칙:
 - "평점 높은" → rating >= 7.0 (명시적 수치가 없으면 합리적 기본값 사용)
-- "요즘", "최근", "신작" → release_year >= {current_year} - 1 (직전 1년)
+- "요즘", "최근", "신작" → release_year >= {current_year} - 3 (너무 좁히면 후보 0건 위험 → 넉넉히 3년)
 - "최신" → release_year >= {current_year} - 2 (대략적 기준)
-- "인기 있는", "인기" → popularity_score >= 50.0 또는 vote_count >= 500
-- 필터로 변환할 수 없는 주관적 표현은 user_intent에만 반영
+- "올해" 같이 **명시적으로 단일 연도**를 언급한 경우에만 release_year >= {current_year}
+- "인기 있는", "인기", "핫한" 같은 **주관적 인기 표현은 dynamic_filter 로 만들지 마세요**. 대신
+  search_keywords 에 ["인기", "화제"] 등으로 담아 검색 부스트만 유도 (랭킹 단계의 popularity
+  prior 가 자연스럽게 인기작을 상위로 끌어올리므로 하드 필터는 오히려 후보를 과도하게 제거).
+  단 사용자가 **수치로 명시**한 경우 ("평가 1000개 이상" 등) 에는 vote_count/popularity_score 필터 사용.
+- 필터로 변환할 수 없는 주관적 표현은 user_intent 또는 search_keywords 에만 반영
 - 확실하지 않은 조건은 필터로 만들지 마세요
 
 ### 복합 조건 추출 예시 (반드시 각 조건을 개별 dynamic_filter로 추출):
-- "요즘 인기 있는 한국 영화" → dynamic_filters: [release_year gte {current_year}-1, popularity_score gte 50.0, origin_country contains "KR"]
+- "요즘 인기 있는 한국 영화" → dynamic_filters: [release_year gte {current_year}-3, origin_country contains "KR"], search_keywords: ["인기", "화제"]  (popularity 는 하드 필터 X)
 - "평점 높은 최신 일본 애니" → dynamic_filters: [rating gte 7.0, release_year gte {current_year}-2, origin_country contains "JP"], genre_preference: "애니메이션"
-- "넷플릭스에서 볼 수 있는 최근 미국 스릴러" → dynamic_filters: [release_year gte {current_year}-1, origin_country contains "US"], genre_preference: "스릴러", platform: "넷플릭스"
+- "넷플릭스에서 볼 수 있는 최근 미국 스릴러" → dynamic_filters: [release_year gte {current_year}-3, origin_country contains "US"], genre_preference: "스릴러", platform: "넷플릭스"
 
-중요: 국가/시기/인기도가 동시에 언급되면 각각을 개별 dynamic_filter로 추출하세요. 하나라도 빠뜨리면 검색 결과가 부정확해집니다.
+중요: 국가/시기는 언급되면 개별 dynamic_filter로 추출하세요. 단, **주관적 인기 표현**(예: "인기 있는")
+은 하드 필터 대신 search_keywords 로만 넘기세요. 하드 필터를 남발하면 후보 0건 상태가 발생합니다.
 
 ## 3. search_keywords (검색 키워드)
 시맨틱 검색을 보강할 **핵심 키워드**를 추출하세요.
@@ -101,7 +106,14 @@ DB에서 직접 필터링할 수 있는 조건만 추출합니다.
 - 파악할 수 없는 필드는 null 또는 빈 배열로 설정
 - reference_movies와 dynamic_filters는 항상 배열로 반환
 - search_keywords도 항상 배열로 반환 (빈 배열 가능)
-- 이전 대화에서 이미 파악된 선호와 중복되면 생략
+
+## ⚠️ dynamic_filters 재추출 규칙 (중요)
+- dynamic_filters 는 **현재 턴에서 여전히 유효한 필터만** 전부 다시 포함하세요 (replace 정책).
+  - 예: 이전 턴에 `release_year gte 2024` 가 있었고 사용자가 여전히 최신작을 원하면 이번 턴에도 그대로 포함.
+  - 사용자가 이번 턴에 "다른 시기도 괜찮다" 등 완화/철회 신호를 보내면 해당 필터를 **제외**.
+  - 사용자가 더 이상 언급하지 않고 주제가 전환되었다면 (예: "이번엔 잔잔한 거로") 해당 필터를 **제외**.
+- **기본 원칙**: "지금도 유효한 필터만 전부", 애매하면 덜 포함.
+- genre_preference / mood / reference_movies 등 누적성 필드는 이전 조건과 중복되면 생략해도 됩니다 (병합 레이어가 union 합산).
 - 확실하지 않은 정보는 추출하지 마세요 (null 유지)
 
 ## 출력 형식

@@ -484,16 +484,25 @@ class TestQuestionGenerator:
 
     @pytest.mark.asyncio
     async def test_retrieval_feedback_question(self, mock_ollama):
-        """검색 품질 미달 시 피드백 메시지 포함 질문 생성."""
+        """
+        검색 품질 미달 시 피드백 메시지가 질문에 prefix 로 포함되는지 검증.
+
+        2026-04-15 리팩토링: 기존에는 hardcoded suffix("좀 더 구체적으로...") 를 붙였지만
+        이제는 LLM(또는 fallback) 이 만든 question 이 feedback 뒤에 자연스럽게 합성된다.
+        따라서 여기서는 "feedback 원문이 앞에 남는다" 와 "뒤에 추가 문장이 있다" 만 검증한다.
+        """
+        mock_ollama.set_response("어떤 분위기의 다큐멘터리를 찾으세요?")
+        feedback = "조건에 맞는 영화를 찾지 못했어요."
         state: ChatAgentState = {
             "preferences": ExtractedPreferences(genre_preference="다큐멘터리"),
             "turn_count": 1,
-            "retrieval_feedback": "조건에 맞는 영화를 찾지 못했어요.",
+            "retrieval_feedback": feedback,
         }
         result = await question_generator(state)
-        # 피드백 메시지가 질문에 포함되어야 함
-        assert "찾지 못했어요" in result["follow_up_question"]
-        assert "구체적" in result["follow_up_question"]
+        # 피드백 원문이 질문 prefix 로 포함되어야 함
+        assert feedback in result["follow_up_question"]
+        # feedback 뒤에 추가 질문이 합성되어 전체 길이가 feedback 보다 길어야 함
+        assert len(result["follow_up_question"]) > len(feedback)
 
     @pytest.mark.asyncio
     async def test_error_fallback(self, mock_ollama):

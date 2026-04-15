@@ -52,6 +52,7 @@ from monglepick.agents.chat.models import (
     RETRIEVAL_MIN_CANDIDATES,
     RETRIEVAL_MIN_TOP_SCORE,
     RETRIEVAL_QUALITY_MIN_AVG,
+    RETRIEVAL_SOFT_AMBIGUOUS_TOP_SCORE,
     TURN_COUNT_OVERRIDE,
     ChatAgentState,
 )
@@ -187,14 +188,17 @@ def route_after_retrieval(state: ChatAgentState) -> str:
 
     품질 기준 (모두 충족해야 PASS):
     1. 후보 수 ≥ RETRIEVAL_MIN_CANDIDATES (3개)
-    2. Top-1 RRF 점수 ≥ RETRIEVAL_MIN_TOP_SCORE (0.015)
-    3. 상위 5개 평균 ≥ RETRIEVAL_QUALITY_MIN_AVG (0.01)
+    2. Top-1 RRF 점수 ≥ RETRIEVAL_MIN_TOP_SCORE (기본 0.010)
+    3. 상위 5개 평균 ≥ RETRIEVAL_QUALITY_MIN_AVG (기본 0.008)
 
-    Phase Q-3 변경: 품질 미달 시 바로 질문하지 않고 비슷한 영화 확장 검색을 먼저 시도.
-    - 후보가 1편 이상 있으면 → similar_fallback_search (비슷한 영화 재검색)
-    - 후보가 0편이면 → question_generator (추가 질문)
-    - turn_count >= TURN_COUNT_OVERRIDE(3) → 있는 결과로 진행
-    - 품질 충족 → llm_reranker → 추천 진행
+    분기 우선순위 (2026-04-15 개정 — "애매하면 재질문" 정책 반영):
+    1) 품질 통과 또는 turn_count ≥ TURN_COUNT_OVERRIDE → llm_reranker
+    2) 후보 0개 → question_generator
+    3) 후보 있지만 top_score < RETRIEVAL_SOFT_AMBIGUOUS_TOP_SCORE 이고 초기 턴
+       (turn_count < TURN_COUNT_OVERRIDE) → question_generator (soft-ambiguous)
+       사용자 의도가 모호해 점수가 낮게 나왔을 가능성이 높다고 보고, 확장 검색 전에
+       AI 가 생성한 제안 카드로 의도 확인을 먼저 수행한다.
+    4) 그 외 (후보는 있고 점수도 중간 이상) → similar_fallback_search (기존 Phase Q-3)
 
     Args:
         state: ChatAgentState (candidate_movies, turn_count 필요)
@@ -218,6 +222,12 @@ def route_after_retrieval(state: ChatAgentState) -> str:
         and top_score >= RETRIEVAL_MIN_TOP_SCORE
         and avg_score >= RETRIEVAL_QUALITY_MIN_AVG
     )
+    # "애매 구간" 판정: 후보는 있지만 top_score 가 soft 임계값 미만
+    is_soft_ambiguous = (
+        num_candidates > 0
+        and top_score < RETRIEVAL_SOFT_AMBIGUOUS_TOP_SCORE
+        and turn_count < TURN_COUNT_OVERRIDE
+    )
 
     logger.info(
         "route_after_retrieval",
@@ -225,24 +235,46 @@ def route_after_retrieval(state: ChatAgentState) -> str:
         top_score=round(top_score, 6),
         avg_score=round(avg_score, 6),
         quality_passed=quality_passed,
+        is_soft_ambiguous=is_soft_ambiguous,
         turn_count=turn_count,
     )
 
-    if quality_passed or turn_count >= TURN_COUNT_OVERRIDE:
-        # 품질 통과 또는 TURN_COUNT_OVERRIDE(3)턴 이상이면 LLM 재랭킹 → 추천 진행
-        return "llm_reranker"
-    elif num_candidates > 0:
-        # Phase Q-3: 후보가 있지만 품질 미달 → 비슷한 영화로 확장 검색
-        # 기존 후보의 장르/무드를 활용해서 유사한 영화를 추가 검색한다.
+    # ── 라우팅 우선순위 (2026-04-15 재조정) ──
+    # 1) 후보 0개 → 무조건 question_generator.
+    #    핵심: turn_count >= TURN_COUNT_OVERRIDE 인 경우에도 llm_reranker 로 보내지 않는다.
+    #    과거에는 "3턴째이면 어떻게든 추천" 의도로 override 를 먼저 평가했으나, 후보가
+    #    0 개라면 llm_reranker → recommendation_ranker_no_candidates → response_formatter
+    #    의 빈 응답("무엇을 도와드릴까요?" 32 자 fallback) 으로 흘러가 사용자가 대화 흐름을
+    #    잃어버리는 실제 장애를 재현한다 (2026-04-15 로그 확인). 후보 0 이면 항상 재질문.
+    if num_candidates == 0:
         logger.info(
-            "route_to_similar_fallback",
-            num_candidates=num_candidates,
-            reason="quality_low_but_has_candidates",
+            "route_to_question_empty_candidates",
+            turn_count=turn_count,
+            reason="num_candidates==0",
         )
-        return "similar_fallback_search"
-    else:
-        # 후보가 전혀 없으면 추가 질문
         return "question_generator"
+
+    # 2) 품질 통과 또는 턴 오버라이드 → 추천 진행 (후보가 있을 때만)
+    if quality_passed or turn_count >= TURN_COUNT_OVERRIDE:
+        return "llm_reranker"
+
+    # 3) soft-ambiguous: 의도 확인 재질문으로 보내면서 retrieval_feedback 힌트 주입
+    if is_soft_ambiguous:
+        logger.info(
+            "route_to_question_soft_ambiguous",
+            num_candidates=num_candidates,
+            top_score=round(top_score, 6),
+            reason="ambiguous_intent_low_score",
+        )
+        return "question_generator"
+
+    # 4) 기존 Phase Q-3: 후보 있고 점수 중간 → 유사 영화 확장 검색
+    logger.info(
+        "route_to_similar_fallback",
+        num_candidates=num_candidates,
+        reason="quality_low_but_has_candidates",
+    )
+    return "similar_fallback_search"
 
 
 # ============================================================
@@ -653,6 +685,9 @@ async def run_chat_agent(
                     current_message = completed_message
 
                 # question_generator 완료 시 clarification 이벤트 발행
+                # 페이로드: { question, hints[], primary_field, suggestions[], allow_custom }
+                # suggestions 는 2026-04-15 추가된 AI 생성 제안 카드 (Claude Code 스타일).
+                # ClarificationResponse.model_dump() 가 Pydantic 전체 필드를 자동 직렬화한다.
                 if node_name == "question_generator":
                     clarification = updates.get("clarification")
                     if clarification and hasattr(clarification, "model_dump"):
@@ -661,19 +696,71 @@ async def run_chat_agent(
                 # response_formatter 완료 시 결과 발행
                 if node_name == "response_formatter":
                     # token 이벤트: 응답 텍스트 발행 (MVP: 전체 텍스트를 단일 이벤트로)
+                    # 2026-04-15 중복 답변 제거:
+                    # 이 턴에서 `clarification` 이벤트가 이미 question 텍스트를 전달했다면
+                    # 동일 텍스트의 `token` 이벤트 emit 을 스킵한다. 클라이언트는 clarification
+                    # 이벤트 → ClarificationOptions 컴포넌트에서 question 을 단일 렌더한다.
+                    # (nodes.py response_formatter 는 clarification 동반 시 vLLM 재작성을 스킵하고
+                    # question 텍스트를 그대로 response 에 담아두므로 chat history 재현에도 문제 없음.)
                     response_text = updates.get("response", "")
-                    if response_text:
+                    already_emitted_as_clarification = bool(final_state.get("clarification"))
+                    if response_text and not already_emitted_as_clarification:
                         yield _format_sse_event("token", {"delta": response_text})
 
-                # recommendation_ranker 완료 시: 포인트 차감 → movie_card 이벤트 발행
+                # recommendation_ranker 완료 시: AI 쿼터 1회 차감 → movie_card 이벤트 발행
                 # 과금 단위: "추천 완료" (movie_card 발행 시점에만 1회 차감)
                 # AI의 후속 질문(clarification) 턴은 과금하지 않음
-                # effective_cost=0이면 무료 잔여로 커버된 요청이므로 차감 스킵
+                #
+                # 2026-04-15 변경: check/consume 분리 정책 반영.
+                # 이전까지는 chat.py 진입 시 check_point 가 쿼터까지 즉시 차감했으나,
+                # "추천 완료(movie_card 발행) 전에 쿼터가 소진"되는 정책 버그가 있었다.
+                # 이제 check_point 는 순수 조회로 남고, consume_point 가 이 자리에서
+                # 유일한 쓰기 경로를 담당한다. 포인트 차감(deduct_point)은 v3.0 AI 무과금
+                # 정책상 effective_cost=0 이 기본값이라 거의 호출되지 않으며, 기존 경로는
+                # 유료 번들(effective_cost > 0) 호환성 위해 그대로 유지한다.
                 if node_name == "recommendation_ranker":
                     ranked_movies = updates.get("ranked_movies", [])
                     if ranked_movies:
-                        # ── 포인트 차감 (추천 결과가 있고, effective_cost > 0일 때만) ──
                         from monglepick.config import settings
+
+                        # ── AI 쿼터 차감 (movie_card 발행 직전, 로그인 사용자 한정) ──
+                        if settings.POINT_CHECK_ENABLED and user_id:
+                            from monglepick.api.point_client import consume_point
+                            consume_result = await consume_point(user_id=user_id)
+                            logger.info(
+                                "ai_quota_consumed",
+                                user_id=user_id,
+                                session_id=session_id,
+                                source=consume_result.source,
+                                daily_used=consume_result.daily_used,
+                                daily_limit=consume_result.daily_limit,
+                                sub_bonus_remaining=consume_result.sub_bonus_remaining,
+                                purchased_remaining=consume_result.purchased_remaining,
+                                allowed=consume_result.allowed,
+                            )
+                            # point_update 이벤트: UI 배너가 "오늘 N/M" · 이용권 잔량 등 표시
+                            yield _format_sse_event("point_update", {
+                                "balance": consume_result.balance,
+                                "deducted": 0,  # v3.0 AI 무과금
+                                "source": consume_result.source,
+                                "daily_used": consume_result.daily_used,
+                                "daily_limit": consume_result.daily_limit,
+                                "sub_bonus_remaining": consume_result.sub_bonus_remaining,
+                                "purchased_remaining": consume_result.purchased_remaining,
+                                "message": consume_result.message,
+                                "free_usage": consume_result.source == "GRADE_FREE",
+                            })
+                            if not consume_result.allowed:
+                                # check 와 consume 사이 레이스로 BLOCKED 로 전환된 경우 —
+                                # movie_card 는 이미 생성된 상태라 graceful 유지 (에러 안내만)
+                                logger.warning(
+                                    "ai_quota_consume_blocked_graceful",
+                                    user_id=user_id,
+                                    session_id=session_id,
+                                    message=consume_result.message,
+                                )
+
+                        # ── 유료 포인트 차감 (effective_cost > 0 일 때만; v3.0 기본 0) ──
                         if settings.POINT_CHECK_ENABLED and user_id and effective_cost > 0:
                             from monglepick.api.point_client import deduct_point
                             deduct_result = await deduct_point(
@@ -683,7 +770,6 @@ async def run_chat_agent(
                                 description="AI 추천 사용",
                             )
                             if deduct_result.success:
-                                # 차감 성공: 잔여 포인트 정보를 SSE로 전달
                                 yield _format_sse_event("point_update", {
                                     "balance": deduct_result.balance_after,
                                     "deducted": effective_cost,
@@ -696,12 +782,7 @@ async def run_chat_agent(
                                     balance_after=deduct_result.balance_after,
                                 )
                             else:
-                                # 차감 실패: error_code를 파싱하여 세분화된 SSE error 이벤트 발행.
-                                # INSUFFICIENT_POINT / DAILY_LIMIT_EXCEEDED / MONTHLY_LIMIT_EXCEEDED
-                                # 각각의 error_code는 프론트엔드에서 적절한 안내 UI를 표시하는 데 사용된다.
-                                # 단, 추천 결과(movie_card)는 이미 생성된 상태이므로
-                                # 그대로 전달하는 것이 UX상 더 낫다 (graceful degradation).
-                                # → error 이벤트는 포인트 관련 알림용이며, 추천 차단이 아님.
+                                # 포인트 잔액 부족 등 — graceful: movie_card 는 유지
                                 deduct_error_code = deduct_result.error_code or "INSUFFICIENT_POINT"
                                 deduct_error_msg = deduct_result.error_message or "포인트 차감에 실패했습니다."
                                 logger.warning(
@@ -711,26 +792,50 @@ async def run_chat_agent(
                                     effective_cost=effective_cost,
                                     error_code=deduct_error_code,
                                 )
-                                # SSE error 이벤트: 프론트엔드가 포인트/쿼터 상태를 파악할 수 있도록 전달
                                 yield _format_sse_event("error", {
                                     "message": deduct_error_msg,
                                     "error_code": deduct_error_code,
                                     "balance": deduct_result.balance_after,
-                                    # 쿼터 초과 여부: 프론트엔드가 구매 유도 UI를 선택적으로 표시
                                     "needs_purchase": deduct_error_code == "INSUFFICIENT_POINT",
                                 })
-                        elif settings.POINT_CHECK_ENABLED and user_id and effective_cost == 0:
-                            # 무료 잔여로 커버된 요청 → 차감 없이 point_update 발행
-                            logger.info(
-                                "point_free_usage",
+
+                        # ── 추천 로그 배치 저장 (movie_card 발행 직전, 로그인 사용자 한정) ──
+                        # 2026-04-15 신규: 마이픽 추천 내역 + 관리자 AI 추천 분석 둘 다 이 로그를
+                        # DB 원천으로 사용한다. 이전까지는 저장 경로 자체가 없어 양쪽 모두 빈 화면.
+                        # 저장된 recommendation_log_id 를 RankedMovie 에 주입 → SSE movie_card
+                        # payload 에 실려 Client 피드백(관심없음/좋아요) 버튼이 FK 로 사용 가능.
+                        if user_id and ranked_movies:
+                            from monglepick.api.recommendation_client import save_recommendation_logs
+                            prefs = final_state.get("preferences")
+                            emotion_result = final_state.get("emotion")
+                            user_intent_str = (
+                                getattr(prefs, "user_intent", None)
+                                if prefs is not None else None
+                            ) or ""
+                            emotion_str = (
+                                getattr(emotion_result, "emotion", None)
+                                if emotion_result is not None else None
+                            ) or ""
+                            mood_tags_list = (
+                                getattr(emotion_result, "mood_tags", None)
+                                if emotion_result is not None else None
+                            ) or []
+                            elapsed_ms_int = int((time.perf_counter() - graph_start) * 1000)
+                            log_ids = await save_recommendation_logs(
                                 user_id=user_id,
                                 session_id=session_id,
+                                user_intent=user_intent_str,
+                                emotion=emotion_str,
+                                mood_tags=mood_tags_list,
+                                response_time_ms=elapsed_ms_int,
+                                model_version="chat-v3.4",
+                                movies=ranked_movies,
                             )
-                            yield _format_sse_event("point_update", {
-                                "balance": -1,  # 무료 사용 시 잔액 미변동 (-1은 미조회)
-                                "deducted": 0,
-                                "free_usage": True,
-                            })
+                            # movies 와 log_ids 순서 일치 (Backend saveAll 순서 보존 + skip 은 None 채움)
+                            # 길이 mismatch 시 zip 은 짧은 쪽 기준으로 수렴하여 graceful
+                            for movie, lid in zip(ranked_movies, log_ids):
+                                if hasattr(movie, "recommendation_log_id"):
+                                    movie.recommendation_log_id = lid
 
                         # movie_card 이벤트 발행
                         for movie in ranked_movies:

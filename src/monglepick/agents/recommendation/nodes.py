@@ -740,6 +740,119 @@ def _data_quality_bonus(movie) -> float:
     return DATA_QUALITY_BONUS * (fields / total)
 
 
+# ── Popular / Hidden Gem 슬롯 quota ──
+# 최종 TOP_K(5) 중 몇 개를 "인기작(=검증된 품질)" 으로 채울지 결정하는 임계값.
+# 설계 의도:
+#   1) 평점 0.0/트레일러·포스터 부재인 무명작이 상위 1~3순위를 독점하는 것을 막는다.
+#   2) 그렇다고 무명작을 완전히 배제하지는 않는다 — hidden gem 발굴도 서비스 매력의 일부.
+#   3) 해결: 슬롯을 분리해 "인기작 풀" 에서 POPULAR_SLOTS 개, "그 외(hidden) 풀" 에서
+#      HIDDEN_SLOTS 개를 각각 MMR 로 뽑아 최종 리스트를 구성한다.
+# 각 풀이 부족하면 다른 풀로 채움 (총 TOP_K 유지).
+POPULAR_SLOTS = 3
+HIDDEN_SLOTS = 2  # TOP_K=5 기준 ( POPULAR_SLOTS + HIDDEN_SLOTS == TOP_K )
+
+# 인기작 분류 기준 — rating 과 vote_count 둘 중 하나만 충족해도 popular 풀에 포함.
+# 평점만 있고 투표수 없는 구작, 또는 투표수 많고 평점이 가지각색인 블록버스터 모두 커버.
+POPULAR_MIN_RATING = 5.0
+POPULAR_MIN_VOTE_COUNT = 50
+
+
+def _is_popular(movie) -> bool:
+    """인기작/검증작 여부 판정 (rating 또는 vote_count 임계값 충족)."""
+    rating_ok = bool(movie.rating and movie.rating >= POPULAR_MIN_RATING)
+    vote_ok = bool(
+        getattr(movie, "vote_count", None) is not None
+        and movie.vote_count >= POPULAR_MIN_VOTE_COUNT
+    )
+    return rating_ok or vote_ok
+
+
+def _mmr_select(
+    pool_ids: set[str],
+    candidate_map: dict,
+    hybrid_scores: dict[str, float],
+    already_selected: list,
+    k: int,
+) -> list:
+    """
+    주어진 풀에서 MMR 알고리즘으로 최대 k 편을 greedy 선택한다.
+
+    diversity_reranker 의 기존 루프를 함수로 분리해 popular / hidden 슬롯 양쪽에
+    동일 로직을 재사용하기 위함. `already_selected` 가 비어 있으면 첫 선택은
+    hybrid_score + quality_bonus 최고점, 이후는 MMR 점수 최고점을 선택한다.
+
+    Args:
+        pool_ids: 이 풀에서 선택 가능한 영화 id 집합 (호출 측이 소비할 때마다 줄어듦)
+        candidate_map: {id: CandidateMovie} 조회용 dict
+        hybrid_scores: {id: float} — 관련성 점수
+        already_selected: 이미 선택된 영화 리스트 (다른 풀에서 선택된 것도 포함 가능)
+        k: 이 풀에서 뽑을 최대 편수
+
+    Returns:
+        선택된 CandidateMovie 리스트 (최대 k 편, 풀이 부족하면 그만큼만)
+    """
+    selected: list = []
+    remaining = set(pool_ids)  # 호출자 집합을 건드리지 않도록 복사
+
+    for i in range(k):
+        if not remaining:
+            break
+
+        # 첫 선택이고 already_selected 도 비어있을 때만 단순 hybrid+quality 최고점
+        if i == 0 and not already_selected:
+            best_id = max(
+                remaining,
+                key=lambda mid: hybrid_scores.get(mid, 0.0)
+                + _data_quality_bonus(candidate_map[mid]),
+            )
+        else:
+            # MMR: 이미 선택된 영화(already_selected + selected) 와의 최대 유사도 계산
+            best_id = None
+            best_mmr = float("-inf")
+            reference = list(already_selected) + selected
+
+            for mid in remaining:
+                movie = candidate_map[mid]
+                relevance = hybrid_scores.get(mid, 0.0)
+
+                # 이미 선택된 영화와의 최대 유사도 (장르 60% + 감독 25% + 배우 15%)
+                max_sim = 0.0
+                for sel in reference:
+                    genre_sim = _jaccard(set(movie.genres), set(sel.genres))
+                    director_sim = (
+                        1.0
+                        if (movie.director and movie.director == sel.director)
+                        else 0.0
+                    )
+                    cast_overlap = (
+                        len(set(movie.cast[:3]) & set(sel.cast[:3])) / 3.0
+                        if movie.cast and sel.cast
+                        else 0.0
+                    )
+                    sim = 0.60 * genre_sim + 0.25 * director_sim + 0.15 * cast_overlap
+                    if sim > max_sim:
+                        max_sim = sim
+
+                quality_bonus = _data_quality_bonus(movie)
+                mmr_score = (
+                    MMR_LAMBDA * relevance
+                    - (1 - MMR_LAMBDA) * max_sim
+                    + quality_bonus
+                )
+
+                if mmr_score > best_mmr:
+                    best_mmr = mmr_score
+                    best_id = mid
+
+        if best_id is None:
+            break
+        selected.append(candidate_map[best_id])
+        remaining.discard(best_id)
+        pool_ids.discard(best_id)  # 호출자 풀에서도 제거 → 중복 선택 방지
+
+    return selected
+
+
 # ============================================================
 # 6. diversity_reranker — MMR 다양성 재정렬
 # ============================================================
@@ -781,64 +894,66 @@ async def diversity_reranker(state: RecommendationEngineState) -> dict:
         # 후보를 dict로 변환 (빠른 조회용)
         candidate_map: dict[str, CandidateMovie] = {c.id: c for c in candidates}
 
-        # 선택 가능한 후보 ID 집합
-        remaining = set(candidate_map.keys())
+        # ── 1단계: popular / hidden 풀 분리 ──
+        # 평점 ≥5.0 또는 투표수 ≥50 을 충족하는 "검증된" 영화를 popular 풀로 분리.
+        # 나머지(평점 0.0 무명작 포함)는 hidden gem 풀로 두어 최종 HIDDEN_SLOTS 개만 경쟁.
+        # 이 분리가 필요한 이유: BM25 제목 매칭으로 올라온 평점 0.0 무명작이 hybrid_score=1.0
+        # 으로 1순위 차지하는 구조를 원천 차단하기 위함. (사용자 피드백: "가끔 1~2개 정도
+        # 무명작은 추천돼도 괜찮다")
+        popular_ids: set[str] = set()
+        hidden_ids: set[str] = set()
+        for mid, movie in candidate_map.items():
+            if _is_popular(movie):
+                popular_ids.add(mid)
+            else:
+                hidden_ids.add(mid)
+
+        # ── 2단계: 슬롯별 MMR 선택 ──
         selected: list[CandidateMovie] = []
 
-        # Greedy 선택 루프
-        select_count = min(TOP_K, len(candidates))
+        # 2-1) popular 풀에서 POPULAR_SLOTS 개 우선 선택
+        popular_pick = _mmr_select(
+            pool_ids=popular_ids,
+            candidate_map=candidate_map,
+            hybrid_scores=hybrid_scores,
+            already_selected=selected,
+            k=POPULAR_SLOTS,
+        )
+        selected.extend(popular_pick)
 
-        for i in range(select_count):
-            if not remaining:
-                break
+        # 2-2) hidden 풀에서 HIDDEN_SLOTS 개 선택 (이미 선택된 영화와의 다양성 고려)
+        hidden_pick = _mmr_select(
+            pool_ids=hidden_ids,
+            candidate_map=candidate_map,
+            hybrid_scores=hybrid_scores,
+            already_selected=selected,
+            k=HIDDEN_SLOTS,
+        )
+        selected.extend(hidden_pick)
 
-            if i == 0:
-                # 첫 영화: 최고 hybrid_score 선택 (품질 보너스 포함)
-                best_id = max(
-                    remaining,
-                    key=lambda mid: hybrid_scores.get(mid, 0.0) + _data_quality_bonus(candidate_map[mid]),
+        # 2-3) 총 TOP_K 미달 시 남은 풀에서 채움 (어느 풀이 모자랐든 대체).
+        # 예) popular 1편 + hidden 2편만 있으면 → 3편만 반환되는 것을 방지.
+        shortage = TOP_K - len(selected)
+        if shortage > 0:
+            leftover_ids = (popular_ids | hidden_ids)  # _mmr_select 가 이미 소비한 후 남은 것
+            if leftover_ids:
+                extra_pick = _mmr_select(
+                    pool_ids=leftover_ids,
+                    candidate_map=candidate_map,
+                    hybrid_scores=hybrid_scores,
+                    already_selected=selected,
+                    k=shortage,
                 )
-            else:
-                # MMR_score 계산: λ × relevance - (1 - λ) × max_genre_sim + quality_bonus
-                # quality_bonus: 포스터/줄거리/평점 완비도에 따른 가산점 (0.0 ~ 0.005)
-                best_id = None
-                best_mmr = float("-inf")
-
-                for mid in remaining:
-                    movie = candidate_map[mid]
-                    relevance = hybrid_scores.get(mid, 0.0)
-
-                    # 이미 선택된 영화와의 최대 유사도 (장르 60% + 감독 25% + 배우 15%)
-                    # 기존: 장르 Jaccard만 사용 → 같은 감독/배우 영화가 중복 추천
-                    # 수정: 감독/배우까지 포함하여 다차원 다양성 확보
-                    max_sim = 0.0
-                    for sel in selected:
-                        genre_sim = _jaccard(set(movie.genres), set(sel.genres))
-                        director_sim = 1.0 if (movie.director and movie.director == sel.director) else 0.0
-                        cast_overlap = (
-                            len(set(movie.cast[:3]) & set(sel.cast[:3])) / 3.0
-                            if movie.cast and sel.cast else 0.0
-                        )
-                        sim = 0.60 * genre_sim + 0.25 * director_sim + 0.15 * cast_overlap
-                        if sim > max_sim:
-                            max_sim = sim
-
-                    # 데이터 품질 보너스: 포스터/줄거리/평점 완비 시 가산점
-                    quality_bonus = _data_quality_bonus(movie)
-                    mmr_score = MMR_LAMBDA * relevance - (1 - MMR_LAMBDA) * max_sim + quality_bonus
-
-                    if mmr_score > best_mmr:
-                        best_mmr = mmr_score
-                        best_id = mid
-
-            if best_id is not None:
-                selected.append(candidate_map[best_id])
-                remaining.discard(best_id)
+                selected.extend(extra_pick)
 
         elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
             "diversity_reranked",
             original_count=len(candidates),
+            popular_pool_size=len(popular_ids) + len(popular_pick),  # 소비 전 크기 복원
+            hidden_pool_size=len(hidden_ids) + len(hidden_pick),
+            popular_selected=[m.title for m in popular_pick],
+            hidden_selected=[m.title for m in hidden_pick],
             selected_count=len(selected),
             selected_titles=[m.title for m in selected],
             elapsed_ms=round(elapsed_ms, 1),
