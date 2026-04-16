@@ -292,20 +292,51 @@ async def get_data_overview() -> dict:
             return {"name": "Qdrant", "error": str(e)}
 
     async def _neo4j_count() -> dict:
+        """
+        라벨별·관계타입별 count 를 개별 쿼리로 실행한다.
+
+        Neo4j 는 `MATCH (n:Label) RETURN count(n)` 형태를 count-store O(1) 조회로
+        최적화하지만, 라벨 없는 `MATCH (n)` 은 전체 노드를 메모리에 로드하므로
+        트랜잭션 메모리 한도(256MB)를 초과할 수 있다.
+        UNION ALL 로 라벨별 카운트를 모아 합산하면 메모리 사용을 최소화한다.
+        """
+        # 프로젝트에서 사용하는 노드 라벨 / 관계 타입
+        _NODE_LABELS = [
+            "Movie", "Person", "Genre", "Keyword", "MoodTag",
+            "OTTPlatform", "Studio", "Collection", "Country",
+        ]
+        _REL_TYPES = [
+            "DIRECTED", "ACTED_IN", "HAS_GENRE", "HAS_KEYWORD", "HAS_MOOD",
+            "AVAILABLE_ON", "PRODUCED_BY", "PART_OF_COLLECTION", "PRODUCED_IN",
+            "SHOT_BY", "COMPOSED_BY", "WRITTEN_BY", "PRODUCED", "EDITED_BY",
+            "EXECUTIVE_PRODUCED", "DESIGNED", "COSTUMED", "BASED_ON",
+            "RECOMMENDED", "SIMILAR_TO",
+        ]
         try:
             driver = await get_neo4j()
             async with driver.session() as session:
-                # 노드/관계 수 한 번에 조회
-                result = await session.run(
-                    "MATCH (n) "
-                    "OPTIONAL MATCH ()-[r]->() "
-                    "RETURN count(DISTINCT n) AS nodes, count(DISTINCT r) AS rels"
+                # ── 노드 수: 라벨별 count-store O(1) 쿼리를 UNION ALL 로 합산 ──
+                node_cypher = " UNION ALL ".join(
+                    f"MATCH (n:{label}) RETURN count(n) AS cnt"
+                    for label in _NODE_LABELS
                 )
-                record = await result.single()
+                result = await session.run(node_cypher)
+                records = await result.data()
+                total_nodes = sum(r.get("cnt", 0) for r in records)
+
+                # ── 관계 수: 타입별 count-store O(1) 쿼리를 UNION ALL 로 합산 ──
+                rel_cypher = " UNION ALL ".join(
+                    f"MATCH ()-[r:{rtype}]->() RETURN count(r) AS cnt"
+                    for rtype in _REL_TYPES
+                )
+                result = await session.run(rel_cypher)
+                records = await result.data()
+                total_rels = sum(r.get("cnt", 0) for r in records)
+
                 return {
                     "name": "Neo4j",
-                    "nodeCount": record["nodes"] if record else 0,
-                    "relationshipCount": record["rels"] if record else 0,
+                    "nodeCount": total_nodes,
+                    "relationshipCount": total_rels,
                 }
         except Exception as e:
             logger.warning("data_overview_neo4j_failed", error=str(e))
