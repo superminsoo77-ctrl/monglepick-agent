@@ -58,19 +58,45 @@ async def _check_qdrant() -> dict:
 
 
 async def _check_neo4j() -> dict:
-    """Neo4j 연결 상태 + 노드/관계 수 조회."""
+    """
+    Neo4j 연결 상태 + 노드/관계 수 조회.
+
+    라벨/타입 없는 `MATCH (n)` 은 전체 노드를 메모리에 로드하므로
+    트랜잭션 메모리 한도(256MB)를 초과할 수 있다.
+    라벨별·타입별 count-store O(1) 쿼리를 UNION ALL 로 합산하여 메모리 사용을 최소화한다.
+    """
+    # 프로젝트에서 사용하는 노드 라벨 / 관계 타입
+    _NODE_LABELS = [
+        "Movie", "Person", "Genre", "Keyword", "MoodTag",
+        "OTTPlatform", "Studio", "Collection", "Country",
+    ]
+    _REL_TYPES = [
+        "DIRECTED", "ACTED_IN", "HAS_GENRE", "HAS_KEYWORD", "HAS_MOOD",
+        "AVAILABLE_ON", "PRODUCED_BY", "PART_OF_COLLECTION", "PRODUCED_IN",
+        "SHOT_BY", "COMPOSED_BY", "WRITTEN_BY", "PRODUCED", "EDITED_BY",
+        "EXECUTIVE_PRODUCED", "DESIGNED", "COSTUMED", "BASED_ON",
+        "RECOMMENDED", "SIMILAR_TO",
+    ]
     try:
         driver = await get_neo4j()
         async with driver.session() as session:
-            # 노드 수
-            result = await session.run("MATCH (n) RETURN count(n) AS cnt")
-            record = await result.single()
-            node_count = record["cnt"] if record else 0
+            # 노드 수: 라벨별 count-store O(1) 쿼리
+            node_cypher = " UNION ALL ".join(
+                f"MATCH (n:{label}) RETURN count(n) AS cnt"
+                for label in _NODE_LABELS
+            )
+            result = await session.run(node_cypher)
+            records = await result.data()
+            node_count = sum(r.get("cnt", 0) for r in records)
 
-            # 관계 수
-            result = await session.run("MATCH ()-[r]->() RETURN count(r) AS cnt")
-            record = await result.single()
-            rel_count = record["cnt"] if record else 0
+            # 관계 수: 타입별 count-store O(1) 쿼리
+            rel_cypher = " UNION ALL ".join(
+                f"MATCH ()-[r:{rtype}]->() RETURN count(r) AS cnt"
+                for rtype in _REL_TYPES
+            )
+            result = await session.run(rel_cypher)
+            records = await result.data()
+            rel_count = sum(r.get("cnt", 0) for r in records)
 
         return {
             "connected": True,
