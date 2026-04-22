@@ -18,10 +18,11 @@ from typing import Any, Optional
 
 import httpx
 import structlog
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, model_validator
 
+from monglepick.api.auth_deps import verify_service_key
 from monglepick.config import settings
 from monglepick.db.clients import (
     get_elasticsearch,
@@ -34,6 +35,10 @@ from monglepick.llm import get_conversation_llm, guarded_ainvoke
 
 logger = structlog.get_logger()
 
+# 라우터 레벨에는 가드를 걸지 않는다.
+# Admin SPA 가 agentApi 로 /admin/system/**, /admin/ai/chat/** 등을 **직접** 호출하기 때문.
+# ServiceKey 는 쓰기성/민감 엔드포인트(예: review-verification/verify) 에 개별 적용한다.
+# admin_data_router 도 동일 정책 — 자세한 근거는 api/auth_deps.py 문서 참고.
 admin_router = APIRouter(prefix="/admin", tags=["admin"])
 
 
@@ -1062,8 +1067,12 @@ class ReviewVerificationResponse(BaseModel):
     summary="도장깨기 리뷰 인증 AI 판정",
     description=(
         "영화 줄거리 ↔ 사용자 리뷰 유사도를 계산하여 시청 여부를 자동 인증한다. "
-        "Solar 임베딩 유사도 + 키워드 매칭 + (선택) LLM 재검증 3단계 하이브리드 판정."
+        "Solar 임베딩 유사도 + 키워드 매칭 + (선택) LLM 재검증 3단계 하이브리드 판정. "
+        "2026-04-22 보안 패치: Backend 내부 호출 전용 — X-Service-Key 헤더 필수."
     ),
+    # 2026-04-22 보안 패치: Backend 만 호출하도록 ServiceKey 헤더 필수화.
+    # 브라우저 직접 호출 시 사용자가 AUTO_VERIFIED 결과를 조작할 수 있던 취약점 차단.
+    dependencies=[Depends(verify_service_key)],
 )
 async def verify_course_review(request: ReviewVerificationRequest) -> ReviewVerificationResponse:
     """
