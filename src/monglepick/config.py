@@ -180,7 +180,9 @@ class Settings(BaseSettings):
     FREE_POINTS_ON_SIGNUP: int = 5
 
     # ── Security ──
-    SERVICE_API_KEY: str = ""
+    # Backend 측 application.yml 의 app.service.key 와 동일해야 한다.
+    # 운영 환경(.env.prod)에서는 반드시 랜덤 문자열로 교체.
+    SERVICE_API_KEY: str = "dev-service-key-change-me"
     # JWT 시크릿 키 (Backend application.yml의 app.jwt.secret과 동일해야 함)
     # Client → Agent 요청 시 Authorization: Bearer {JWT} 헤더의 user_id를 검증한다.
     # 미설정 시 JWT 검증을 건너뛰고 body의 user_id를 그대로 사용 (개발 환경용)

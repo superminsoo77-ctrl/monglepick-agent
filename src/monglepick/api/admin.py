@@ -18,10 +18,11 @@ from typing import Any, Optional
 
 import httpx
 import structlog
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
+from monglepick.api.auth_deps import verify_service_key
 from monglepick.config import settings
 from monglepick.db.clients import (
     get_elasticsearch,
@@ -34,6 +35,10 @@ from monglepick.llm import get_conversation_llm, guarded_ainvoke
 
 logger = structlog.get_logger()
 
+# 라우터 레벨에는 가드를 걸지 않는다.
+# Admin SPA 가 agentApi 로 /admin/system/**, /admin/ai/chat/** 등을 **직접** 호출하기 때문.
+# ServiceKey 는 쓰기성/민감 엔드포인트(예: review-verification/verify) 에 개별 적용한다.
+# admin_data_router 도 동일 정책 — 자세한 근거는 api/auth_deps.py 문서 참고.
 admin_router = APIRouter(prefix="/admin", tags=["admin"])
 
 
@@ -984,15 +989,37 @@ class ReviewVerificationRequest(BaseModel):
     """
 
     verification_id: int = Field(..., description="course_verification PK — 판정 결과 upsert 대상")
-    user_id: str = Field(..., description="리뷰 작성자 user_id")
-    course_id: str = Field(..., description="도장깨기 코스 ID")
-    movie_id: str = Field(..., description="영화 ID")
-    review_id: Optional[int] = Field(
-        None,
-        description="reviews 테이블의 review_id (있다면 감사/로깅용). course_review 만 있는 경우 생략 가능.",
-    )
-    review_text: str = Field(..., description="사용자가 작성한 리뷰 본문 (원문)")
-    movie_plot: str = Field(..., description="비교 기준이 될 영화 줄거리/시놉시스")
+    user_id: str = Field(default="", description="리뷰 작성자 user_id")
+    course_id: str = Field(default="", description="도장깨기 코스 ID")
+    movie_id: str = Field(default="", description="영화 ID")
+    review_id: Optional[int] = Field(default=None, description="course_review PK (로깅용)")
+    review_text: str = Field(default="", description="사용자가 작성한 리뷰 본문 (원문)")
+    movie_plot: str = Field(default="", description="비교 기준이 될 영화 줄거리/시놉시스")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_keys(cls, data: Any) -> Any:
+        """camelCase → snake_case 변환 + null 문자열 필드를 빈 문자열로 정규화."""
+        if not isinstance(data, dict):
+            return data
+        logger.info("review_verification_raw_body", keys=list(data.keys()), data=data)
+        mapping = {
+            "verificationId": "verification_id",
+            "userId":         "user_id",
+            "courseId":       "course_id",
+            "movieId":        "movie_id",
+            "reviewId":       "review_id",
+            "reviewText":     "review_text",
+            "moviePlot":      "movie_plot",
+        }
+        for camel, snake in mapping.items():
+            if camel in data and snake not in data:
+                data[snake] = data.pop(camel)
+        # Java null String → 빈 문자열
+        for str_field in ("user_id", "course_id", "movie_id", "review_text", "movie_plot"):
+            if data.get(str_field) is None:
+                data[str_field] = ""
+        return data
 
 
 class ReviewVerificationResponse(BaseModel):
@@ -1037,42 +1064,76 @@ class ReviewVerificationResponse(BaseModel):
 @admin_router.post(
     "/ai/review-verification/verify",
     response_model=ReviewVerificationResponse,
-    summary="도장깨기 리뷰 인증 AI 판정 (미구현)",
+    summary="도장깨기 리뷰 인증 AI 판정",
     description=(
         "영화 줄거리 ↔ 사용자 리뷰 유사도를 계산하여 시청 여부를 자동 인증한다. "
-        "현재는 계약만 정의되어 있고 실제 구현은 대기 중이다 — HTTP 503 을 반환한다."
+        "Solar 임베딩 유사도 + 키워드 매칭 + (선택) LLM 재검증 3단계 하이브리드 판정. "
+        "2026-04-22 보안 패치: Backend 내부 호출 전용 — X-Service-Key 헤더 필수."
     ),
+    # 2026-04-22 보안 패치: Backend 만 호출하도록 ServiceKey 헤더 필수화.
+    # 브라우저 직접 호출 시 사용자가 AUTO_VERIFIED 결과를 조작할 수 있던 취약점 차단.
+    dependencies=[Depends(verify_service_key)],
 )
 async def verify_course_review(request: ReviewVerificationRequest) -> ReviewVerificationResponse:
     """
-    리뷰 인증 에이전트 엔드포인트 — 현 시점은 placeholder.
+    리뷰 인증 에이전트 엔드포인트.
 
-    추후 구현 시 다음 단계를 수행할 예정:
-        1) 영화 줄거리와 리뷰 본문을 Solar 임베딩으로 벡터화 → 코사인 유사도
-        2) 동시 발생 키워드 추출 (명사 추출 + stop-word 제거 + BM25 상위 토큰)
-        3) (선택) LLM 으로 "리뷰가 영화 내용에 관한 것인가" yes/no 재검증
-        4) 임계값 (application.yml: app.ai.review-verification.threshold) 기준으로
-           AUTO_VERIFIED / NEEDS_REVIEW / AUTO_REJECTED 분기
-        5) Backend 의 CourseVerification.applyAiDecision() 를 호출하도록 결과 반환
-
-    이 함수가 구현되기 전까지 Admin UI 의 "AI 재검증" 버튼은 상태만 PENDING 으로
-    되돌리고 실제로는 이 엔드포인트를 호출하지 않는다 (Backend 측에서 단락).
+    LangGraph ReviewVerificationGraph 를 실행하여 5단계로 판정한다:
+        1) preprocessor         : 텍스트 정제, 20자 미만 조기 종료
+        2) embedding_similarity : Solar 임베딩 코사인 유사도
+        3) keyword_matcher      : 한국어 명사 교집합 키워드 추출
+        4) llm_revalidator      : confidence_draft 0.5~0.8 구간에서만 LLM 재검증
+        5) threshold_decider    : 임계값 기준 AUTO_VERIFIED/NEEDS_REVIEW/AUTO_REJECTED
     """
-    logger.warning(
-        "review_verification_agent_not_implemented",
+    from monglepick.agents.review_verification.graph import review_verification_graph
+
+    logger.info(
+        "review_verification_start",
         verification_id=request.verification_id,
-        user_id=request.user_id,
+        movie_id=request.movie_id,
+        review_len=len(request.review_text),
     )
-    # 503 Service Unavailable — "의도적으로 현재 가용하지 않음" 의 표준 코드.
-    # Admin UI 는 이 응답 대신 agentAvailable=false 플래그(Backend 에서 단락)로 안내한다.
-    raise HTTPException(
-        status_code=503,
-        detail={
-            "error": "review_verification_agent_not_implemented",
-            "message": (
-                "AI 리뷰 검증 에이전트가 아직 구현되지 않았습니다. "
-                "설계: docs/도장깨기_리뷰검증_에이전트_설계서.md"
-            ),
+
+    try:
+        initial_state = {
             "verification_id": request.verification_id,
-        },
-    )
+            "user_id":         request.user_id,
+            "course_id":       request.course_id,
+            "movie_id":        request.movie_id,
+            "review_id":       request.review_id,
+            "review_text":     request.review_text,
+            "movie_plot":      request.movie_plot,
+        }
+
+        result = await review_verification_graph.ainvoke(initial_state)
+
+        logger.info(
+            "review_verification_complete",
+            verification_id=request.verification_id,
+            review_status=result.get("review_status"),
+            confidence=round(result.get("confidence", 0.0), 4),
+        )
+
+        return ReviewVerificationResponse(
+            verification_id=result["verification_id"],
+            similarity_score=result.get("similarity_score", 0.0),
+            matched_keywords=result.get("matched_keywords", []),
+            confidence=result.get("confidence", 0.0),
+            review_status=result.get("review_status", "NEEDS_REVIEW"),
+            rationale=result.get("rationale", ""),
+        )
+
+    except Exception as e:
+        logger.error(
+            "review_verification_failed",
+            verification_id=request.verification_id,
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "review_verification_agent_error",
+                "message": f"AI 리뷰 검증 중 오류가 발생했습니다: {str(e)}",
+                "verification_id": request.verification_id,
+            },
+        )

@@ -69,7 +69,10 @@ from monglepick.db.clients import (
 
 logger = structlog.get_logger()
 
-# 라우터: admin_router 와 동일 prefix /admin 사용
+# 라우터: admin_router 와 동일 prefix /admin 사용.
+# 현재는 Admin SPA 가 agentApi 로 /admin/data/**, /admin/movies/**, /admin/pipeline/** 등을
+# **직접** 호출하는 구조라 라우터 레벨 ServiceKey 가드는 걸지 않는다.
+# (SPA → Agent 직접 호출 구조 자체는 JWT+Admin role 전환 별도 이슈로 분리.)
 admin_data_router = APIRouter(prefix="/admin", tags=["admin-data"])
 
 
