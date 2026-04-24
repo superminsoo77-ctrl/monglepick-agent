@@ -55,26 +55,25 @@ from monglepick.agents.chat.models import (
 @pytest.fixture(autouse=True)
 def _mock_movie_info_enricher():
     """
-    모든 테스트에서 `enrich_movies_batch` · `search_external_movies` 네트워크
-    호출을 차단한다. explanation_generator 와 external_search_node 가 CI
-    러너에서 DDGS timeout 을 기다리며 hang 되는 것을 막는다.
+    모든 테스트에서 `enrich_movies_batch` 네트워크 호출을 차단한다.
+    explanation_generator 가 CI 러너에서 DDGS timeout 을 기다리며 hang 되는
+    현상을 막는다 (run 24865625059 에서 15m job timeout 재현).
+
+    주의: `search_external_movies` 는 전역 patch 하지 않는다. 해당 함수
+    자체를 검증하는 unit 테스트(test_external_search_node.py) 가 있어
+    autouse 로 전역 치환하면 그 테스트가 기대하는 RankedMovie stub 이
+    사라져 실패한다. external_search_node 경로는 일반 integration 테스트에서
+    타지 않으므로(DB 후보 0 + recency 시그널 조합이어야 호출됨) hang 에
+    기여하지 않는다.
     """
     async def _noop_enrich(movies, *args, **kwargs):
         # movies 는 dict list. 원본 그대로 반환해 _enriched 플래그가 없게 만든다
         # → explanation_generator 가 overview 를 덮어쓰지 않는다.
         return list(movies) if movies else []
 
-    async def _noop_external_search(*args, **kwargs):
-        # external_search_node 용 (DB 후보 0 + recency 시그널 경로).
-        # 테스트에서 외부 검색 결과를 쓰고 싶다면 테스트별로 재패치하면 된다.
-        return []
-
     with patch(
         "monglepick.agents.chat.nodes.enrich_movies_batch",
         side_effect=_noop_enrich,
-    ), patch(
-        "monglepick.agents.chat.nodes.search_external_movies",
-        side_effect=_noop_external_search,
     ):
         yield
 
