@@ -5,7 +5,7 @@
   preprocessor         → HTML/마크다운 제거, 1500자 truncate, 20자 미만 early_exit
   embedding_similarity → Solar 임베딩 코사인 유사도
   keyword_matcher      → 한국어 명사 추출 + 스탑워드 제거 + TOP-20 교집합
-  llm_revalidator      → confidence_draft 0.5~0.8 구간에서만 Solar LLM yes/no 판정
+  llm_revalidator      → confidence_draft 0.5~0.8 구간에서만 EXAONE LLM yes/no 판정
   threshold_decider    → 최종 confidence + AUTO_VERIFIED/NEEDS_REVIEW/AUTO_REJECTED
 
 모든 노드는 try/except로 감싸고, 실패 시 안전한 기본값을 반환한다 (에러 전파 금지).
@@ -25,8 +25,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langsmith import traceable
 
 from monglepick.agents.review_verification.models import ReviewVerificationState
+from monglepick.config import settings
 from monglepick.data_pipeline.embedder import embed_query_async
-from monglepick.llm import get_solar_api_llm, guarded_ainvoke
+from monglepick.llm import get_ollama_llm, guarded_ainvoke
 
 logger = structlog.get_logger()
 
@@ -264,7 +265,7 @@ _REVALIDATION_HUMAN = """[영화 줄거리]
 @traceable(name="review_verification.llm_revalidator")
 async def llm_revalidator(state: ReviewVerificationState) -> dict:
     """
-    confidence_draft 0.5~0.8 구간일 때만 Solar LLM으로 yes/no 재검증한다.
+    confidence_draft 0.5~0.8 구간일 때만 EXAONE LLM으로 yes/no 재검증한다.
 
     구간 밖(< 0.5 또는 > 0.8)은 LLM 호출 없이 adjustment=0.0으로 처리한다.
     LLM 호출 실패 시에도 adjustment=0.0으로 중립 처리하여 에러 전파를 막는다.
@@ -286,7 +287,7 @@ async def llm_revalidator(state: ReviewVerificationState) -> dict:
         return {"confidence_draft": confidence_draft, "llm_adjustment": 0.0}
 
     try:
-        llm = get_solar_api_llm(temperature=0.1)
+        llm = get_ollama_llm(model=settings.CONVERSATION_MODEL, temperature=0.1)
         messages = [
             SystemMessage(content=_REVALIDATION_SYSTEM),
             HumanMessage(content=_REVALIDATION_HUMAN.format(
@@ -294,7 +295,7 @@ async def llm_revalidator(state: ReviewVerificationState) -> dict:
                 review=state.get("clean_review", "")[:500],
             )),
         ]
-        response = await guarded_ainvoke(llm, messages, model="solar_api")
+        response = await guarded_ainvoke(llm, messages, model=settings.CONVERSATION_MODEL)
         response_text = (
             response.content if hasattr(response, "content") else str(response)
         ).strip().upper()
