@@ -101,16 +101,32 @@ def _select_matched_faqs(
     faqs: list[FaqDoc], matched_ids: list[int]
 ) -> list[MatchedFaq]:
     """
-    LLM 이 돌려준 matched_faq_ids 를 실제 FAQ 메타와 매핑해 SSE/UI 용 축약 리스트로 변환.
+    LLM/ES 가 돌려준 matched_faq_ids 를 실제 FAQ 메타와 매핑해 SSE/UI 용 축약 리스트로 변환.
 
-    - ID 순서를 LLM 이 제시한 대로 유지 (중요 FAQ 가 먼저 노출되도록)
-    - 존재하지 않는 ID 는 조용히 스킵 (환각 방지)
+    - ID 순서를 제시된 대로 유지 (중요 FAQ 가 먼저 노출되도록)
+    - v3.3: state.faqs(Backend fetch 결과)에서 못 찾은 ID 도 **드롭하지 않고 id-only
+      MatchedFaq 로 유지**. chain 내부에서 ES candidate 로 이미 검증된 ID 이므로
+      Backend fetch 가 일시 실패해도 근거 FAQ 표시를 포기하지 않기 위함.
+      (v3.2 까지는 못 찾은 ID 를 조용히 스킵 → kind 강등 → complaint 로 수렴하는 버그)
     """
     by_id: dict[int, FaqDoc] = {f.faq_id: f for f in faqs}
     out: list[MatchedFaq] = []
     for fid in matched_ids:
-        faq = by_id.get(int(fid))
+        try:
+            fid_int = int(fid)
+        except (TypeError, ValueError):
+            continue
+        faq = by_id.get(fid_int)
         if faq is None:
+            # Backend fetch 결과엔 없지만 chain(ES) 이 유효하다고 전한 ID —
+            # id 만 담은 축약 레코드로 유지해 강등 트리거를 피한다.
+            out.append(
+                MatchedFaq(
+                    faq_id=fid_int,
+                    category="",
+                    question="",
+                )
+            )
             continue
         out.append(
             MatchedFaq(
@@ -140,9 +156,11 @@ async def support_agent(state: SupportAssistantState) -> dict:
 
     matched = _select_matched_faqs(faqs, reply.matched_faq_ids)
 
-    # matched_faq_ids 에는 LLM 이 채웠지만 실제 존재하지 않는 ID 였다면 드롭 후
-    # kind 도 보정 (faq/partial 이었는데 매칭이 0건이면 복구 어려움 → complaint 로 격하).
-    if reply.kind in ("faq", "partial") and not matched:
+    # 환각/진짜 매칭 실패 방어.
+    # v3.3: chain 이 ES candidate 로 이미 ID 를 검증하므로 reply.matched_faq_ids 가
+    # 비어있을 때만 강등한다 (v3.2 처럼 matched 축약 리스트 기준으로 강등하면
+    # Backend fetch 실패 시에도 잘못 강등되는 버그 — 2026-04-24 hotfix).
+    if reply.kind in ("faq", "partial") and not reply.matched_faq_ids:
         logger.info(
             "support_agent_empty_matches_for_faq_kind",
             original_kind=reply.kind,
