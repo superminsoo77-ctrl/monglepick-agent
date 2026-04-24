@@ -22,6 +22,8 @@
 #
 # 필요 GitHub Secrets:
 #   DEPLOY_SSH_KEY / VM1_HOST / VM2_HOST / VM_USER
+#   SLACK_WEBHOOK_URL (선택) — 설정 시 배포 완료/실패 시 슬랙 채널로 알림 전송.
+#                              미설정이면 notify 잡이 안전하게 스킵된다.
 
 name: CD (Production)
 
@@ -192,21 +194,20 @@ jobs:
           print(f"image 교체 완료: {new_image}")
           PY
 
-          # 2026-04-24: pull 전 VM2 디스크 자동 정리 (디스크 부족 사고 재발 방지)
-          # - dangling(<none>) 이미지 제거
-          # - 본 서비스 GHCR 이미지 중 최신 3개만 유지 (롤백 여지 확보, running 중은 docker 가 자동 보호)
-          # - 72h 이상 미사용 전역 이미지 제거
-          echo ">>> [3.5/6] 디스크 사전 정리"
+          # 2026-04-24: pull 전 디스크 자동 정리 — 정책: "running + 신규 = 최대 2개"
+          # VM2 디스크 여유 좁아 (8.7GB) 구 이미지 누적되면 pull 실패 반복.
+          # 본 서비스의 running 중이 아닌 모든 이미지 제거 → running 1개만 남김 → pull 후 정확히 2개.
+          # docker rmi 는 in-use 이미지를 자동 거부하므로 running 컨테이너는 보호된다.
+          echo ">>> [3.5/6] 디스크 사전 정리 (본 서비스 미사용 이미지 전부 제거)"
           echo "    [dangling] 태그 없는 이미지"
           docker image prune -f 2>&1 | tail -1 || true
-          echo "    [본 서비스 구 SHA 제거] ${IMAGE_NAME} 최신 3개 유지"
-          docker images "${IMAGE_NAME}" --format '{{.ID}} {{.CreatedAt}}' 2>/dev/null \
-            | sort -k2 -r | tail -n +4 | awk '{print $1}' | sort -u \
-            | xargs -r docker rmi 2>&1 | tail -3 || true
-          echo "    [72h+ 전역] 미사용 이미지"
-          docker image prune -a -f --filter "until=72h" 2>&1 | tail -1 || true
+          echo "    [본 서비스 미사용 이미지] running 제외 전부 제거"
+          docker images "${IMAGE_NAME}" -q 2>/dev/null | sort -u \
+            | xargs -r docker rmi 2>&1 | tail -5 || true
+          echo "    [전역 dangling + 24h 이상] 미사용 이미지"
+          docker image prune -a -f --filter "until=24h" 2>&1 | tail -1 || true
           echo "    [build cache]"
-          docker builder prune -f --filter "until=72h" 2>&1 | tail -1 || true
+          docker builder prune -f --filter "until=24h" 2>&1 | tail -1 || true
           echo "    정리 후 디스크:"
           df -h / | head -2
 
@@ -254,3 +255,99 @@ jobs:
 
           echo "✅ Agent 배포 완료: ${IMAGE_NAME}:${IMAGE_TAG}"
           REMOTE
+
+  # =========================================================================
+  # 배포 결과 슬랙 알림
+  # =========================================================================
+  # - test / build-and-push / deploy 세 잡 결과를 종합해 슬랙으로 단일 카드 전송.
+  # - `if: always()` 로 실패/취소 시에도 호출 — 깨진 단계를 즉시 공유.
+  # - SLACK_WEBHOOK_URL Secret 미설정 시 조용히 스킵.
+  # - 커밋 메시지 다줄/특수문자 안전을 위해 payload 는 python json.dumps 로 빌드.
+  notify:
+    name: Slack Notify
+    needs: [test, build-and-push, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Resolve overall status
+        id: status
+        env:
+          TEST: ${{ needs.test.result }}
+          BUILD: ${{ needs.build-and-push.result }}
+          DEPLOY: ${{ needs.deploy.result }}
+        run: |
+          if [ "$DEPLOY" = "success" ] && [ "$TEST" = "success" ] && [ "$BUILD" = "success" ]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "emoji=:white_check_mark:" >> "$GITHUB_OUTPUT"
+            echo "title=운영 배포 완료" >> "$GITHUB_OUTPUT"
+          elif [ "$DEPLOY" = "cancelled" ] || [ "$BUILD" = "cancelled" ] || [ "$TEST" = "cancelled" ]; then
+            echo "status=cancelled" >> "$GITHUB_OUTPUT"
+            echo "emoji=:black_circle:" >> "$GITHUB_OUTPUT"
+            echo "title=운영 배포 취소됨" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "emoji=:x:" >> "$GITHUB_OUTPUT"
+            echo "title=운영 배포 실패" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send Slack webhook
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          EMOJI: ${{ steps.status.outputs.emoji }}
+          TITLE: ${{ steps.status.outputs.title }}
+          SERVICE: monglepick-agent
+          TEST_RESULT: ${{ needs.test.result }}
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "ℹ️ SLACK_WEBHOOK_URL Secret 미설정 — 알림 스킵"
+            exit 0
+          fi
+
+          PAYLOAD=$(python3 <<'PY'
+          import json, os
+          sha = (os.environ.get("SHA") or "")[:7]
+          image_tag = (os.environ.get("IMAGE_TAG") or "")[:12]
+          emoji = os.environ["EMOJI"]
+          title = os.environ["TITLE"]
+          service = os.environ["SERVICE"]
+          msg = (os.environ.get("COMMIT_MSG") or "").split("\n")[0][:200]
+
+          fields = [
+              {"type": "mrkdwn", "text": f"*서비스*\n{service}"},
+              {"type": "mrkdwn", "text": f"*브랜치*\n`{os.environ['BRANCH']}`"},
+              {"type": "mrkdwn", "text": f"*커밋*\n`{sha}`"},
+              {"type": "mrkdwn", "text": f"*이미지 태그*\n`{image_tag}`"},
+              {"type": "mrkdwn", "text": f"*실행자*\n{os.environ['ACTOR']}"},
+              {"type": "mrkdwn", "text": f"*테스트 / 빌드 / 배포*\n{os.environ['TEST_RESULT']} / {os.environ['BUILD_RESULT']} / {os.environ['DEPLOY_RESULT']}"},
+          ]
+          blocks = [
+              {"type": "header", "text": {"type": "plain_text", "text": f"{emoji} {service} — {title}", "emoji": True}},
+              {"type": "section", "fields": fields},
+          ]
+          if msg:
+              blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*커밋 메시지*\n{msg}"}})
+          blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"<{os.environ['RUN_URL']}|:mag: 워크플로우 실행 로그 보기>"}})
+
+          print(json.dumps({
+              "text": f"{service} {title}",
+              "blocks": blocks,
+          }, ensure_ascii=False))
+          PY
+          )
+
+          HTTP_CODE=$(curl -sS -o /tmp/slack-resp.txt -w "%{http_code}" \
+            -X POST -H "Content-Type: application/json" \
+            --data "$PAYLOAD" "$SLACK_WEBHOOK_URL" || echo "000")
+          echo "Slack HTTP $HTTP_CODE — $(cat /tmp/slack-resp.txt 2>/dev/null || true)"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "⚠️ Slack 전송 실패 (HTTP $HTTP_CODE) — 배포 결과는 유효"
+          fi
