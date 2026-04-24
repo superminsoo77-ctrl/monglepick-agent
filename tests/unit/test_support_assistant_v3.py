@@ -120,13 +120,19 @@ class TestNodes:
         assert out["needs_human_agent"] is False
         assert "비밀번호" in out["response_text"]
 
-    async def test_support_agent_drops_nonexistent_faq_ids(
+    async def test_support_agent_keeps_id_only_when_backend_fetch_misses(
         self, monkeypatch, sample_faqs
     ):
-        """LLM 이 환각으로 존재하지 않는 FAQ ID 를 돌려줘도 드롭되어야 한다."""
+        """v3.3: state.faqs(Backend fetch) 에서 못 찾은 ID 여도 chain(ES)이 유효하다고 전한
+        matched_faq_ids 가 있으면 **강등하지 않고 id-only MatchedFaq 로 유지** 한다.
+
+        - v3.2: Backend fetch 결과에서 못 찾으면 complaint 로 강등(버그 — 환불/비밀번호
+          스모크에서 '1:1 문의'로 수렴하는 원인)
+        - v3.3: 강등은 reply.matched_faq_ids 가 비어있을 때만 (chain 책임)
+        """
         reply = SupportReply(
             kind="faq",
-            matched_faq_ids=[999],  # 존재하지 않음
+            matched_faq_ids=[999],  # Backend fetch 결과에는 없음
             answer="자세한 내용은 FAQ 를 확인해 주세요.",
             needs_human=False,
         )
@@ -135,7 +141,30 @@ class TestNodes:
         out = await support_nodes.support_agent(
             {"user_message": "가짜 질문", "faqs": sample_faqs}
         )
-        # 매칭 0건이면 faq/partial 로 답변 불가 → complaint 로 강등
+        # kind 유지 — chain 이 ES 로 이미 검증한 ID 이므로 신뢰
+        assert out["reply"].kind == "faq"
+        # id 는 살아있되 Backend fetch 미스로 category/question 은 빈 문자열
+        assert len(out["matched_faqs"]) == 1
+        assert out["matched_faqs"][0].faq_id == 999
+        assert out["matched_faqs"][0].category == ""
+        assert out["matched_faqs"][0].question == ""
+        assert out["needs_human_agent"] is False
+
+    async def test_support_agent_demotes_only_when_matched_ids_empty(
+        self, monkeypatch, sample_faqs
+    ):
+        """faq/partial 인데 matched_faq_ids 자체가 비어있으면 complaint 로 강등."""
+        reply = SupportReply(
+            kind="faq",
+            matched_faq_ids=[],
+            answer="",
+            needs_human=False,
+        )
+        _patch_reply(monkeypatch, reply)
+
+        out = await support_nodes.support_agent(
+            {"user_message": "애매한 질문", "faqs": sample_faqs}
+        )
         assert out["reply"].kind == "complaint"
         assert out["matched_faqs"] == []
         assert out["needs_human_agent"] is True

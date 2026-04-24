@@ -2,7 +2,7 @@
 고객센터 AI 챗봇 — Backend FAQ 조회 클라이언트 (v3).
 
 v2 의 `faq_cache.py` (Solar 임베딩 + 키워드 스코어링) 를 폐기하고
-**매 요청마다 Backend GET /api/v1/support/faqs 를 직접 호출**하는 단순 fetcher
+**매 요청마다 Backend GET /api/v1/support/faq 를 직접 호출**하는 단순 fetcher
 로 대체한다.
 
 ### 왜 캐시 없이 매번 조회하는가
@@ -55,7 +55,7 @@ async def fetch_faqs() -> list[FaqDoc]:
     """
     client = await _get_client()
     try:
-        response = await client.get("/api/v1/support/faqs")
+        response = await client.get("/api/v1/support/faq")
         response.raise_for_status()
     except httpx.HTTPError as exc:
         logger.warning(
