@@ -1,13 +1,21 @@
 """
-support_assistant LangGraph 노드 (v3 — 3노드).
+support_assistant LangGraph 노드 (v3.3 — ES-first + Solar 경계분류 + vLLM 답변).
 
-그래프:
+그래프 (3노드 유지):
     START → context_loader → support_agent → response_formatter → END
 
-v2 의 7노드(context_loader / intent_classifier / smalltalk / faq_retriever /
-answer_generator / fallback / response_formatter) 를 LLM 1회 호출로 축약.
-분기 로직은 전부 `support_agent` 노드 안에서 Solar Pro structured output
-(SupportReply.kind) 로 결정된다.
+### v3.3 변경점
+context_loader 가 ES-first 전략을 채택한다.
+- ES 검색은 support_reply_chain 내부에서 수행되므로 노드 자체는 단순하게 유지.
+- context_loader 는 Backend HTTP FAQ 조회를 **지연(lazy)** 방식으로 처리한다:
+    - ES 주요 경로: Backend FAQ 호출 생략 가능 (ES 가 검색을 담당)
+    - 그러나 Solar/vLLM fallback 경로에서 faqs 인수가 필요하므로 항상 조회 유지.
+    - 단, Backend 장애 시 faqs=[] 로 계속 진행 — ES 가 있으면 정상 응답 가능.
+
+### 노드 역할
+- context_loader     : Backend FAQ 조회 + state 초기화
+- support_agent      : generate_support_reply() 위임 (ES+Solar+vLLM 3단계)
+- response_formatter : 최종 검증 + 빈 응답 방어
 
 모든 노드:
 - async def
@@ -33,16 +41,27 @@ logger = structlog.get_logger(__name__)
 
 
 # =============================================================================
-# 1) context_loader — 매 요청마다 Backend 에서 FAQ 전체를 가져온다
+# 1) context_loader — Backend FAQ 조회 (ES fallback 안전망용)
 # =============================================================================
 
 
 async def context_loader(state: SupportAssistantState) -> dict:
     """
-    진입 노드. RDB FAQ 전체를 조회해 state.faqs 에 싣고 기본 필드를 초기화한다.
+    진입 노드. Backend HTTP 에서 FAQ 전체를 조회해 state.faqs 에 싣고 기본 필드를 초기화한다.
 
-    캐시 없음 — 관리자가 FAQ 를 추가/수정/삭제한 즉시 다음 요청부터 반영된다.
-    Backend 장애 시 faqs=[] 상태로 계속 진행 (support_agent 가 complaint 폴백).
+    ### ES-first 전략에서 faqs 의 역할 (v3.3)
+    v3.3 에서는 ES Nori BM25 가 FAQ 검색의 주요 경로이므로 이론상 Backend FAQ 전체
+    조회가 불필요하다. 그러나 다음 이유로 유지한다:
+
+    1. **Solar/vLLM fallback**: ES 실패 시 _classify_and_match 가 faqs 인수로
+       question 목록을 필요로 한다 (최후 안전망).
+    2. **답변 생성 보조**: _generate_answer_from_faq 가 ES 후보에 없는 id 를
+       Backend FAQ 에서 찾는 로직을 포함한다 (교차 참조).
+    3. **matched_faq_ids 환각 방어**: valid_ids = candidate_ids | faq_ids
+       — Backend FAQ 가 있으면 Solar 가 돌려준 id 를 더 넓게 허용 가능.
+
+    Backend 장애 시 faqs=[] 로 계속 진행한다. ES 가 정상이면 faqs=[] 여도
+    HIGH/MID 경로에서 정상 응답이 가능하다.
     """
     user_message = (state.get("user_message") or "").strip()
     logger.info(
