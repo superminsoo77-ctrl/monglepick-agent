@@ -77,13 +77,18 @@ class TestMultiTurn:
 
     @pytest.mark.asyncio
     async def test_turn1_saves_session(self, mock_session_store):
-        """턴 1: 후속 질문 → 세션 저장 (messages, turn_count 기록)."""
+        """턴 1: 후속 질문 → 세션 저장 (messages, turn_count 기록).
+
+        Note: SUFFICIENCY_THRESHOLD=2.0 이고 has_emotion 만으로 mood 가중치(2.0) 가
+        부여되므로, 빈 선호 + 감정 있음 = 충분 판정(needs_clarification=False) 이 된다.
+        본 테스트는 "선호 부족 → 질문" 흐름을 검증하므로 emotion 도 없앤다.
+        """
         patches = _make_multi_turn_mocks(
             intent_emotion=IntentEmotionResult(
                 intent="recommend", confidence=0.9,
-                emotion="sad", mood_tags=["힐링", "감동"],
+                emotion=None, mood_tags=[],
             ),
-            preferences=ExtractedPreferences(),  # 빈 선호 → 불충분 → 후속 질문
+            preferences=ExtractedPreferences(),  # 빈 선호 + 감정 없음 → 불충분 → 후속 질문
         )
 
         from monglepick.agents.chat.graph import run_chat_agent_sync
@@ -92,7 +97,7 @@ class TestMultiTurn:
             state = await run_chat_agent_sync(
                 user_id="",
                 session_id="multi-turn-test",
-                message="우울한데 영화 추천해줘",
+                message="영화 추천해줘",
             )
 
         # 후속 질문이 생성됨
