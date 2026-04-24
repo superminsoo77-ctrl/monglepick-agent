@@ -271,6 +271,12 @@ async def load_session(user_id: str, session_id: str) -> dict[str, Any] | None:
                 logger.warning("emotion_restore_failed", session_id=session_id)
                 emotion = None
 
+        # 세션 내 최근 추천 ID 롤링 윈도우 — 스키마 이전 세션은 비어 있는 기본값
+        recent_recommended_ids_raw = session_state.get("recent_recommended_ids") or []
+        recent_recommended_ids: list[str] = [
+            str(rid) for rid in recent_recommended_ids_raw if rid
+        ]
+
         data: dict[str, Any] = {
             "messages": messages,
             "preferences": preferences,
@@ -278,6 +284,7 @@ async def load_session(user_id: str, session_id: str) -> dict[str, Any] | None:
             "turn_count": raw.get("turnCount", 0),
             "user_profile": session_state.get("user_profile", {}),
             "watch_history": session_state.get("watch_history", []),
+            "recent_recommended_ids": recent_recommended_ids,
         }
 
         logger.info(
@@ -392,6 +399,14 @@ async def save_session(user_id: str, session_id: str, state: dict[str, Any]) -> 
                 item["watched_at"] = item["watched_at"].isoformat()
             serializable_history.append(item)
         session_state["watch_history"] = serializable_history
+
+        # recent_recommended_ids: 세션 내 최근 추천 영화 ID 롤링 윈도우.
+        # query_builder 가 다음 턴 exclude_ids 에 병합해 같은 영화 반복 추천을 방지한다
+        # (2026-04-24 버그: "한 편 더 추천" 시 동일 포스터가 반복 노출).
+        recent_recommended_ids = state.get("recent_recommended_ids") or []
+        session_state["recent_recommended_ids"] = [
+            str(rid) for rid in recent_recommended_ids if rid
+        ]
 
         # JSON 직렬화
         messages_json = json.dumps(messages, ensure_ascii=False, default=str)

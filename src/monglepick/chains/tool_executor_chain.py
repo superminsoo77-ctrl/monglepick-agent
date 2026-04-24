@@ -72,6 +72,12 @@ async def execute_tool(
         logger.info("tool_executor_chain_unknown_intent", intent=intent)
         return {}
 
+    # ── gating 대상 인텐트 (theater/booking) ──
+    # "근처 상영중 영화가 실제로 있을 때만 영화관 카드를 노출한다" 요구사항을 만족시키기 위해
+    # kobis_now_showing 을 선행 실행하고, 결과가 비면 theater_search / search_movies 를 전부 스킵한다.
+    # info 는 kobis 를 쓰지 않으므로 기존 병렬 경로를 유지한다.
+    _GATED_INTENTS = ("theater", "booking")
+
     # 도구 호출 인자 조립 헬퍼 — 도구가 요구하는 입력만 골라서 전달한다.
     # 인자 누락 시 (예: theater_search 인데 location 없음) None 반환 → 호출 스킵.
     def _build_args(name: str) -> dict[str, Any] | None:
@@ -122,6 +128,56 @@ async def execute_tool(
     # 도구별 호출 코루틴 빌드 — 인자 누락(None)은 미실행으로 분류
     pending: dict[str, Any] = {}        # name -> 결과 (이미 fail-fast 분류된 항목)
     coros: list[tuple[str, Any]] = []   # (name, coroutine) — 실제로 실행할 것만
+
+    # ── theater/booking 인텐트 gating ──
+    # kobis_now_showing 을 먼저 호출하여 "현재 상영중인 영화가 있는가" 를 확인한다.
+    # 비어 있으면 (API 장애 / 박스오피스 공백 등) theater_search / search_movies 를 건너뛰어
+    # "근처에 영화관만 덩그러니 떠 있고 볼 영화는 없음" 상태를 방지한다.
+    # 정상(>0) 이면 kobis 결과를 pending 에 확정해두고 나머지 도구만 병렬로 실행한다.
+    if intent in _GATED_INTENTS and "kobis_now_showing" in tool_names:
+        kobis_tool = TOOL_REGISTRY.get("kobis_now_showing")
+        if kobis_tool is not None:
+            kobis_args = _build_args("kobis_now_showing") or {}
+            try:
+                kobis_result = await asyncio.wait_for(
+                    kobis_tool.ainvoke(kobis_args),
+                    timeout=_TOOL_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "tool_executor_chain_tool_timeout",
+                    tool="kobis_now_showing",
+                    intent=intent,
+                    timeout_sec=_TOOL_TIMEOUT_SEC,
+                )
+                kobis_result = []
+            except Exception as e:  # noqa: BLE001 — 도구 경계에서 모든 예외 흡수
+                logger.error(
+                    "tool_executor_chain_tool_error",
+                    tool="kobis_now_showing",
+                    intent=intent,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                kobis_result = []
+
+            # kobis 는 결과 유형이 list | str 둘 다 허용 → list 이고 원소가 있을 때만 "상영중" 으로 판정.
+            has_now_showing = isinstance(kobis_result, list) and len(kobis_result) > 0
+            pending["kobis_now_showing"] = kobis_result
+
+            if not has_now_showing:
+                # 현재 상영중 영화가 없음 → 영화관/예매 관련 도구를 일괄 스킵.
+                logger.info(
+                    "tool_executor_chain_gated_skip",
+                    intent=intent,
+                    reason="kobis_now_showing_empty",
+                    skipped_tools=[n for n in tool_names if n != "kobis_now_showing"],
+                )
+                return pending
+
+            # 정상: 나머지 도구만 이후 루프에서 처리하도록 kobis 제외
+            tool_names = [n for n in tool_names if n != "kobis_now_showing"]
+
     for name in tool_names:
         tool_obj = TOOL_REGISTRY.get(name)
         if tool_obj is None:

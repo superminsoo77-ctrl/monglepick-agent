@@ -672,6 +672,10 @@ async def run_chat_agent(
         "turn_count": session_data["turn_count"] if session_data else 0,
         "user_profile": session_data["user_profile"] if session_data else {},
         "watch_history": session_data["watch_history"] if session_data else [],
+        # 세션 내 최근 추천된 영화 ID (중복 추천 방지 롤링 윈도우 — 2026-04-24)
+        "recent_recommended_ids": (
+            session_data.get("recent_recommended_ids", []) if session_data else []
+        ),
     }
 
     logger.info(
@@ -1148,6 +1152,10 @@ async def run_chat_agent_sync(
         "turn_count": session_data["turn_count"] if session_data else 0,
         "user_profile": session_data["user_profile"] if session_data else {},
         "watch_history": session_data["watch_history"] if session_data else [],
+        # 세션 내 최근 추천된 영화 ID (중복 추천 방지 롤링 윈도우 — 2026-04-24)
+        "recent_recommended_ids": (
+            session_data.get("recent_recommended_ids", []) if session_data else []
+        ),
     }
 
     logger.info(

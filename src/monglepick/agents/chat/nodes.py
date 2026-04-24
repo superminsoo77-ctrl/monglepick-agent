@@ -78,6 +78,43 @@ from monglepick.utils.movie_info_enricher import (
 logger = structlog.get_logger()
 
 
+# 세션 내 "최근 추천된 영화 ID" 롤링 윈도우 크기.
+# "한 편 더 추천해줘" 같은 재추천 요청이 같은 영화를 반복해서 내보내던 문제를 막기 위해
+# recommendation_ranker / external_search_node 가 매 턴 ranked_movies 의 ID 를 이 큐에
+# 쌓아두고, query_builder 가 exclude_ids 에 병합한다. 한 턴당 최대 5편 가정 시
+# 30 은 대략 6 턴 분량으로, 그 이후에는 가장 오래된 ID 부터 빠져 재추천이 다시 가능.
+_RECENT_RECOMMENDED_WINDOW: int = 30
+
+
+def _append_recent_recommended_ids(
+    prev: list[str] | None,
+    new_ids: list[str],
+) -> list[str]:
+    """
+    세션 최근 추천 ID 큐에 새 ID 들을 append 하고 롤링 윈도우 크기로 자른다.
+
+    - prev 내부에 이미 있는 ID 는 중복 제거 후 "가장 최근" 위치로 이동 (순서 유지: 오래된 → 최신)
+    - 빈 문자열/None 은 무시
+    - 외부 검색 결과 (`external_` 접두사) 도 같은 큐에 저장해 외부 검색의 재호출 루프도 방지
+
+    Args:
+        prev: 이전 턴까지 누적된 ID 리스트 (세션 state 에서 복원)
+        new_ids: 이번 턴에 추천된 영화 ID 리스트
+
+    Returns:
+        최신 N 개 (_RECENT_RECOMMENDED_WINDOW) 로 자른 누적 리스트
+    """
+    prev_list = list(prev or [])
+    filtered_new = [str(nid) for nid in new_ids if nid]
+    # new 쪽에 포함된 ID 는 기존 리스트에서 제거해 맨 뒤로 밀어낸다.
+    new_set = set(filtered_new)
+    combined = [pid for pid in prev_list if pid not in new_set] + filtered_new
+    # 롤링 윈도우 적용 (앞쪽이 오래된 ID)
+    if len(combined) > _RECENT_RECOMMENDED_WINDOW:
+        combined = combined[-_RECENT_RECOMMENDED_WINDOW:]
+    return combined
+
+
 # ============================================================
 # 1. context_loader — 유저 프로필/시청이력/대화이력 로드
 # ============================================================
@@ -170,27 +207,64 @@ async def context_loader(state: ChatAgentState) -> dict:
                     if row:
                         user_profile = dict(row)
 
-                    # 시청 이력 조회 (최근 50건, 영화 메타데이터 포함)
-                    # — 2026-04-07: watch_history → reviews 로 교체
-                    #   근거: 몽글픽은 영상 스트리밍 미제공. "봤다" = 리뷰 작성.
-                    #         reviews 테이블이 단일 진실 원본이며,
-                    #         watch_history 는 Kaggle 26M CF 학습용 시드 데이터 전용.
-                    # — review_source: 어떤 경로(AI추천/검색/위시리스트 등)로 시청 후 리뷰했는지
-                    # — CBF에서 장르/감독/배우/무드 프로필 구축에 활용
+                    # 시청 이력 조회 (최근 100건, 영화 메타데이터 포함)
+                    # — 2026-04-08: "봤다 = 리뷰" 부분 재정의
+                    #     · 강한 신호 = reviews (rating 필수, CF 학습 단일 진실 원본 + CBF)
+                    #     · 약한 신호 = user_watch_history (rating nullable, CBF 후보군 보강)
+                    # — 2026-04-24: reviews 단독 → reviews UNION user_watch_history 로 확장
+                    #   근거: "봤어요" 만 체크한 약한 신호도 CBF 의 장르/감독/배우 프로필
+                    #         구축에 기여시켜 Cold Start 오판정 해소 + 정보량 증가.
+                    #         CF 는 Redis `cf:user_ratings` (reviews 기반 사전 빌드) 만
+                    #         보므로 약한 신호가 CF 학습에 오염되지 않는다.
+                    # — 중복 처리: reviews 에 이미 있는 movie_id 는 reviews 행만 채택
+                    #   (rating 보존). user_watch_history 는 reviews 에 없는 영화만 보충.
+                    # — _rating_weight(None) = 1.0 (중립) 이므로 NULL rating 은 안전.
+                    # — exclude_ids (query_builder) 도 자동으로 두 신호의 합집합을 제외하게 됨.
+                    # — review_source: 강한 신호는 review_source, 약한 신호는 watch_source
+                    #   를 같은 컬럼으로 alias (디버깅 용도, 추천 로직 미참조).
                     await cursor.execute(
                         """
-                        SELECT r.movie_id, m.title, r.rating, r.created_at AS watched_at,
-                               m.genres, m.director, m.cast_members AS `cast`,
-                               m.mood_tags, m.popularity_score, m.rating AS movie_rating,
-                               r.review_source
-                        FROM reviews r
-                        LEFT JOIN movies m ON r.movie_id = m.movie_id
-                        WHERE r.user_id = %s
-                          AND r.is_deleted = false
-                        ORDER BY r.created_at DESC
-                        LIMIT 50
+                        SELECT signal_type, movie_id, title, rating, watched_at,
+                               genres, director, `cast`, mood_tags,
+                               popularity_score, movie_rating, review_source
+                        FROM (
+                            SELECT
+                                'review' AS signal_type,
+                                r.movie_id, m.title, r.rating,
+                                r.created_at AS watched_at,
+                                m.genres, m.director, m.cast_members AS `cast`,
+                                m.mood_tags, m.popularity_score,
+                                m.rating AS movie_rating,
+                                r.review_source
+                            FROM reviews r
+                            LEFT JOIN movies m ON r.movie_id = m.movie_id
+                            WHERE r.user_id = %s
+                              AND r.is_deleted = false
+
+                            UNION ALL
+
+                            SELECT
+                                'watch' AS signal_type,
+                                uwh.movie_id, m.title, uwh.rating,
+                                uwh.watched_at,
+                                m.genres, m.director, m.cast_members AS `cast`,
+                                m.mood_tags, m.popularity_score,
+                                m.rating AS movie_rating,
+                                uwh.watch_source AS review_source
+                            FROM user_watch_history uwh
+                            LEFT JOIN movies m ON uwh.movie_id = m.movie_id
+                            WHERE uwh.user_id = %s
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM reviews r2
+                                  WHERE r2.user_id = uwh.user_id
+                                    AND r2.movie_id = uwh.movie_id
+                                    AND r2.is_deleted = false
+                              )
+                        ) AS combined
+                        ORDER BY watched_at DESC
+                        LIMIT 100
                         """,
-                        (user_id,),
+                        (user_id, user_id),
                     )
                     rows = await cursor.fetchall()
                     watch_history = [dict(r) for r in rows]
@@ -251,12 +325,18 @@ async def context_loader(state: ChatAgentState) -> dict:
             # DB 에러 시에도 빈 기본값으로 계속 진행
             logger.warning("context_loader_db_error", error=str(db_err))
 
+        # 강한/약한 신호 분리 카운트 — 약한 신호 흡수 효과 모니터링용
+        review_count = sum(1 for wh in watch_history if wh.get("signal_type") == "review")
+        watch_count = sum(1 for wh in watch_history if wh.get("signal_type") == "watch")
+
         elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
             "context_loaded",
             user_id=user_id,
             profile_exists=bool(user_profile),
             history_count=len(watch_history),
+            review_count=review_count,
+            watch_only_count=watch_count,
             turn_count=turn_count,
             recent_watched=[wh.get("title", "") for wh in watch_history[:5]],
             elapsed_ms=round(elapsed_ms, 1),
@@ -965,8 +1045,14 @@ async def query_builder(state: ChatAgentState) -> dict:
             boost_keywords.extend(image_analysis.search_keywords)
             boost_keywords.extend(image_analysis.visual_elements[:3])
 
-        # exclude_ids: 시청 이력 영화 ID
+        # exclude_ids: 시청 이력 영화 ID + 세션 내 최근 추천된 영화 ID (중복 추천 방지)
         exclude_ids = [str(wh.get("movie_id", "")) for wh in watch_history if wh.get("movie_id")]
+        # 세션 롤링 윈도우 — "external_" 접두사(DB 에 없음) 는 제외 매칭할 대상이 없으므로 skip
+        recent_recommended = state.get("recent_recommended_ids", []) or []
+        for rid in recent_recommended:
+            sid = str(rid) if rid else ""
+            if sid and not sid.startswith("external_") and sid not in exclude_ids:
+                exclude_ids.append(sid)
 
         search_query = SearchQuery(
             semantic_query=semantic_query,
@@ -1861,7 +1947,14 @@ async def external_search_node(state: ChatAgentState) -> dict:
             session_id=session_id,
             user_id=user_id,
         )
-        return {"ranked_movies": ranked}
+        # 외부 검색도 "추천을 냈다" 로 간주 — 다음 턴 동일 쿼리에서 큐에 있는 external_ ID 는
+        # query_builder 가 skip 하므로 DB 필터에는 영향 없지만, 추후 정책(예: 외부 검색 자체의
+        # 중복 방지 루프) 에서 공용 소스로 활용할 수 있도록 롤링 윈도우에 함께 쌓아둔다.
+        updated_recent = _append_recent_recommended_ids(
+            state.get("recent_recommended_ids"),
+            [m.id for m in ranked if m.id],
+        )
+        return {"ranked_movies": ranked, "recent_recommended_ids": updated_recent}
 
     except Exception as e:
         elapsed_ms = (time.perf_counter() - node_start) * 1000
@@ -2018,7 +2111,12 @@ async def recommendation_ranker(state: ChatAgentState) -> dict:
             session_id=session_id,
             user_id=user_id,
         )
-        return {"ranked_movies": ranked}
+        # 세션 롤링 윈도우에 이번 턴 추천 ID append — 다음 턴 query_builder 의 exclude_ids 로 쓰인다
+        updated_recent = _append_recent_recommended_ids(
+            state.get("recent_recommended_ids"),
+            [m.id for m in ranked if m.id],
+        )
+        return {"ranked_movies": ranked, "recent_recommended_ids": updated_recent}
 
     except Exception as e:
         # fallback: RRF 점수 기준 정렬 (서브그래프 에러 시 기존 스텁 로직)
@@ -2071,7 +2169,12 @@ async def recommendation_ranker(state: ChatAgentState) -> dict:
                 vote_count=c.vote_count,
                 backdrop_path=c.backdrop_path,
             ))
-        return {"ranked_movies": ranked}
+        # 세션 롤링 윈도우는 try 블록과 동일하게 fallback 경로에서도 갱신한다.
+        updated_recent = _append_recent_recommended_ids(
+            state.get("recent_recommended_ids"),
+            [m.id for m in ranked if m.id],
+        )
+        return {"ranked_movies": ranked, "recent_recommended_ids": updated_recent}
 
 
 # ============================================================

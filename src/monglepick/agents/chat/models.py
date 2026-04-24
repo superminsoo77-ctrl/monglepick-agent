@@ -749,6 +749,15 @@ class ChatAgentState(TypedDict, total=False):
     # response_formatter에서 final_answer가 있으면 LLM 생성 없이 그대로 반환한다.
     final_answer: str | None
 
+    # ── 세션 내 최근 추천된 영화 ID (중복 추천 방지, 롤링 윈도우) ──
+    # "한 편 더 추천해줘" 처럼 같은 세션에서 같은 preferences 로 재검색이 일어나면
+    # hybrid_search 가 같은 후보를 결정적으로 반환해 이전 턴과 동일한 카드가 다시 나가고,
+    # EXAONE 1.2B 가 "새로움" 을 내려고 텍스트에서만 제목을 환각(hallucinate)하는 현상이
+    # 보고됐다 (2026-04-24). query_builder 가 이 집합을 exclude_ids 에 병합하고,
+    # recommendation_ranker / external_search_node 는 매 턴 신규 추천 ID 를 append 한다.
+    # session_store 에 영속화되어 재접속 시에도 이어진다.
+    recent_recommended_ids: list[str]
+
     # ── error_handler ──
     error: str | None
 

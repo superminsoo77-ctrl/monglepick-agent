@@ -129,3 +129,60 @@ class TestExecuteToolDispatch:
             )
         assert result["theater_search"] == []
         assert result["kobis_now_showing"] == [{"rank": 1}]
+
+    # ──────────────────────────────────────────────────────────────
+    # gating: "근처 상영중 영화가 있을 때만 영화관 카드를 노출" 요구사항
+    # ──────────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_theater_gated_skip_when_kobis_empty(self):
+        """kobis 결과가 빈 list → theater_search 호출 자체를 스킵."""
+        fake_registry = {
+            "theater_search": _make_async_tool([{"name": "should not be called"}]),
+            "kobis_now_showing": _make_async_tool([]),  # 빈 박스오피스
+        }
+        with patch("monglepick.chains.tool_executor_chain.TOOL_REGISTRY", fake_registry):
+            result = await execute_tool(
+                intent="theater",
+                location={"latitude": 37.5, "longitude": 127.0},
+            )
+        # kobis 결과는 포함되지만 값은 빈 list, theater_search 는 키조차 없어야 한다
+        assert result["kobis_now_showing"] == []
+        assert "theater_search" not in result
+        fake_registry["theater_search"].ainvoke.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_theater_gated_skip_when_kobis_timeout(self):
+        """kobis 가 타임아웃 → 상영중 확인 불가 → theater_search 스킵 (보수적)."""
+        fake_registry = {
+            "theater_search": _make_async_tool([{"name": "nope"}]),
+            "kobis_now_showing": _make_failing_tool(asyncio.TimeoutError()),
+        }
+        with patch("monglepick.chains.tool_executor_chain.TOOL_REGISTRY", fake_registry):
+            result = await execute_tool(
+                intent="theater",
+                location={"latitude": 37.5, "longitude": 127.0},
+            )
+        assert result["kobis_now_showing"] == []
+        assert "theater_search" not in result
+        fake_registry["theater_search"].ainvoke.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_booking_gated_skip_also_blocks_search_movies(self):
+        """booking 도 gating 대상 — kobis 비었을 때 theater_search 와 search_movies 모두 스킵."""
+        fake_registry = {
+            "theater_search": _make_async_tool([{"name": "nope"}]),
+            "kobis_now_showing": _make_async_tool([]),
+            "search_movies": _make_async_tool([{"title": "nope"}]),
+        }
+        with patch("monglepick.chains.tool_executor_chain.TOOL_REGISTRY", fake_registry):
+            result = await execute_tool(
+                intent="booking",
+                location={"latitude": 37.5, "longitude": 127.0},
+                movie_title="아무 영화",
+            )
+        assert result["kobis_now_showing"] == []
+        assert "theater_search" not in result
+        assert "search_movies" not in result
+        fake_registry["theater_search"].ainvoke.assert_not_awaited()
+        fake_registry["search_movies"].ainvoke.assert_not_awaited()
