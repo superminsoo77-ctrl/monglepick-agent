@@ -1,17 +1,20 @@
 # =========================================
-# 몽글픽 AI Agent CI/CD 워크플로우
+# 몽글픽 AI Agent CI/CD 워크플로우 (스테이징)
 # =========================================
-# PR/push → pytest 테스트 + ruff 린트 (GitHub 호스팅 러너)
-# develop push → 스테이징 맥북에서 직접 배포 (Self-hosted 러너)
+# 역할 분담:
+#   - 이 파일(ci-cd.yml)      : develop push → pytest + 스테이징 맥북 배포
+#                              + develop/main PR → pytest 만
+#   - cd-prod.yml             : main push → pytest + GHCR 빌드 + VM2 운영 배포
 #
-# 사전 준비:
-#   스테이징 맥북에 GitHub Actions self-hosted runner 설치 완료
+# main push 에서 이 워크플로우가 중복으로 돌면 cd-prod.yml 과
+# concurrency 그룹이 달라 서로 cancel/fail 로 갈려 실패 알림이 자주 떴었음.
+# 중복 제거를 위해 이 파일은 develop push 만 받는다.
 
 name: CI/CD
 
 on:
   push:
-    branches: [develop, main]
+    branches: [develop]
   pull_request:
     branches: [develop, main]
 
