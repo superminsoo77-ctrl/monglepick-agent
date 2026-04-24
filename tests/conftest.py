@@ -30,6 +30,54 @@ from monglepick.agents.chat.models import (
 )
 
 
+# ============================================================
+# 외부 네트워크 차단 autouse Fixture
+# ============================================================
+#
+# CI hang 근본 원인 (2026-04-24):
+#   explanation_generator 노드가 enrich_movies_batch() 를 호출해
+#   DuckDuckGo(DDGS) 검색으로 overview 를 보강한다. DDGS 는 동기 API 라
+#   asyncio.to_thread 로 스레드에서 돌리고 asyncio.wait_for 로 5초 timeout 을
+#   걸지만, wait_for 는 스레드 자체를 cancel 하지 못한다. 최근 ddgs 의존성
+#   변경(= `duckduckgo_search` → `ddgs` 리네임)과 호스티드 러너의 외부
+#   HTTPS 지연이 겹치면, 내부 스레드가 해제되지 않아 pytest 가 15분
+#   job timeout 까지 hang 되는 현상이 발생했다 (run 24865625059).
+#
+# 해결 원칙:
+#   - 운영 코드(movie_info_enricher)는 건드리지 않는다.
+#   - integration/unit 테스트 전 영역에서 enrich 는 "no-op" 으로 치환한다.
+#   - autouse=True 로 모든 테스트에 자동 적용 → 누락 실수 방지.
+#
+# no-op 반환값은 원본 dict 를 그대로 되돌려주도록 하여, _enriched 플래그가
+# 없는 상태 == overview 업데이트 생략 (explanation_generator 의 else 분기).
+
+
+@pytest.fixture(autouse=True)
+def _mock_movie_info_enricher():
+    """
+    모든 테스트에서 `enrich_movies_batch` 네트워크 호출을 차단한다.
+    explanation_generator 가 CI 러너에서 DDGS timeout 을 기다리며 hang 되는
+    현상을 막는다 (run 24865625059 에서 15m job timeout 재현).
+
+    주의: `search_external_movies` 는 전역 patch 하지 않는다. 해당 함수
+    자체를 검증하는 unit 테스트(test_external_search_node.py) 가 있어
+    autouse 로 전역 치환하면 그 테스트가 기대하는 RankedMovie stub 이
+    사라져 실패한다. external_search_node 경로는 일반 integration 테스트에서
+    타지 않으므로(DB 후보 0 + recency 시그널 조합이어야 호출됨) hang 에
+    기여하지 않는다.
+    """
+    async def _noop_enrich(movies, *args, **kwargs):
+        # movies 는 dict list. 원본 그대로 반환해 _enriched 플래그가 없게 만든다
+        # → explanation_generator 가 overview 를 덮어쓰지 않는다.
+        return list(movies) if movies else []
+
+    with patch(
+        "monglepick.agents.chat.nodes.enrich_movies_batch",
+        side_effect=_noop_enrich,
+    ):
+        yield
+
+
 @pytest.fixture
 def sample_preferences() -> ExtractedPreferences:
     """미리 채워진 사용자 선호 조건 fixture."""
