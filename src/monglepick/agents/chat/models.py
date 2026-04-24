@@ -320,6 +320,17 @@ class ExtractedPreferences(BaseModel):
         description="검색 부스트용 키워드 (LLM이 추출한 핵심 검색어)",
     )
 
+    # ── 사용자가 명시적으로 요청한 추천 편수 (2026-04-24) ──
+    # "한 편만", "1편만", "딱 하나", "세 편" 등 구체적 숫자 표현이 있을 때만 채운다.
+    # None = 사용자가 편수를 언급하지 않음 → 기본 TOP_K(5) 사용.
+    # 유효 범위: 1~TOP_K(5). 범위 밖 값은 recommendation 엔진에서 clamp.
+    requested_count: int | None = Field(
+        default=None,
+        ge=1,
+        le=5,
+        description="사용자가 명시적으로 요청한 추천 편수 (1~5). 미지정 시 기본 TOP_K 사용",
+    )
+
 
 # ============================================================
 # 선호 충분성 판정 (Intent-First 아키텍처)
@@ -955,6 +966,14 @@ def merge_preferences(
     merged_genre = _merge_comma_field(prev.genre_preference, curr.genre_preference)
     merged_mood = _merge_comma_field(prev.mood, curr.mood)
 
+    # ── requested_count 병합 (2026-04-24) ──
+    # 사용자가 매 턴마다 원하는 편수를 바꿀 수 있으므로 curr 가 명시적으로 값을 가지면
+    # 덮어쓰고, curr 가 None 이면 prev 를 유지한다. "이 중에서 한 편만" 같은 후속
+    # 요청도 반영되도록 replace 정책.
+    merged_requested_count = (
+        curr.requested_count if curr.requested_count is not None else prev.requested_count
+    )
+
     return ExtractedPreferences(
         genre_preference=merged_genre,
         mood=merged_mood,
@@ -968,4 +987,5 @@ def merge_preferences(
         user_intent=curr.user_intent if curr.user_intent else prev.user_intent,
         dynamic_filters=merged_filters,
         search_keywords=merged_keywords,
+        requested_count=merged_requested_count,
     )

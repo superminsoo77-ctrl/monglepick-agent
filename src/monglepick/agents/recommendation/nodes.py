@@ -1012,12 +1012,21 @@ async def score_finalizer(state: RecommendationEngineState) -> dict:
         hybrid_scores = state.get("hybrid_scores", {})
         watch_history = state.get("watch_history", [])
         mood_tags = state.get("mood_tags", [])
+        preferences = state.get("preferences")
 
         if not candidates:
             return {"ranked_movies": []}
 
-        # diversity_reranker가 이미 TOP_K편을 선택했으므로 그대로 사용
-        selected = candidates[:TOP_K]
+        # ── 사용자 명시 편수 우선 (2026-04-24) ──
+        # "인생영화 한 편만 추천해줘" 같이 ExtractedPreferences.requested_count 가 채워지면
+        # 해당 값으로 최종 편수를 제한한다. 미지정(None) 이면 기본 TOP_K(5).
+        # 유효 범위 [1, TOP_K] 로 clamp — 프롬프트에서 1~5 만 허용하지만 방어적 처리.
+        effective_top_k = TOP_K
+        if preferences is not None and preferences.requested_count is not None:
+            effective_top_k = max(1, min(TOP_K, preferences.requested_count))
+
+        # diversity_reranker가 이미 TOP_K편을 선택했으므로 그 결과에서 effective_top_k 만 slice
+        selected = candidates[:effective_top_k]
 
         # 사용자 선호 장르 추출
         liked_genres = _extract_liked_genres(watch_history, top_k=5)
@@ -1111,8 +1120,12 @@ async def score_finalizer(state: RecommendationEngineState) -> dict:
         elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.error("score_finalizer_error", error=str(e), error_type=type(e).__name__,
                       stack_trace=traceback.format_exc(), elapsed_ms=round(elapsed_ms, 1))
-        # fallback: CandidateMovie를 RankedMovie로 최소 변환
+        # fallback: CandidateMovie를 RankedMovie로 최소 변환 (requested_count 존중)
         candidates = state.get("candidate_movies", [])
+        preferences = state.get("preferences")
+        fallback_top_k = TOP_K
+        if preferences is not None and preferences.requested_count is not None:
+            fallback_top_k = max(1, min(TOP_K, preferences.requested_count))
         ranked = [
             RankedMovie(
                 id=c.id,
@@ -1138,7 +1151,7 @@ async def score_finalizer(state: RecommendationEngineState) -> dict:
                 vote_count=c.vote_count,
                 backdrop_path=c.backdrop_path,
             )
-            for i, c in enumerate(candidates[:TOP_K])
+            for i, c in enumerate(candidates[:fallback_top_k])
         ]
         return {"ranked_movies": ranked}
 

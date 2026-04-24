@@ -79,6 +79,8 @@ def _format_existing_preferences(prefs: ExtractedPreferences | None) -> str:
         parts.append(f"- 시대: {prefs.era}")
     if prefs.exclude:
         parts.append(f"- 제외: {prefs.exclude}")
+    if prefs.requested_count is not None:
+        parts.append(f"- 요청 편수: {prefs.requested_count}편")
 
     if not parts:
         return "(아직 파악된 선호 조건 없음)"

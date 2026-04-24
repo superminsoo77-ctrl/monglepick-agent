@@ -818,3 +818,69 @@ class TestScoreFinalizer:
         }
         result = await score_finalizer(state)
         assert result["ranked_movies"] == []
+
+    @pytest.mark.asyncio
+    async def test_requested_count_one_limits_output(self):
+        """requested_count=1 이면 1편만 반환한다 ('인생영화 한 편만 추천해줘' 시나리오)."""
+        candidates = _make_candidates()  # 5편
+        state: RecommendationEngineState = {
+            "candidate_movies": candidates,
+            "cf_scores": {c.id: 0.5 for c in candidates},
+            "cbf_scores": {c.id: 0.5 for c in candidates},
+            "hybrid_scores": {c.id: 0.5 for c in candidates},
+            "watch_history": [],
+            "mood_tags": [],
+            "preferences": ExtractedPreferences(requested_count=1),
+        }
+        result = await score_finalizer(state)
+        assert len(result["ranked_movies"]) == 1
+        assert result["ranked_movies"][0].rank == 1
+
+    @pytest.mark.asyncio
+    async def test_requested_count_three_limits_output(self):
+        """requested_count=3 이면 3편만 반환한다."""
+        candidates = _make_candidates()
+        state: RecommendationEngineState = {
+            "candidate_movies": candidates,
+            "cf_scores": {c.id: 0.5 for c in candidates},
+            "cbf_scores": {c.id: 0.5 for c in candidates},
+            "hybrid_scores": {c.id: 0.5 for c in candidates},
+            "watch_history": [],
+            "mood_tags": [],
+            "preferences": ExtractedPreferences(requested_count=3),
+        }
+        result = await score_finalizer(state)
+        assert len(result["ranked_movies"]) == 3
+        assert [m.rank for m in result["ranked_movies"]] == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_requested_count_none_uses_default_top_k(self):
+        """requested_count=None 이면 기본 TOP_K(5)편을 반환한다."""
+        candidates = _make_candidates()  # 5편
+        state: RecommendationEngineState = {
+            "candidate_movies": candidates,
+            "cf_scores": {c.id: 0.5 for c in candidates},
+            "cbf_scores": {c.id: 0.5 for c in candidates},
+            "hybrid_scores": {c.id: 0.5 for c in candidates},
+            "watch_history": [],
+            "mood_tags": [],
+            "preferences": ExtractedPreferences(),  # requested_count 미지정
+        }
+        result = await score_finalizer(state)
+        assert len(result["ranked_movies"]) == 5
+
+    @pytest.mark.asyncio
+    async def test_requested_count_without_preferences_uses_default(self):
+        """preferences=None(과거 호환) 이면 기본 TOP_K(5)편을 반환한다."""
+        candidates = _make_candidates()
+        state: RecommendationEngineState = {
+            "candidate_movies": candidates,
+            "cf_scores": {c.id: 0.5 for c in candidates},
+            "cbf_scores": {c.id: 0.5 for c in candidates},
+            "hybrid_scores": {c.id: 0.5 for c in candidates},
+            "watch_history": [],
+            "mood_tags": [],
+            # preferences 키 자체가 없음
+        }
+        result = await score_finalizer(state)
+        assert len(result["ranked_movies"]) == 5

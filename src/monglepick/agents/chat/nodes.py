@@ -2030,9 +2030,15 @@ async def recommendation_ranker(state: ChatAgentState) -> dict:
         if not candidates:
             return {"ranked_movies": []}
 
+        # 사용자 요청 편수(requested_count) 가 있으면 존중, 아니면 기본 5편
+        preferences = state.get("preferences")
+        fallback_top_k = 5
+        if preferences is not None and preferences.requested_count is not None:
+            fallback_top_k = max(1, min(5, preferences.requested_count))
+
         sorted_candidates = sorted(candidates, key=lambda c: c.rrf_score, reverse=True)
         ranked: list[RankedMovie] = []
-        for i, c in enumerate(sorted_candidates[:5]):
+        for i, c in enumerate(sorted_candidates[:fallback_top_k]):
             ranked.append(RankedMovie(
                 id=c.id,
                 title=c.title,

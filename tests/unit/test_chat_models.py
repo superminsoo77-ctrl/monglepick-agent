@@ -209,6 +209,28 @@ class TestMergePreferences:
         assert len(merged.dynamic_filters) == 1
         assert merged.dynamic_filters[0].field == "rating"
 
+    def test_merge_requested_count_curr_overrides(self):
+        """requested_count: curr 값이 명시되면 prev 를 덮어쓴다.
+
+        "이 중에서 한 편만" 같은 후속 요청이 이전 턴의 편수를 교체하도록 하기 위함.
+        """
+        prev = ExtractedPreferences(requested_count=5)
+        curr = ExtractedPreferences(requested_count=1)
+        merged = merge_preferences(prev, curr)
+        assert merged.requested_count == 1
+
+    def test_merge_requested_count_curr_none_preserves_prev(self):
+        """curr.requested_count=None 이면 prev 값을 유지한다."""
+        prev = ExtractedPreferences(requested_count=3)
+        curr = ExtractedPreferences()  # requested_count=None
+        merged = merge_preferences(prev, curr)
+        assert merged.requested_count == 3
+
+    def test_merge_requested_count_both_none(self):
+        """둘 다 None 이면 None 유지 (기본 TOP_K 적용)."""
+        merged = merge_preferences(ExtractedPreferences(), ExtractedPreferences())
+        assert merged.requested_count is None
+
 
 # ============================================================
 # calculate_sufficiency 테스트
