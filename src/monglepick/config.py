@@ -269,6 +269,17 @@ class Settings(BaseSettings):
     # 풀 최대 연결 수 (동시 쿼리 허용 상한)
     MYSQL_POOL_MAX: int = 10
 
+    # ── Support FAQ ES 검색 (support_assistant v3.3) ──
+    # ES BM25 점수 임계값 — HIGH: LLM 호출 없이 즉시 faq 확정
+    # MID 이상 HIGH 미만: Solar 재랭킹 호출
+    # MID 미만: Solar 무매칭 분류 (smalltalk/complaint/out_of_scope)
+    SUPPORT_ES_SCORE_HIGH: float = 12.0
+    SUPPORT_ES_SCORE_MID: float = 4.0
+    # ES 검색 타임아웃 (초). 초과 시 빈 리스트 반환 → Backend HTTP fallback
+    SUPPORT_ES_TIMEOUT_SECONDS: float = 2.0
+    # ES 인덱스명 — Backend 팀과 합의된 값. 절대 임의 변경 금지
+    SUPPORT_FAQ_INDEX_NAME: str = "support_faq"
+
     # ── Redis 커넥션 풀 ──
     # Redis 클라이언트 최대 연결 수
     REDIS_MAX_CONNECTIONS: int = 50
