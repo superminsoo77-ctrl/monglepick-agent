@@ -687,6 +687,12 @@ class ChatAgentState(TypedDict, total=False):
     watch_history: list[dict[str, Any]]
     messages: list[dict[str, str]]
 
+    # ── 음 신호: "관심 없음" 으로 표시된 영화 ID (P2, 2026-04-24) ──
+    # recommendation_impact.dismissed=true 인 영화의 movie_id 만 보관.
+    # query_builder 가 exclude_ids 에 자동 병합 → 다음 추천에서 항상 제외.
+    # CBF 학습에는 사용하지 않음 (명시적 거부 신호이므로 양 가중치 부여 X).
+    dismissed_movie_ids: list[str]
+
     # ── image_analyzer 출력 ──
     image_analysis: ImageAnalysisResult
 
