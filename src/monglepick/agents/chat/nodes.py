@@ -162,6 +162,7 @@ async def context_loader(state: ChatAgentState) -> dict:
             return {
                 "user_profile": state.get("user_profile", {}),
                 "watch_history": state.get("watch_history", []),
+                "dismissed_movie_ids": state.get("dismissed_movie_ids", []),
                 "messages": messages,
                 "turn_count": turn_count,
             }
@@ -169,6 +170,7 @@ async def context_loader(state: ChatAgentState) -> dict:
         # 세션에서 이미 프로필이 로드되어 있으면 MySQL 조회 스킵
         existing_profile = state.get("user_profile", {})
         existing_history = state.get("watch_history", [])
+        existing_dismissed = state.get("dismissed_movie_ids", [])
 
         if existing_profile:
             # 2턴 이후: 세션에서 캐싱된 프로필/시청이력 재사용 → MySQL 0회
@@ -177,6 +179,7 @@ async def context_loader(state: ChatAgentState) -> dict:
                 "context_loaded_from_session",
                 user_id=user_id,
                 history_count=len(existing_history),
+                dismissed_count=len(existing_dismissed),
                 turn_count=turn_count,
                 elapsed_ms=round(elapsed_ms, 1),
                 session_id=session_id,
@@ -184,15 +187,18 @@ async def context_loader(state: ChatAgentState) -> dict:
             return {
                 "user_profile": existing_profile,
                 "watch_history": existing_history,
+                "dismissed_movie_ids": existing_dismissed,
                 "messages": messages,
                 "turn_count": turn_count,
             }
 
         # 첫 턴: MySQL에서 유저 프로필 + 시청 이력 + 암시적 평점 + 행동 프로필 로드
+        # P2 (2026-04-24): "관심없음" 표시된 영화 ID 도 함께 로드 → query_builder exclude_ids
         user_profile: dict[str, Any] = {}
         watch_history: list[dict[str, Any]] = []
         implicit_ratings: dict[str, float] = {}  # Phase 3
         user_behavior_profile: dict[str, Any] = {}  # Phase 4
+        dismissed_movie_ids: list[str] = []  # P2 (2026-04-24): 음 신호
 
         try:
             pool = await get_mysql()
@@ -321,6 +327,29 @@ async def context_loader(state: ChatAgentState) -> dict:
                                     user_behavior_profile[key] = json.loads(val)
                                 except (json.JSONDecodeError, TypeError):
                                     user_behavior_profile[key] = {}
+
+                    # P2 (2026-04-24): "관심없음" 표시된 영화 ID 조회 (recommendation_impact)
+                    # — Client MovieCard "관심 없음" 버튼이 POST /api/v1/recommendations/{id}/dismiss
+                    #   호출 → Backend RecommendationImpact.dismissed=true 갱신
+                    # — 본 SELECT 가 dismissed=true 인 영화를 모두 추출 → query_builder 의
+                    #   exclude_ids 에 자동 병합 → 다음 추천에서 항상 제외 (음 신호)
+                    # — CBF 학습에는 사용하지 않음 (명시적 거부 신호이므로 양 가중치 부여 X)
+                    # — LIMIT 200 — exclude_ids 가 너무 길면 검색 성능 저하 가능하나 200 정도는
+                    #   실사용에서 도달 어려움. 도달 시 가장 최근 dismiss 만 유지
+                    await cursor.execute(
+                        """
+                        SELECT ri.movie_id
+                        FROM recommendation_impact ri
+                        WHERE ri.user_id = %s AND ri.dismissed = true
+                        ORDER BY ri.created_at DESC
+                        LIMIT 200
+                        """,
+                        (user_id,),
+                    )
+                    dismissed_rows = await cursor.fetchall()
+                    dismissed_movie_ids = [
+                        str(row["movie_id"]) for row in dismissed_rows if row.get("movie_id")
+                    ]
         except Exception as db_err:
             # DB 에러 시에도 빈 기본값으로 계속 진행
             logger.warning("context_loader_db_error", error=str(db_err))
@@ -337,6 +366,7 @@ async def context_loader(state: ChatAgentState) -> dict:
             history_count=len(watch_history),
             review_count=review_count,
             watch_only_count=watch_count,
+            dismissed_count=len(dismissed_movie_ids),
             turn_count=turn_count,
             recent_watched=[wh.get("title", "") for wh in watch_history[:5]],
             elapsed_ms=round(elapsed_ms, 1),
@@ -346,6 +376,7 @@ async def context_loader(state: ChatAgentState) -> dict:
         return {
             "user_profile": user_profile,
             "watch_history": watch_history,
+            "dismissed_movie_ids": dismissed_movie_ids,
             "messages": messages,
             "turn_count": turn_count,
             "implicit_ratings": implicit_ratings,
@@ -360,6 +391,7 @@ async def context_loader(state: ChatAgentState) -> dict:
         return {
             "user_profile": {},
             "watch_history": [],
+            "dismissed_movie_ids": [],
             "messages": [{"role": "user", "content": state.get("current_input", "")}],
             "turn_count": 1,
             "error": str(e),
@@ -1046,12 +1078,19 @@ async def query_builder(state: ChatAgentState) -> dict:
             boost_keywords.extend(image_analysis.visual_elements[:3])
 
         # exclude_ids: 시청 이력 영화 ID + 세션 내 최근 추천된 영화 ID (중복 추천 방지)
+        #              + P2 (2026-04-24): "관심없음" 표시한 영화 (recommendation_impact.dismissed)
         exclude_ids = [str(wh.get("movie_id", "")) for wh in watch_history if wh.get("movie_id")]
         # 세션 롤링 윈도우 — "external_" 접두사(DB 에 없음) 는 제외 매칭할 대상이 없으므로 skip
         recent_recommended = state.get("recent_recommended_ids", []) or []
         for rid in recent_recommended:
             sid = str(rid) if rid else ""
             if sid and not sid.startswith("external_") and sid not in exclude_ids:
+                exclude_ids.append(sid)
+        # P2: 사용자가 "관심없음" 으로 표시한 영화 — 영구 제외 (다음 모든 추천에서 차단)
+        dismissed_ids = state.get("dismissed_movie_ids", []) or []
+        for did in dismissed_ids:
+            sid = str(did) if did else ""
+            if sid and sid not in exclude_ids:
                 exclude_ids.append(sid)
 
         search_query = SearchQuery(

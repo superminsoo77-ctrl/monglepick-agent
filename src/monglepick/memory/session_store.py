@@ -277,6 +277,12 @@ async def load_session(user_id: str, session_id: str) -> dict[str, Any] | None:
             str(rid) for rid in recent_recommended_ids_raw if rid
         ]
 
+        # P2 (2026-04-24): "관심없음" 영화 ID — query_builder exclude_ids 병합용 음 신호
+        dismissed_movie_ids_raw = session_state.get("dismissed_movie_ids") or []
+        dismissed_movie_ids: list[str] = [
+            str(mid) for mid in dismissed_movie_ids_raw if mid
+        ]
+
         data: dict[str, Any] = {
             "messages": messages,
             "preferences": preferences,
@@ -284,6 +290,7 @@ async def load_session(user_id: str, session_id: str) -> dict[str, Any] | None:
             "turn_count": raw.get("turnCount", 0),
             "user_profile": session_state.get("user_profile", {}),
             "watch_history": session_state.get("watch_history", []),
+            "dismissed_movie_ids": dismissed_movie_ids,
             "recent_recommended_ids": recent_recommended_ids,
         }
 
@@ -399,6 +406,12 @@ async def save_session(user_id: str, session_id: str, state: dict[str, Any]) -> 
                 item["watched_at"] = item["watched_at"].isoformat()
             serializable_history.append(item)
         session_state["watch_history"] = serializable_history
+
+        # P2 (2026-04-24): dismissed_movie_ids — list[str] 단순 직렬화
+        dismissed_state_ids = state.get("dismissed_movie_ids", []) or []
+        session_state["dismissed_movie_ids"] = [
+            str(mid) for mid in dismissed_state_ids if mid
+        ]
 
         # recent_recommended_ids: 세션 내 최근 추천 영화 ID 롤링 윈도우.
         # query_builder 가 다음 턴 exclude_ids 에 병합해 같은 영화 반복 추천을 방지한다
