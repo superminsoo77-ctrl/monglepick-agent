@@ -657,6 +657,14 @@ class RankedMovie(BaseModel):
         default=None,
         description="recommendation_log PK — 저장 후 채워짐 (Client 피드백 FK)",
     )
+    # 2026-04-27 신규: KOBIS 일별 박스오피스 Top-10 매칭 결과.
+    # True = 현재 국내 극장가에서 상영 중인 영화 (Client 의 "🏢 영화관" 버튼 노출 조건).
+    # KOBIS 가 영화관별 시간표 API 를 제공하지 않아 박스오피스 Top-10 을 "전국 어딘가에서 상영 중"
+    # 의 약한 신호로 사용한다. recommendation_ranker / external_search_node 가 채운다.
+    is_now_showing: bool = Field(
+        default=False,
+        description="현재 KOBIS 일별 박스오피스 Top-10 안에 있는지 여부 (영화관 버튼 노출 트리거)",
+    )
 
 
 # ============================================================

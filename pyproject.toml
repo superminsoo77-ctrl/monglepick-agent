@@ -51,7 +51,10 @@ dependencies = [
     # VM3 Prometheus 가 http://10.20.0.11:8000/metrics 를 15s 간격으로 스크레이프한다.
     "prometheus-fastapi-instrumentator>=7.0.0",
     # ── Web Search (영화 정보 부족 시 외부 검색 보강) ──
-    "duckduckgo-search>=7.0.0",
+    # 2026-04-27: duckduckgo-search 8.x 가 ddgs 로 rename + httpx → primp(Rust) 백엔드 전환.
+    # 기존 duckduckgo-search 는 RuntimeWarning + httpx hang 으로 enrich 단계에서 thread leak →
+    # uvicorn worker 사망 (운영 SSE 끊김 → 클라이언트 리로드 루프) 재현. ddgs 9.x 로 마이그레이션.
+    "ddgs>=9.0.0",
     # ── Utilities ──
     "PyJWT>=2.9.0",
     "python-dotenv>=1.0.0",

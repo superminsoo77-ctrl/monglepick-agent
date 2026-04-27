@@ -72,8 +72,10 @@ from monglepick.metrics import external_map_location_source_total
 from monglepick.rag.hybrid_search import SearchResult, hybrid_search
 from monglepick.utils.movie_info_enricher import (
     enrich_movies_batch,
-    search_external_movies,
+    search_external_movies,  # deprecated: 하위 호환 유지 (다른 경로에서 참조 가능)
 )
+# v2: TMDB Discover + KOBIS 박스오피스 + KMDb 메타데이터 fan-out (2026-04-27)
+from monglepick.tools.external_movie_search import search_external_movies_v2
 
 logger = structlog.get_logger()
 
@@ -1871,21 +1873,26 @@ async def similar_fallback_search(state: ChatAgentState) -> dict:
 @traceable(name="external_search_node", run_type="retriever", metadata={"node": "7.65/17"})
 async def external_search_node(state: ChatAgentState) -> dict:
     """
-    DB 후보 0건 + 최신 시그널 있을 때 DuckDuckGo 로 외부 영화 정보를 검색한다.
+    DB 후보 0건 + 최신 시그널 있을 때 TMDB/KOBIS/KMDb 메타데이터 API 로 외부 영화를 검색한다.
 
-    preferences 에서 dynamic_filters[release_year>=N] 의 하한값을 뽑아
-    search_external_movies() 로 웹 검색하고, 결과를 RankedMovie 스텁으로
-    변환해 ranked_movies 에 직접 담는다. 이후 그래프는 recommendation_ranker /
-    explanation_generator 를 모두 건너뛰고 response_formatter 로 직행한다.
+    2026-04-27 재설계: DuckDuckGo 단일 경로(비영화 페이지 오인 결함) →
+    TMDB Discover + KOBIS 박스오피스 + KMDb 검색 fan-out 으로 전환.
+    search_external_movies_v2() 가 3-소스 병렬 조회 + Wikipedia 보강을 수행한다.
 
-    에러·타임아웃·결과 0 건 모두 ranked_movies=[] 로 graceful degrade 되어
+    preferences 에서 추출한 release_year_gte, genre_preference 를 v2 함수로 전달해
+    "SF 신작", "2026 공포" 같은 장르+연도 복합 질의를 API 레벨에서 처리한다.
+
+    한국어 입력/의도에 "한국/국내" 시그널이 있으면 KOBIS+KMDb 를 우선하고,
+    그 외(글로벌 의도)에는 TMDB Discover 를 우선한다.
+
+    에러·타임아웃·결과 0건 모두 ranked_movies=[] 로 graceful degrade 되어
     response_formatter 의 "조건에 맞는 영화를 찾지 못했어요" 안내가 나온다.
 
     Args:
         state: ChatAgentState (preferences, current_input, session_id)
 
     Returns:
-        dict: ranked_movies (list[RankedMovie] 스텁) 업데이트
+        dict: ranked_movies (list[RankedMovie] 스텁), recent_recommended_ids 업데이트
     """
     node_start = time.perf_counter()
     session_id = state.get("session_id", "")
@@ -1895,11 +1902,15 @@ async def external_search_node(state: ChatAgentState) -> dict:
         preferences: ExtractedPreferences | None = state.get("preferences")
         current_input = state.get("current_input", "")
 
-        # ── 1. release_year 하한값 추출 (dynamic_filters 우선) ──
+        # ── 1. preferences 에서 검색 파라미터 추출 ──
         release_year_gte: int | None = None
         user_intent = ""
+        genres: list[str] = []
+
         if preferences:
             user_intent = preferences.user_intent or ""
+
+            # dynamic_filters 에서 release_year 하한값 추출
             for fc in preferences.dynamic_filters:
                 if fc.field == "release_year" and fc.operator == "gte":
                     try:
@@ -1908,11 +1919,24 @@ async def external_search_node(state: ChatAgentState) -> dict:
                         pass
                     break
 
-        # ── 2. DuckDuckGo 외부 검색 실행 ──
-        external_movies = await search_external_movies(
+            # genre_preference 는 단일 문자열 (예: "SF", "SF/스릴러", "액션 코미디")
+            # → 리스트로 감싸서 v2 함수에 전달 (v2 내부에서 파싱)
+            if preferences.genre_preference:
+                genres = [preferences.genre_preference]
+
+        # ── 2. 한국 영화 포커스 시그널 판정 ──
+        # "한국/국내" 키워드가 입력 또는 의도에 있으면 KOBIS+KMDb 우선
+        _korean_signals = ["한국", "국내", "국산", "한국영화", "k-movie"]
+        _combined_text = (user_intent + " " + current_input).lower().replace(" ", "")
+        is_korean_focus = any(sig in _combined_text for sig in _korean_signals)
+
+        # ── 3. v2 외부 검색 실행 (TMDB Discover + KOBIS + KMDb fan-out) ──
+        external_movies = await search_external_movies_v2(
             user_intent=user_intent,
             current_input=current_input,
             release_year_gte=release_year_gte,
+            genres=genres,
+            is_korean_focus=is_korean_focus,
             max_movies=5,
         )
 
@@ -1921,6 +1945,8 @@ async def external_search_node(state: ChatAgentState) -> dict:
             logger.info(
                 "external_search_no_results",
                 release_year_gte=release_year_gte,
+                genres=genres,
+                is_korean_focus=is_korean_focus,
                 user_intent=user_intent[:80],
                 elapsed_ms=round(elapsed_ms, 1),
                 session_id=session_id,
@@ -1928,35 +1954,39 @@ async def external_search_node(state: ChatAgentState) -> dict:
             )
             return {"ranked_movies": []}
 
-        # ── 3. 외부 영화 스텁 → RankedMovie 변환 ──
+        # ── 4. 외부 영화 dict → RankedMovie 스텁 변환 ──
         # 주의: 내부 DB PK 가 아니므로 recommendation_log 저장 경로는 건너뛴다.
-        # Client 는 id 접두사 "external_" 로 이 카드를 "DB 외 정보" 로 표시해야 한다.
+        # Client 는 id 접두사 "external_" 로 이 카드를 "DB 외 정보" 로 표시한다.
+        # v2 dict 스키마: external_id / title / release_year / overview / poster_url / source / extra
         ranked: list[RankedMovie] = []
         for i, m in enumerate(external_movies):
             overview_text = m.get("overview", "") or ""
-            source_url = m.get("source_url", "") or ""
+            poster_url = m.get("poster_url") or ""   # TMDB: https://image.tmdb.org/... / 그 외 None
 
-            # 출처 URL 을 overview 뒤에 부착해 Client 가 "더 보기" 링크로 활용 가능
-            enriched_overview = overview_text
-            if source_url:
-                enriched_overview = (
-                    f"{overview_text}\n[외부 출처] {source_url}"
-                    if overview_text
-                    else f"[외부 출처] {source_url}"
-                )
+            # 소스별 explanation 문구 차등화
+            source = m.get("source", "tmdb")
+            if source == "kobis":
+                explanation = "박스오피스 정보에서 찾았어요."
+            elif source == "kmdb":
+                explanation = "한국영상자료원에서 찾았어요."
+            else:
+                explanation = "최신 영화 데이터(TMDB)에서 찾았어요."
 
             ranked.append(RankedMovie(
-                id=m.get("id", f"external_{i}"),
+                # external_id 를 그대로 id 로 사용 (예: "external_tmdb_12345")
+                id=m.get("external_id", f"external_{i}"),
                 title=m.get("title", "") or "",
-                title_en="",
-                genres=[],
-                director="",
+                title_en=m.get("original_title", "") or "",
+                genres=m.get("extra", {}).get("genres_kr", []),
+                director=m.get("extra", {}).get("director", ""),
                 cast=[],
-                rating=0.0,
+                rating=float(m.get("extra", {}).get("vote_average", 0.0) or 0.0),
                 release_year=int(m.get("release_year") or 0),
-                overview=enriched_overview,
+                overview=overview_text,
                 mood_tags=[],
-                poster_path="",
+                # poster_path: TMDB 는 전체 URL, KOBIS/KMDb 는 빈 값
+                # RankedMovie.poster_path 는 str (None 불가) 이므로 빈 문자열 fallback
+                poster_path=poster_url if poster_url else "",
                 ott_platforms=[],
                 certification="",
                 trailer_url="",
@@ -1969,26 +1999,36 @@ async def external_search_node(state: ChatAgentState) -> dict:
                     mood_match=0.0,
                     similar_to=[],
                 ),
-                # 고정 문구: response_formatter 의 몽글이 LLM 이 이 설명을 보고
-                # "최신 정보라 DB 에는 없지만 웹에서 찾아왔어요" 풍으로 자연스럽게 변환.
-                explanation="DB 에 없는 최신 영화 정보를 외부 웹에서 찾아왔어요.",
+                explanation=explanation,
                 recommendation_log_id=None,
             ))
+
+        # ── 5. KOBIS now_showing 어노테이션 ──
+        # 외부 검색 결과 중 현재 극장 상영 중인 영화에 is_now_showing=True 태깅
+        # (Client 의 "영화관" 버튼 노출 조건)
+        from monglepick.agents.chat.now_showing_cache import annotate_movies as _annotate_now_showing
+        try:
+            await _annotate_now_showing(ranked)
+        except Exception as ann_err:
+            logger.warning("external_search_now_showing_annotate_failed", error=str(ann_err))
 
         elapsed_ms = (time.perf_counter() - node_start) * 1000
         logger.info(
             "external_search_node_completed",
             release_year_gte=release_year_gte,
+            genres=genres,
+            is_korean_focus=is_korean_focus,
             user_intent=user_intent[:80],
             ranked_count=len(ranked),
             ranked_titles=[m.title for m in ranked],
+            sources=[m.get("source") for m in external_movies],
             elapsed_ms=round(elapsed_ms, 1),
             session_id=session_id,
             user_id=user_id,
         )
-        # 외부 검색도 "추천을 냈다" 로 간주 — 다음 턴 동일 쿼리에서 큐에 있는 external_ ID 는
-        # query_builder 가 skip 하므로 DB 필터에는 영향 없지만, 추후 정책(예: 외부 검색 자체의
-        # 중복 방지 루프) 에서 공용 소스로 활용할 수 있도록 롤링 윈도우에 함께 쌓아둔다.
+
+        # 외부 검색도 "추천을 냈다" 로 간주 — 롤링 윈도우에 ID 누적
+        # (다음 턴 external_ 접두 ID 를 query_builder 가 exclude_ids 에 병합해 중복 방지)
         updated_recent = _append_recent_recommended_ids(
             state.get("recent_recommended_ids"),
             [m.id for m in ranked if m.id],
