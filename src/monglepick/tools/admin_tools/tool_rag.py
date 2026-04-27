@@ -277,7 +277,7 @@ async def search_similar_tools(
     *,
     allowed_tool_names: set[str] | None = None,
     top_k: int = 20,
-    score_threshold: float = 0.30,
+    score_threshold: float = 0.25,
 ) -> list[str]:
     """
     `query` 와 의미적으로 유사한 tool 이름을 top-K 로 반환한다.
@@ -293,7 +293,9 @@ async def search_similar_tools(
         allowed_tool_names: role 매트릭스로 필터된 후보 집합. None 이면 필터 없음.
             **호출측은 항상 `list_tools_for_role(admin_role)` 결과를 넘기는 게 안전.**
         top_k: 후보 상한 (기본 20).
-        score_threshold: cosine 유사도 하한 (기본 0.30).
+        score_threshold: cosine 유사도 하한 (기본 0.25, 2026-04-27 튜닝).
+            짧은 발화("FAQ 추가"/"도움말 추가"/"이용권 등록") 가 0.29 근처에서 모이는 분포가
+            관찰되어 0.30 → 0.25 로 완화. 0.20~0.25 구간은 노이즈 비율이 높아 제외.
 
     Returns:
         score 내림차순 tool 이름 리스트. 권한 없거나 결과가 비면 빈 리스트.
