@@ -913,12 +913,21 @@ async def run_chat_agent(
                                     "needs_purchase": deduct_error_code == "INSUFFICIENT_POINT",
                                 })
 
-                        # ── 추천 로그 배치 저장 (movie_card 발행 직전, 로그인 사용자 한정) ──
-                        # 2026-04-15 신규: 마이픽 추천 내역 + 관리자 AI 추천 분석 둘 다 이 로그를
-                        # DB 원천으로 사용한다. 이전까지는 저장 경로 자체가 없어 양쪽 모두 빈 화면.
-                        # 저장된 recommendation_log_id 를 RankedMovie 에 주입 → SSE movie_card
-                        # payload 에 실려 Client 피드백(관심없음/좋아요) 버튼이 FK 로 사용 가능.
-                        if user_id and ranked_movies:
+                # ── 추천 로그 배치 저장 + movie_card 이벤트 발행 ──
+                # 2026-04-27 fix: 기존엔 recommendation_ranker 완료 시점에 save + emit 했으나,
+                # 그 시점의 ranked_movies 는 explanation 이 아직 비어있어 Backend `recommendation_log.reason`
+                # 컬럼이 항상 " " (whitespace) 로 저장됐다 → 마이픽 추천 내역 페이지에 추천 이유가
+                # 빈 보라색 바로 노출. explanation_generator 가 ranked_movies 를 새 인스턴스로 교체
+                # (model_copy(update={"explanation": clean})) 하므로, 그 직후로 옮겨 반드시 채워진
+                # 설명을 DB 와 클라이언트 양쪽에 전달한다.
+                #
+                # 2026-04-15 배경: 마이픽 추천 내역 + 관리자 AI 추천 분석 모두 이 로그를 DB 원천으로 사용.
+                # 저장된 recommendation_log_id 는 RankedMovie 에 주입 → SSE movie_card payload 에 실려
+                # Client 피드백(관심없음/좋아요) 버튼이 FK 로 사용 가능.
+                if node_name == "explanation_generator":
+                    ranked_movies = updates.get("ranked_movies", [])
+                    if ranked_movies:
+                        if user_id:
                             from monglepick.api.recommendation_client import save_recommendation_logs
                             prefs = final_state.get("preferences")
                             emotion_result = final_state.get("emotion")
@@ -951,7 +960,7 @@ async def run_chat_agent(
                                 if hasattr(movie, "recommendation_log_id"):
                                     movie.recommendation_log_id = lid
 
-                        # movie_card 이벤트 발행
+                        # movie_card 이벤트 발행 (explanation 채워진 상태)
                         for movie in ranked_movies:
                             movie_data = movie.model_dump() if hasattr(movie, "model_dump") else movie
                             yield _format_sse_event("movie_card", movie_data)
