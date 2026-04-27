@@ -38,11 +38,13 @@ logger = structlog.get_logger()
 _MAX_TEXT_LEN = 1500
 _MIN_REVIEW_LEN = 20
 
-_THRESHOLD_HIGH = 0.7   # AUTO_VERIFIED
-_THRESHOLD_LOW = 0.3    # AUTO_REJECTED (미만이면)
+# 임계값은 settings 로 외부화 (2026-04-27 — 운영 튜닝 편의)
+# 환경변수 REVIEW_VERIFICATION_{THRESHOLD_HIGH,THRESHOLD_LOW,LLM_CALL_LOW,LLM_CALL_HIGH} 로 override.
+_THRESHOLD_HIGH = settings.REVIEW_VERIFICATION_THRESHOLD_HIGH   # AUTO_VERIFIED
+_THRESHOLD_LOW = settings.REVIEW_VERIFICATION_THRESHOLD_LOW     # AUTO_REJECTED (미만이면)
 
-_LLM_CALL_LOW = 0.5     # LLM 호출 하한
-_LLM_CALL_HIGH = 0.8    # LLM 호출 상한
+_LLM_CALL_LOW = settings.REVIEW_VERIFICATION_LLM_CALL_LOW       # LLM 호출 하한
+_LLM_CALL_HIGH = settings.REVIEW_VERIFICATION_LLM_CALL_HIGH     # LLM 호출 상한
 
 # 영화 리뷰에서 흔히 등장하지만 내용과 무관한 일반 어휘
 _STOPWORDS: set[str] = {

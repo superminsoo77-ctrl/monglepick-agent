@@ -80,6 +80,17 @@ class Settings(BaseSettings):
     # "api_only": 모든 체인을 Solar API로 처리 (Ollama 장애 시)
     LLM_MODE: str = "local_only"
 
+    # ── 도장깨기 리뷰 검증 에이전트 (Step D, 2026-04-27 외부화) ──
+    # 운영 튜닝 편의를 위해 임계값을 환경변수로 외부화. 기본값은 설계서 §4 동일.
+    # confidence ≥ HIGH → AUTO_VERIFIED (자동 승인)
+    # LOW ≤ confidence < HIGH → NEEDS_REVIEW (관리자 검수 대기)
+    # confidence < LOW → AUTO_REJECTED (자동 반려)
+    REVIEW_VERIFICATION_THRESHOLD_HIGH: float = 0.7
+    REVIEW_VERIFICATION_THRESHOLD_LOW: float = 0.3
+    # confidence_draft 가 이 구간에 들어올 때만 LLM 재검증 호출 (구간 밖은 LLM 0회)
+    REVIEW_VERIFICATION_LLM_CALL_LOW: float = 0.5
+    REVIEW_VERIFICATION_LLM_CALL_HIGH: float = 0.8
+
     # ── Solar API (Upstage, 추론 품질이 중요한 체인) ──
     # OpenAI 호환 API — langchain-openai의 ChatOpenAI로 연동
     # hybrid/api_only 모드에서 의도분류, 감정분석, 선호추출, 추천이유, 이미지분석에 사용
