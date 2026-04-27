@@ -30,6 +30,7 @@ Fallback:
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from typing import Any
 
@@ -352,3 +353,93 @@ async def search_similar_tools(
         top_score=hits[0].score if hits else None,
     )
     return names
+
+
+# ============================================================
+# Step 7b — 하이브리드 후보 빌더 (filter + RAG 머지)
+# ============================================================
+
+def _is_rag_enabled() -> bool:
+    """ADMIN_TOOL_RAG_ENABLED 환경변수 — true/1/yes 외에는 비활성."""
+    return os.getenv("ADMIN_TOOL_RAG_ENABLED", "false").lower() in ("true", "1", "yes")
+
+
+async def build_admin_tool_candidates_async(
+    *,
+    user_message: str,
+    admin_role: str,
+    intent_kind: str,
+    max_tools: int = 30,
+) -> list[str]:
+    """
+    `tool_selector` 노드용 하이브리드 후보 빌더 (Step 7b).
+
+    1) 항상 `tool_filter.shortlist_tools_by_category()` 로 카테고리 + 키워드 후보 산출 (Qdrant 0 의존)
+    2) `ADMIN_TOOL_RAG_ENABLED=true` 면 `search_similar_tools()` 추가 호출 (의미 유사도)
+    3) filter 결과 우선 + RAG 결과 보강 — 중복 제거 + 상한 절단
+
+    이렇게 하면:
+    - **filter 단독**: 항상 빠르고 안정적, intent_kind 가 정확하면 충분.
+    - **RAG 추가**: intent_kind 가 모호하거나 키워드 매칭이 안 될 때(예: \"환불 처리해줘\"
+      → goto_order_refund) 의미 유사도로 보강.
+    - **장애 시 자동 폴백**: RAG 가 빈 리스트 반환해도 filter 결과는 유지된다.
+
+    `nodes.py:tool_selector` 가 이 함수를 호출하도록 교체. 직접 `shortlist_tools_by_category`
+    를 호출하던 코드는 본 함수에 위임.
+
+    Args:
+        user_message: 현재 턴 관리자 발화 원문.
+        admin_role: 정규화된 AdminRoleEnum 값.
+        intent_kind: intent_classifier 가 내려준 kind 문자열 (query/action/stats/...).
+        max_tools: bind_tools 에 실을 최대 tool 이름 수.
+
+    Returns:
+        tool 이름 list (중복 없음, filter 우선 정렬).
+    """
+    # 1) 카테고리 필터 — 의존성 0
+    from monglepick.tools.admin_tools.tool_filter import shortlist_tools_by_category
+
+    filter_names = shortlist_tools_by_category(
+        user_message=user_message,
+        admin_role=admin_role,
+        intent_kind=intent_kind,
+        max_tools=max_tools,
+    )
+
+    # 2) RAG 비활성이면 즉시 반환
+    if not _is_rag_enabled():
+        return filter_names
+
+    # 3) RAG 활성 — role 매트릭스 후보를 allowed_tool_names 로 제한
+    from monglepick.tools.admin_tools import list_tools_for_role
+
+    role_allowed: set[str] = {s.name for s in list_tools_for_role(admin_role)}
+    if not role_allowed:
+        # admin_role 이 비었거나 매트릭스 결과 0 — RAG 도 무의미
+        return filter_names
+
+    rag_names = await search_similar_tools(
+        user_message,
+        allowed_tool_names=role_allowed,
+        top_k=max_tools,
+    )
+
+    # 4) 머지 — filter 우선, RAG 로 보강
+    seen: set[str] = set()
+    merged: list[str] = []
+    for name in filter_names + rag_names:
+        if name not in seen:
+            seen.add(name)
+            merged.append(name)
+
+    truncated = merged[:max_tools]
+    logger.info(
+        "admin_tool_candidates_built",
+        intent_kind=intent_kind,
+        role=admin_role,
+        filter_total=len(filter_names),
+        rag_total=len(rag_names),
+        merged=len(truncated),
+        rag_only_added=len([n for n in rag_names if n not in set(filter_names)]),
+    )
+    return truncated

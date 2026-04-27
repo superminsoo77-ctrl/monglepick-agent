@@ -434,17 +434,18 @@ async def tool_selector(state: AdminAssistantState) -> dict:
     if not admin_role or not user_message.strip():
         return {"pending_tool_call": None}
 
-    # ── Step 7a: Tool 카테고리 필터 — Qdrant 없이 이름 컨벤션 + 키워드로 후보 축소 ──
-    # intent_kind + 이름 컨벤션(stats_*, dashboard_*, *_draft, goto_*) + 도메인 키워드로
-    # 76 tool 을 LLM bind 전에 최대 30 개로 좁힌다. 별도 인프라·임베딩 비용 없음.
-    # ADMIN_TOOL_FILTER_MAX (기본 30) 으로 상한 조정 가능. 카테고리 결과 비면 role 전체 fallback.
+    # ── Step 7a/7b: Tool 후보 빌더 — 카테고리 필터 + (옵션) RAG 의미 유사도 머지 ──
+    # 1) tool_filter.shortlist_tools_by_category — Qdrant 0 의존, 빠른 1차 후보 (intent_kind 기반)
+    # 2) ADMIN_TOOL_RAG_ENABLED=true 면 search_similar_tools 추가 호출 → 의미 유사도 보강
+    # 두 결과를 머지(filter 우선)해 LLM bind 전에 최대 ADMIN_TOOL_FILTER_MAX(기본 30) 개로 절단.
+    # RAG 장애 시 filter 결과만 반환되므로 페일 세이프.
     filter_max: int = int(os.getenv("ADMIN_TOOL_FILTER_MAX", "30"))
 
     allowed_tool_names: list[str] | None = None
     if admin_role:
         try:
-            from monglepick.tools.admin_tools.tool_filter import shortlist_tools_by_category
-            allowed_tool_names = shortlist_tools_by_category(
+            from monglepick.tools.admin_tools.tool_rag import build_admin_tool_candidates_async
+            allowed_tool_names = await build_admin_tool_candidates_async(
                 user_message=user_message,
                 admin_role=admin_role,
                 intent_kind=intent_kind,
@@ -457,7 +458,7 @@ async def tool_selector(state: AdminAssistantState) -> dict:
                 hop_count=hop_count,
             )
         except Exception as filter_err:
-            # 필터 자체가 실패하면 None → select_admin_tool 이 role 기반 전체 bind
+            # 후보 빌더 자체가 실패하면 None → select_admin_tool 이 role 기반 전체 bind
             logger.warning(
                 "admin_tool_filter_failed_fallback_all",
                 error=str(filter_err),

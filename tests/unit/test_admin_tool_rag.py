@@ -27,6 +27,7 @@ from monglepick.tools.admin_tools.tool_rag import (
     _build_embedding_text,
     _classify_tool_kind,
     _tool_name_to_uuid,
+    build_admin_tool_candidates_async,
     ensure_admin_tool_collection,
     search_similar_tools,
     upsert_admin_tool_embeddings,
@@ -420,3 +421,136 @@ class TestSearchSimilarTools:
             result = await search_similar_tools("아무 쿼리")
 
         assert result == ["users_list"]
+
+
+# ============================================================
+# 7) build_admin_tool_candidates_async — Step 7b 하이브리드 머지
+# ============================================================
+
+@pytest.mark.asyncio
+class TestBuildCandidates:
+    """`tool_filter` + (옵션) `tool_rag` 머지 — `tool_selector` 진입점."""
+
+    async def test_rag_disabled_returns_filter_only(self, monkeypatch):
+        """ADMIN_TOOL_RAG_ENABLED 미설정 → filter 결과만 반환, RAG 미호출."""
+        monkeypatch.delenv("ADMIN_TOOL_RAG_ENABLED", raising=False)
+
+        with (
+            patch(
+                "monglepick.tools.admin_tools.tool_filter.shortlist_tools_by_category",
+                return_value=["users_list", "user_detail"],
+            ) as mock_filter,
+            patch(
+                "monglepick.tools.admin_tools.tool_rag.search_similar_tools",
+                new=AsyncMock(return_value=["should_not_appear"]),
+            ) as mock_rag,
+        ):
+            result = await build_admin_tool_candidates_async(
+                user_message="사용자 목록",
+                admin_role="ADMIN",
+                intent_kind="query",
+                max_tools=30,
+            )
+
+        assert result == ["users_list", "user_detail"]
+        mock_filter.assert_called_once()
+        mock_rag.assert_not_called()
+
+    async def test_rag_enabled_merges_with_dedup(self, monkeypatch):
+        """RAG 활성 → filter 우선 + RAG 보강 + 중복 제거 + 상한 절단."""
+        monkeypatch.setenv("ADMIN_TOOL_RAG_ENABLED", "true")
+
+        with (
+            patch(
+                "monglepick.tools.admin_tools.tool_filter.shortlist_tools_by_category",
+                return_value=["users_list", "user_detail"],
+            ),
+            patch(
+                "monglepick.tools.admin_tools.tool_rag.search_similar_tools",
+                new=AsyncMock(return_value=["users_list", "goto_user_suspend", "user_activity"]),
+            ),
+        ):
+            result = await build_admin_tool_candidates_async(
+                user_message="사용자 정지 처리",
+                admin_role="ADMIN",
+                intent_kind="action",
+                max_tools=30,
+            )
+
+        # filter 결과가 앞, RAG-only 가 뒤. users_list 중복 제거.
+        assert result == ["users_list", "user_detail", "goto_user_suspend", "user_activity"]
+
+    async def test_rag_enabled_max_tools_truncates(self, monkeypatch):
+        """RAG 머지 후 max_tools 로 절단."""
+        monkeypatch.setenv("ADMIN_TOOL_RAG_ENABLED", "true")
+
+        with (
+            patch(
+                "monglepick.tools.admin_tools.tool_filter.shortlist_tools_by_category",
+                return_value=["a", "b"],
+            ),
+            patch(
+                "monglepick.tools.admin_tools.tool_rag.search_similar_tools",
+                new=AsyncMock(return_value=["c", "d", "e", "f"]),
+            ),
+        ):
+            result = await build_admin_tool_candidates_async(
+                user_message="아무 쿼리",
+                admin_role="ADMIN",
+                intent_kind="query",
+                max_tools=3,
+            )
+
+        # 머지 ["a","b","c","d","e","f"] → 상한 3 절단
+        assert result == ["a", "b", "c"]
+
+    async def test_rag_enabled_failure_keeps_filter(self, monkeypatch):
+        """RAG 가 빈 리스트(장애/없음) 반환해도 filter 결과 보존."""
+        monkeypatch.setenv("ADMIN_TOOL_RAG_ENABLED", "1")
+
+        with (
+            patch(
+                "monglepick.tools.admin_tools.tool_filter.shortlist_tools_by_category",
+                return_value=["users_list", "user_detail"],
+            ),
+            patch(
+                "monglepick.tools.admin_tools.tool_rag.search_similar_tools",
+                new=AsyncMock(return_value=[]),  # Qdrant/Upstage 장애 시뮬레이션
+            ),
+        ):
+            result = await build_admin_tool_candidates_async(
+                user_message="아무 쿼리",
+                admin_role="ADMIN",
+                intent_kind="query",
+                max_tools=30,
+            )
+
+        assert result == ["users_list", "user_detail"]
+
+    async def test_empty_role_skips_rag(self, monkeypatch):
+        """admin_role 매트릭스 결과가 0 이면 RAG 건너뛰고 filter 그대로 반환."""
+        monkeypatch.setenv("ADMIN_TOOL_RAG_ENABLED", "true")
+
+        with (
+            patch(
+                "monglepick.tools.admin_tools.tool_filter.shortlist_tools_by_category",
+                return_value=[],
+            ),
+            patch(
+                "monglepick.tools.admin_tools.list_tools_for_role",
+                return_value=[],
+            ),
+            patch(
+                "monglepick.tools.admin_tools.tool_rag.search_similar_tools",
+                new=AsyncMock(return_value=["x"]),
+            ) as mock_rag,
+        ):
+            result = await build_admin_tool_candidates_async(
+                user_message="아무 쿼리",
+                admin_role="",  # 권한 없음 가정
+                intent_kind="query",
+                max_tools=30,
+            )
+
+        assert result == []
+        mock_rag.assert_not_called()
