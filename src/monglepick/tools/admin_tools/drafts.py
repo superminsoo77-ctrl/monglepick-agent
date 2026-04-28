@@ -438,7 +438,11 @@ async def _handle_quiz_draft(
         "explanation": explanation,
     }
     data = {
-        "target_path": "/admin/ai?tab=quiz&modal=create",
+        # 2026-04-27 정정: quiz CRUD 는 ContentEventsPage 의 quiz 탭이 담당
+        # (`features/contentEvents/components/QuizManagementTab.jsx`).
+        # AiOpsPage 에는 quiz 탭이 없어 기존 `/admin/ai?tab=quiz` 로 이동 시
+        # 첫 탭(trigger) 으로 폴백되어 모달이 열리지 않던 결함 수정.
+        "target_path": "/admin/content-events?tab=quiz&modal=create",
         "draft_fields": draft_fields,
         "action_label": "퀴즈 작성 화면 열기",
         "summary": f"퀴즈 초안 '{question}'을 준비했어요. 정답 확인 후 저장해주세요.",
@@ -538,7 +542,10 @@ async def _handle_worldcup_candidate_draft(
         "tier": tier,
     }
     data = {
-        "target_path": "/admin/content-events?tab=worldcup&modal=create",
+        # 2026-04-27 정정: ContentEventsPage SUB_TABS 의 실제 key 가
+        # `worldcup_candidate` (snake_case 풀네임). 기존 `tab=worldcup` 으로 이동 시
+        # 첫 탭(roadmap_course) 으로 폴백되던 결함 수정.
+        "target_path": "/admin/content-events?tab=worldcup_candidate&modal=create",
         "draft_fields": draft_fields,
         "action_label": "월드컵 후보 추가 화면 열기",
         "summary": f"이상형 월드컵 후보(영화 ID: {movieId}) 초안을 준비했어요. 검토 후 저장해주세요.",

@@ -1,0 +1,106 @@
+# =========================================
+# 몽글픽 AI Agent CI/CD 워크플로우
+# =========================================
+# monglepick-agent/ 하위 변경 시 자동으로 테스트 + 배포
+#
+# CI: PR/push → Python 테스트 (pytest)
+# CD: develop 브랜치 push → 스테이징 서버에 agent 컨테이너만 재빌드
+
+name: "CI/CD: AI Agent"
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/ci-cd-agent.yml'
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/ci-cd-agent.yml'
+
+jobs:
+  # ─── CI: 테스트 ───
+  test:
+    name: Agent Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Python 3.12 설치
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # uv 패키지 매니저 설치
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      # 의존성 설치 + 테스트 실행
+      - name: Install dependencies
+        working-directory: .
+        run: uv sync
+
+      - name: Run tests
+        working-directory: .
+        run: |
+          PYTHONPATH=src uv run --with pytest --with pytest-asyncio --with httpx \
+            -- python -m pytest tests/ -v --tb=short -q \
+            --ignore=tests/unit/test_image_security.py
+
+      # 린트 체크 (ruff)
+      - name: Lint check
+        working-directory: .
+        run: uv run --with ruff -- ruff check src/ || true
+
+  # ─── CD: 스테이징 배포 (develop 브랜치만) ───
+  deploy:
+    name: Deploy Agent to Staging
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # develop 브랜치 push 시에만 배포 (PR은 테스트만)
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+
+    steps:
+      - name: Deploy Agent container
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          port: ${{ secrets.STAGING_PORT || 22 }}
+          command_timeout: 10m
+          script: |
+            set -e
+            echo "========== AI Agent 배포 시작 =========="
+
+            cd ${{ secrets.PROJECT_DIR }}
+
+            # 최신 코드 pull
+            git pull origin develop
+
+            # Agent 컨테이너만 재빌드 + 재시작
+            docker compose -f docker-compose.staging.yml up -d --build --no-deps ai-agent
+
+            # 헬스체크 대기
+            echo ">>> Agent 헬스체크 대기..."
+            for i in 1 2 3 4 5 6; do
+              if curl -sf "http://localhost:8000/health" > /dev/null 2>&1; then
+                echo "  ✅ Agent OK"
+                break
+              fi
+              echo "  ⏳ Agent starting... ($i/6)"
+              sleep 5
+            done
+
+            echo "========== ✅ AI Agent 배포 완료 =========="

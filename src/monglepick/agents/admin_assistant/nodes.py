@@ -50,6 +50,7 @@ from monglepick.llm.factory import (
 )
 from monglepick.prompts.admin_assistant import (
     NARRATOR_HUMAN_PROMPT,
+    NARRATOR_REPORT_HUMAN_PROMPT,
     NARRATOR_SYSTEM_PROMPT,
     SMALLTALK_SYSTEM_PROMPT,
     SMART_FALLBACK_HUMAN_PROMPT,
@@ -195,9 +196,12 @@ _PLACEHOLDER_MESSAGES: dict[str, str] = {
         "요청하신 통계에 적합한 도구를 찾지 못했어요. "
         "다음 Step 에서 더 많은 통계 도구(추천 성능·포인트 경제·참여도 등) 가 추가됩니다."
     ),
+    # Phase 4 (2026-04-27): report 도 tool_selector 경로를 경유하도록 변경됐다.
+    # 따라서 이 메시지는 정상 흐름에서는 호출되지 않으며, route_after_intent 가
+    # 변경되기 전 thread 가 남아있는 등의 예외 상황 fallback 용으로만 보존한다.
     "report": (
-        "🛠️ 보고서 생성은 Phase 4 예정 기능이에요. "
-        "지금은 통계 조회가 연결된 후 주간/월간 템플릿으로 확장됩니다."
+        "보고서 요청을 처리하지 못했어요. "
+        "잠시 후 다시 시도해 주시거나, '~ 통계 보여줘' 같은 표현으로 바꿔 말씀해 주세요."
     ),
     "sql": (
         "이 에이전트는 자유 SQL 실행을 지원하지 않아요. "
@@ -665,15 +669,102 @@ async def narrator(state: AdminAssistantState) -> dict:
     - 축약본은 summarize_for_llm 으로 생성 — raw rows 가 LLM 컨텍스트에 들어가지 않음 (§6.1).
     - 수치 생성 금지 규칙은 프롬프트로 강제.
     - LLM 실패 시 "조회는 됐지만 해석이 실패했다" 로 안내 + tool 원시값을 축약해 인용.
+
+    Phase 4 (2026-04-27): intent.kind == "report" 인 경우 분기.
+      - tool_call_history + tool_results_cache 의 누적된 모든 read 결과를 묶어
+        NARRATOR_REPORT_HUMAN_PROMPT 로 종합 요약을 작성한다.
+      - 단일 tool 응답 대비 6~10문장의 섹션 구조화 답변. 출처는 콤마로 모두 나열.
     """
     ref_id = state.get("latest_tool_ref_id", "") or ""
     cache = state.get("tool_results_cache", {}) or {}
     call = ensure_tool_call(state.get("pending_tool_call"))
+    intent = ensure_intent(state.get("intent"))
+    is_report = intent is not None and intent.kind == "report"
 
     if not ref_id or ref_id not in cache:
         # tool_selector 가 None 을 낸 경우 — response_formatter 에서 placeholder 처리
         return {}
 
+    # ── Phase 4: report 종합 모드 ──
+    # tool_call_history 와 tool_results_cache 의 1:1 매칭으로 모든 read 결과를 묶어
+    # 단일 LLM 호출에 종합 컨텍스트를 넘긴다. cache 의 dict insertion order 가
+    # observation 노드에서의 append 순서와 동일하므로 시간순으로 정렬됨이 보장된다.
+    # (Python 3.7+ dict 보존 순서 보장 — 본 프로젝트는 3.12)
+    if is_report:
+        history_calls = list(state.get("tool_call_history") or [])
+        cache_items = list(cache.items())  # [(ref_id, AdminApiResult|dict), ...]
+
+        # 길이 mismatch 방어 — 짧은 쪽 기준으로 zip
+        pair_count = min(len(history_calls), len(cache_items))
+        if pair_count == 0:
+            # 비정상 상태(report 인데 누적 hop 없음) → 단건 폴백 경로로 흘러가도록 is_report 끔
+            is_report = False
+
+        if is_report:
+            tool_call_summary_lines: list[str] = []
+            combined_results: list[dict] = []
+            tool_name_set: list[str] = []
+            for idx in range(pair_count):
+                hcall = ensure_tool_call(history_calls[idx])
+                _, hresult = cache_items[idx]
+                hname = hcall.tool_name if hcall else "(unknown)"
+                hargs = json.dumps(hcall.arguments, ensure_ascii=False) if hcall else "{}"
+                tool_call_summary_lines.append(f"{idx + 1}. {hname} args={hargs}")
+                if hname not in tool_name_set:
+                    tool_name_set.append(hname)
+                if isinstance(hresult, AdminApiResult):
+                    summarized_one = summarize_for_llm(hresult)
+                elif isinstance(hresult, dict):
+                    summarized_one = hresult
+                else:
+                    summarized_one = {
+                        "ok": False,
+                        "error": f"unexpected_result_type:{type(hresult).__name__}",
+                    }
+                combined_results.append({"tool_name": hname, "result": summarized_one})
+
+            tool_call_summaries = "\n".join(tool_call_summary_lines)
+            tool_results_combined_json = json.dumps(
+                combined_results, ensure_ascii=False, default=str,
+            )
+
+            start = time.perf_counter()
+            try:
+                llm = get_solar_api_llm(temperature=0.2)
+                system = SystemMessage(content=NARRATOR_SYSTEM_PROMPT)
+                human = HumanMessage(content=NARRATOR_REPORT_HUMAN_PROMPT.format(
+                    user_message=state.get("user_message", ""),
+                    tool_call_summaries=tool_call_summaries,
+                    tool_results_combined_json=tool_results_combined_json,
+                ))
+                response = await guarded_ainvoke(
+                    llm, [system, human],
+                    model="solar_api",
+                    request_id=f"admin_narrator_report:{ref_id}",
+                )
+                raw_text = getattr(response, "content", None) or str(response)
+                text = _sanitize_narrator_output(raw_text)
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                logger.info(
+                    "admin_narrator_report_generated",
+                    tool_count=pair_count,
+                    tool_names=tool_name_set,
+                    raw_length=len(raw_text),
+                    sanitized_length=len(text),
+                    elapsed_ms=round(elapsed_ms, 1),
+                )
+                return {"response_text": text}
+            except Exception as e:
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                logger.warning(
+                    "admin_narrator_report_failed_fallback_single",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    elapsed_ms=round(elapsed_ms, 1),
+                )
+                # 종합 모드 실패 시 단건 narrator 경로로 폴백 — 사용자에게 빈 응답 안 가도록.
+
+    # ── 단건 모드 (기존 흐름) ──
     result = cache[ref_id]
     # result 는 AdminApiResult 인스턴스 또는 dict (테스트용). 둘 다 허용.
     if isinstance(result, AdminApiResult):

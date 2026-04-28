@@ -113,9 +113,12 @@ def route_after_intent(state: AdminAssistantState) -> str:
     # Step 2: stats → tool_selector
     # Step 4(2026-04-23): query 도 tool_selector.
     # Step 5a(2026-04-23): action 도 tool_selector — HITL(risk_gate) 게이트가 있어 안전.
-    if kind in ("stats", "query", "action"):
+    # Phase 4(2026-04-27): report 도 tool_selector. 여러 read tool 을 ReAct 루프로 묶어
+    #   종합 요약(narrator) + 표(table_data) + 화면 이동(navigation) 으로 답한다.
+    #   기존 "Phase 4 예정" placeholder 응답 제거.
+    if kind in ("stats", "query", "action", "report"):
         return "tool_selector"
-    # report/sql 은 여전히 placeholder (report=Phase 4 / sql=영구 미지원)
+    # sql 만 영구 미지원 placeholder.
     return "response_formatter"
 
 
@@ -474,6 +477,448 @@ def state_snapshot_tool_call(merged_state: dict) -> ToolCall | None:
 
 
 # ============================================================
+# Phase 4 (2026-04-27) — table_data SSE 빌더
+# ============================================================
+# 행 갯수가 일정 임계치 이상인 read 결과는 narrator 자연어 외에 **표** 로도 보여준다.
+# Client 의 TableDataCard 가 이 payload 를 카드 형태로 렌더하고, navigate_path 가 있으면
+# "전체 보기" 버튼으로 해당 관리 페이지로 이동시킨다.
+
+# 발행 임계치 — row_count 가 이 값 이상일 때만 table_data 발행 (소량은 narrator 자연어로 충분).
+_TABLE_DATA_MIN_ROWS = 3
+# 카드에 표시할 최대 행 수 (Client 카드의 시각적 부담 + payload 크기 균형).
+_TABLE_DATA_SAMPLE_ROWS = 10
+# 카드에 표시할 최대 컬럼 수 (가로 스크롤 회피 + payload 크기 균형).
+_TABLE_DATA_MAX_COLS = 6
+# 셀 내 문자열 최대 길이 — 긴 본문은 잘라 줄바꿈 방지.
+_TABLE_DATA_MAX_CELL_LEN = 80
+
+# tool 이름 → "전체 보기" 이동 경로 매핑. read tool 만 등록.
+# Page 응답을 돌려주는 list 류 tool 위주. 매핑 없는 tool 은 "전체 보기" 버튼 미렌더.
+#
+# **2026-04-27 (Phase 4 후속) 매핑 정합성 정정:**
+# Admin Client 의 실제 tab id 와 어긋나 있던 매핑 10건을 페이지 진실 원본에 맞춰 수정.
+# (검증 출처: SettingsPage TABS=[terms/banners/admins], AiOpsPage TABS=[trigger/history/
+# chatlog/review-verify/chat-suggestions], PaymentPage TABS=[orders/orders_sub/orders_point/
+# subscription/point/items/point_pack/reward_policy], SupportPage TABS=[notice/faq/help/
+# ticket], ContentEventsPage SUB_TABS=[roadmap_course/quiz/worldcup_candidate/ocr_event],
+# BoardPage TABS=[moderation/reports/toxicity/posts/reviews/categories])
+#
+# 변경 요약:
+#   subscriptions_list  : tab=subscriptions   → tab=subscription (no s)
+#   point_histories     : tab=point-history   → tab=point
+#   point_items         : tab=point-items     → tab=items
+#   tickets_list        : tab=tickets         → tab=ticket (no s)
+#   quizzes_list        : /admin/ai?tab=quiz  → /admin/content-events?tab=quiz (위치 자체 이동)
+#   review_verifications_list : tab=review-verifications → tab=review-verify
+#   chatbot_sessions_list     : tab=chatbot-sessions     → tab=chatlog
+#   banners_list        : /admin/content-events?tab=banner → /admin/settings?tab=banners
+#   chat_suggestions_list : /admin/settings?tab=chat-sugg → /admin/ai?tab=chat-suggestions
+#   audit_logs_list     : /admin/settings?tab=audit → 매핑 제거 (audit 탭 없음. None 으로 fallback)
+_TABLE_NAVIGATE_PATHS: dict[str, str] = {
+    # 콘텐츠 모더레이션 (BoardPage)
+    "reports_list": "/admin/board?tab=reports",
+    "toxicity_list": "/admin/board?tab=toxicity",
+    "posts_list": "/admin/board?tab=posts",
+    "reviews_list": "/admin/board?tab=reviews",
+    # 사용자 (UsersPage — base path 진입 시 기본 탭=list)
+    "users_list": "/admin/users",
+    # 결제 (PaymentPage — tab id 가 단수 형태)
+    "orders_list": "/admin/payment?tab=orders",
+    "subscriptions_list": "/admin/payment?tab=subscription",
+    "point_histories": "/admin/payment?tab=point",
+    "point_items": "/admin/payment?tab=items",
+    # 고객센터 (SupportPage — ticket 단수)
+    "tickets_list": "/admin/support?tab=ticket",
+    "faqs_list": "/admin/support?tab=faq",
+    "help_articles_list": "/admin/support?tab=help",
+    "notices_list": "/admin/support?tab=notice",
+    # AI 운영 (AiOpsPage / ContentEventsPage 분산)
+    # quiz 는 ContentEventsPage 소속이라 다른 페이지로 이동.
+    "quizzes_list": "/admin/content-events?tab=quiz",
+    "review_verifications_list": "/admin/ai?tab=review-verify",
+    "chatbot_sessions_list": "/admin/ai?tab=chatlog",
+    # 설정/감사 (SettingsPage)
+    # audit_logs_list 는 settings 에 audit 탭이 없어 매핑 제거. navigate_path=None 폴백
+    # → TableDataCard 가 "전체 보기" 버튼을 미렌더 (혼란 방지).
+    "admins_list": "/admin/settings?tab=admins",
+    "terms_list": "/admin/settings?tab=terms",
+    # banner CRUD 는 SettingsPage 의 banners 탭이 담당 (BannerTab.jsx 위치도 settings 산하).
+    "banners_list": "/admin/settings?tab=banners",
+    # chat_suggestions 는 AiOpsPage 의 chat-suggestions 탭 (ChatSuggestionTab.jsx 위치 ai 산하).
+    "chat_suggestions_list": "/admin/ai?tab=chat-suggestions",
+}
+
+
+def _coerce_cell_value(value: Any) -> Any:
+    """
+    표 셀에 들어갈 단일 값을 직렬화 가능한 형태로 정규화한다.
+
+    - 스칼라(str/int/float/bool/None)는 그대로 유지하되 너무 긴 문자열은 자른다.
+    - dict/list 는 짧은 JSON 문자열로 직렬화 후 자른다 (객체 미리보기용).
+    - 그 외(객체)는 str() 캐스트 후 자른다.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        if len(value) > _TABLE_DATA_MAX_CELL_LEN:
+            return value[:_TABLE_DATA_MAX_CELL_LEN] + "…"
+        return value
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        encoded = str(value)
+    if len(encoded) > _TABLE_DATA_MAX_CELL_LEN:
+        return encoded[:_TABLE_DATA_MAX_CELL_LEN] + "…"
+    return encoded
+
+
+# ============================================================
+# Phase 4 후속 (2026-04-28) — chart_data SSE 빌더
+# ============================================================
+# 시계열 통계 tool 의 결과를 차트로 렌더하기 위한 chart_data SSE payload 빌더.
+# table_data 와 동시에 발행 가능 (보고서 본문 + 차트 + 표 3종 병행).
+#
+# 발행 전제:
+# - tool 이름이 _CHART_TOOL_SPECS 에 등록되어 있을 것 (whitelisted).
+# - 응답 data 가 dict 이고 명시된 data_key 안에 list[dict] 가 있을 것.
+# - 시계열 list 가 _CHART_DATA_MIN_POINTS 이상 (작은 시계열은 narrator 본문으로 충분).
+#
+# 매핑 외 tool 은 자동 스킵 (None 반환). table_data 와 달리 chart 는 필드 의미 추론이
+# 어려워 보수적으로 등록된 시계열만 처리한다.
+
+# 발행 임계치 — 시계열 데이터포인트 수가 이 값 이상일 때만 차트 발행.
+_CHART_DATA_MIN_POINTS = 3
+# 차트 카드에 표시할 최대 데이터포인트 수 (페이로드 크기 + 시각적 부담).
+_CHART_DATA_MAX_POINTS = 90
+
+#: tool 이름 → 차트 메타. 키:
+#:   - data_key      : 시계열 list 가 들어있는 응답 dict 키 (예: "trends", "dailyRevenue").
+#:                     단계적 접근(`data["trends"]`, `data["a"]["b"]`) 은 미지원 (단일 키).
+#:   - x_key         : 데이터포인트 dict 에서 X축 라벨로 쓸 키 (예: "date").
+#:   - series        : [(label, key), ...] — 차트에 그릴 시리즈 정의. label 은 한국어 표시명,
+#:                     key 는 데이터포인트 dict 의 숫자 필드 이름.
+#:   - title         : 카드 헤더 라벨.
+#:   - chart_type    : "line" | "bar" — Client recharts 컴포넌트 분기 힌트.
+#:   - unit          : (선택) Y축 값 단위 — Client tooltip 표시 ("명", "원", "회" 등).
+#:   - navigate_path : (선택) "전체 화면에서 보기" 버튼 경로 (Admin Client 통계 탭).
+_CHART_TOOL_SPECS: dict[str, dict] = {
+    # 통계 - 일별 추이 (DAU/신규/리뷰/게시글 4시리즈)
+    "stats_trends": {
+        "data_key": "trends",
+        "x_key": "date",
+        "series": [
+            ("DAU", "dau"),
+            ("신규 가입", "newUsers"),
+            ("리뷰", "reviews"),
+            ("게시글", "posts"),
+        ],
+        "title": "일별 추이",
+        "chart_type": "line",
+        "unit": "건",
+        "navigate_path": "/admin/stats?tab=overview",
+    },
+    # 대시보드 - 일별 추이 (신규 가입/결제액/AI 채팅 3시리즈, 결제액 단위 다름 주의)
+    "dashboard_trends": {
+        "data_key": "trends",
+        "x_key": "date",
+        "series": [
+            ("신규 가입", "newUsers"),
+            ("결제액(원)", "paymentAmount"),
+            ("AI 채팅 요청", "chatRequests"),
+        ],
+        "title": "대시보드 일별 추이",
+        "chart_type": "line",
+        "unit": "혼합",
+        "navigate_path": "/admin/dashboard",
+    },
+    # 매출 - 일별 매출 (단일 시리즈)
+    "stats_revenue": {
+        "data_key": "dailyRevenue",
+        "x_key": "date",
+        "series": [
+            ("매출", "amount"),
+        ],
+        "title": "일별 매출 추이",
+        "chart_type": "bar",
+        "unit": "원",
+        "navigate_path": "/admin/stats?tab=revenue",
+    },
+    # 2026-04-28 후속 — 분포 시각화 추가 (pie / bar 확장):
+    # 구독 플랜 분포 — pie 차트. SubscriptionStatsResponse.plans 의 PlanDistribution 4종.
+    # x_key 는 슬라이스 라벨(planName), 단일 series 의 key 는 슬라이스 값(count).
+    # _build_chart_payload 가 동일 schema 로 처리해 ChartDataCard 의 chart_type 분기로 렌더.
+    "stats_subscription": {
+        "data_key": "plans",
+        "x_key": "planName",
+        "series": [
+            ("활성 구독", "count"),
+        ],
+        "title": "구독 플랜별 분포",
+        "chart_type": "pie",
+        "unit": "건",
+        "navigate_path": "/admin/payment?tab=subscription",
+    },
+    # 인기 검색어 Top-N — bar 차트. KeywordItem 의 keyword/searchCount.
+    # 분포보다 랭킹 시각화가 직관적이라 bar 로 처리. limit 인자(default 20) 결과 그대로 사용.
+    "stats_search_popular": {
+        "data_key": "keywords",
+        "x_key": "keyword",
+        "series": [
+            ("검색 수", "searchCount"),
+        ],
+        "title": "인기 검색어 Top",
+        "chart_type": "bar",
+        "unit": "회",
+        "navigate_path": "/admin/stats?tab=search",
+    },
+    # 2026-04-28 후속2 — 분포 도구 3종 pie 차트 매핑:
+    # 추천 장르 분포 — DistributionResponse{genres: [{genre, count, percentage}]}.
+    # 한국어 장르명(genre) 을 슬라이스 라벨, 추천 건수(count) 를 값으로.
+    "stats_recommendation_distribution": {
+        "data_key": "genres",
+        "x_key": "genre",
+        "series": [
+            ("추천 건수", "count"),
+        ],
+        "title": "추천 장르 분포",
+        "chart_type": "pie",
+        "unit": "건",
+        "navigate_path": "/admin/stats?tab=recommendation",
+    },
+    # 포인트 유형별 분포 — PointTypeDistributionResponse{distribution: [{pointType, label, count, totalAmount, percentage}]}.
+    # 한국어 라벨(label, 예: "활동 리워드", "AI 추천 사용") 을 슬라이스 라벨로 사용 — pointType
+    # 코드(earn/spend 등) 는 운영자 친화도 낮음. 값은 거래 건수(count).
+    "stats_point_distribution": {
+        "data_key": "distribution",
+        "x_key": "label",
+        "series": [
+            ("거래 건수", "count"),
+        ],
+        "title": "포인트 유형별 분포",
+        "chart_type": "pie",
+        "unit": "건",
+        "navigate_path": "/admin/stats?tab=point-economy",
+    },
+    # 등급별 사용자 분포 — GradeDistributionResponse{grades: [{gradeCode, gradeName, count, percentage}]}.
+    # 한국어 등급명(gradeName, 예: "팝콘", "다이아몬드") 을 슬라이스 라벨, 사용자 수(count) 를 값으로.
+    "stats_grade_distribution": {
+        "data_key": "grades",
+        "x_key": "gradeName",
+        "series": [
+            ("사용자 수", "count"),
+        ],
+        "title": "등급별 사용자 분포",
+        "chart_type": "pie",
+        "unit": "명",
+        "navigate_path": "/admin/stats?tab=point-economy",
+    },
+    # 2026-04-28 후속2 (시계열 line 추가) — 일별 추이 3종.
+    # 포인트 발행/소비/순유입 — PointTrendsResponse.trends[{date, issued, spent, netFlow}].
+    # netFlow 가 음수일 수 있어 단위 "P" 표기 (Client tooltip 에서 표시).
+    "stats_point_trends": {
+        "data_key": "trends",
+        "x_key": "date",
+        "series": [
+            ("발행", "issued"),
+            ("소비", "spent"),
+            ("순유입", "netFlow"),
+        ],
+        "title": "일별 포인트 흐름",
+        "chart_type": "line",
+        "unit": "P",
+        "navigate_path": "/admin/stats?tab=point-economy",
+    },
+    # AI 세션/턴 추이 — AiSessionTrendsResponse.trends[{date, sessions, turns}].
+    "stats_ai_session_trends": {
+        "data_key": "trends",
+        "x_key": "date",
+        "series": [
+            ("세션", "sessions"),
+            ("턴 수", "turns"),
+        ],
+        "title": "AI 세션·턴 추이",
+        "chart_type": "line",
+        "unit": "건",
+        "navigate_path": "/admin/stats?tab=ai-service",
+    },
+    # 커뮤니티 게시글/댓글/신고 추이 — CommunityTrendsResponse.trends[{date, posts, comments, reports}].
+    # reports 시리즈가 다른 두 시리즈와 스케일이 차이 날 수 있지만 차트 자체는 정상 렌더.
+    "stats_community_trends": {
+        "data_key": "trends",
+        "x_key": "date",
+        "series": [
+            ("게시글", "posts"),
+            ("댓글", "comments"),
+            ("신고", "reports"),
+        ],
+        "title": "커뮤니티 일별 추이",
+        "chart_type": "line",
+        "unit": "건",
+        "navigate_path": "/admin/stats?tab=community",
+    },
+}
+
+
+def _build_chart_payload(tool_name: str, result: AdminApiResult) -> dict | None:
+    """
+    AdminApiResult 의 등록된 시계열 응답에서 SSE chart_data payload 를 빌드한다.
+
+    반환 None 의 경우:
+    - tool 이 _CHART_TOOL_SPECS 에 없음 (whitelisted only)
+    - ok=False
+    - data 가 dict 가 아니거나 data_key 위치에 list 가 없음
+    - 데이터포인트 수가 _CHART_DATA_MIN_POINTS 미만
+    - 첫 데이터포인트가 dict 가 아니거나 x_key 가 없음
+
+    payload 스키마:
+        {
+          "tool_name": str,
+          "title": str,
+          "chart_type": "line" | "bar",
+          "unit": str,
+          "x_axis": {"key": str, "values": list[str]},
+          "series": list[{"name": str, "key": str, "data": list[number|None]}],
+          "total_points": int,
+          "truncated": bool,
+          "navigate_path": str | None,
+        }
+
+    series.data 는 x_axis.values 와 길이·인덱스 1:1. 누락 값은 None 으로 채워 Client 가
+    안전하게 라인 보간 처리할 수 있게 한다.
+    """
+    spec = _CHART_TOOL_SPECS.get(tool_name)
+    if spec is None:
+        return None
+    if not isinstance(result, AdminApiResult) or not result.ok:
+        return None
+    data = result.data
+    if not isinstance(data, dict):
+        return None
+
+    points = data.get(spec["data_key"])
+    if not isinstance(points, list) or len(points) < _CHART_DATA_MIN_POINTS:
+        return None
+    if not isinstance(points[0], dict):
+        return None
+    x_key = spec["x_key"]
+    if x_key not in points[0]:
+        return None
+
+    capped = points[:_CHART_DATA_MAX_POINTS]
+    x_values: list[str] = [str(p.get(x_key, "")) for p in capped if isinstance(p, dict)]
+
+    series_payload: list[dict] = []
+    for label, key in spec["series"]:
+        series_data: list = []
+        for p in capped:
+            if not isinstance(p, dict):
+                series_data.append(None)
+                continue
+            v = p.get(key)
+            # 숫자/None 만 통과. 문자열 등은 None 으로 정규화 (Client 보간 처리).
+            if v is None or isinstance(v, (int, float)):
+                series_data.append(v)
+            else:
+                series_data.append(None)
+        # 시리즈 전체가 None 만 있으면 제외 (백엔드 응답에 키 자체가 빠진 경우).
+        if any(v is not None for v in series_data):
+            series_payload.append({
+                "name": label,
+                "key": key,
+                "data": series_data,
+            })
+
+    if not series_payload:
+        # 매핑된 모든 series 키가 응답에 없으면 차트 의미 없음 → 스킵.
+        return None
+
+    return {
+        "tool_name": tool_name,
+        "title": spec["title"],
+        "chart_type": spec["chart_type"],
+        "unit": spec.get("unit", ""),
+        "x_axis": {"key": x_key, "values": x_values},
+        "series": series_payload,
+        "total_points": len(points),
+        "truncated": len(points) > len(capped),
+        "navigate_path": spec.get("navigate_path"),
+    }
+
+
+def _build_table_payload(tool_name: str, result: AdminApiResult) -> dict | None:
+    """
+    AdminApiResult 의 list/Page 응답에서 SSE table_data payload 를 빌드한다.
+
+    반환 None 의 경우:
+    - ok=False
+    - data 가 list 도 Page(content list 를 가진 dict) 도 아님
+    - row 수가 _TABLE_DATA_MIN_ROWS 미만 (narrator 자연어로 충분)
+    - 첫 행이 dict 가 아니라 컬럼 추출 불가 (스칼라 list 등)
+
+    payload 스키마:
+        {
+          "tool_name": str,
+          "title": str,                          # 카드 헤더 ("리뷰 목록", "신고 목록" 등)
+          "columns": list[str],                  # 첫 행 키 기반, 최대 _TABLE_DATA_MAX_COLS 개
+          "rows": list[dict],                    # 최대 _TABLE_DATA_SAMPLE_ROWS 행
+          "total_rows": int,
+          "truncated": bool,
+          "navigate_path": str | None,           # "전체 보기" 버튼 링크 (등록된 tool 만)
+        }
+    """
+    if not isinstance(result, AdminApiResult) or not result.ok:
+        return None
+
+    data: Any = result.data
+    rows_source: list[Any] | None = None
+    total_rows: int | None = None
+
+    if isinstance(data, list):
+        rows_source = data
+        total_rows = len(data)
+    elif isinstance(data, dict):
+        # Spring Data Page 응답 — content/totalElements 사용
+        content = data.get("content")
+        if isinstance(content, list):
+            rows_source = content
+            te = data.get("totalElements")
+            total_rows = te if isinstance(te, int) else len(content)
+
+    if rows_source is None:
+        return None
+    if total_rows is None:
+        total_rows = len(rows_source)
+    if total_rows < _TABLE_DATA_MIN_ROWS:
+        return None
+    if not rows_source or not isinstance(rows_source[0], dict):
+        # 스칼라 list 같은 케이스는 표로 의미가 없어 스킵
+        return None
+
+    # 첫 행 키를 컬럼 후보로. 식별성 있는 키(id/createdAt 등) 가 있으면 앞으로 정렬해도
+    # 좋지만 단순화 위해 첫 행 자연 순서 그대로 _TABLE_DATA_MAX_COLS 개만 자른다.
+    first_row = rows_source[0]
+    columns = list(first_row.keys())[:_TABLE_DATA_MAX_COLS]
+
+    sample_rows: list[dict] = []
+    for row in rows_source[:_TABLE_DATA_SAMPLE_ROWS]:
+        if not isinstance(row, dict):
+            continue
+        sample_rows.append({c: _coerce_cell_value(row.get(c)) for c in columns})
+
+    truncated = total_rows > len(sample_rows)
+
+    return {
+        "tool_name": tool_name,
+        "title": tool_name.replace("_", " ").strip().title(),
+        "columns": columns,
+        "rows": sample_rows,
+        "total_rows": total_rows,
+        "truncated": truncated,
+        "navigate_path": _TABLE_NAVIGATE_PATHS.get(tool_name),
+    }
+
+
+# ============================================================
 # SSE 스트리밍 실행
 # ============================================================
 
@@ -650,6 +1095,27 @@ async def run_admin_assistant(
                                 "error": result.error if not result.ok else "",
                             },
                         )
+                        # Phase 4 (2026-04-27): list/Page 응답이면 table_data SSE 도 함께 발행.
+                        # _build_table_payload 가 임계치(<3행) 이하 / 비list / 실패 케이스는
+                        # None 을 돌려 자동 스킵된다. Client TableDataCard 가 이 payload 를
+                        # 카드 형태로 렌더하고 navigate_path 가 있으면 "전체 보기" 버튼 노출.
+                        table_payload = _build_table_payload(
+                            call.tool_name if call else "",
+                            result,
+                        )
+                        if table_payload is not None:
+                            yield _format_sse_event("table_data", table_payload)
+
+                        # Phase 4 후속 (2026-04-28): 등록된 시계열 stats tool 이면
+                        # chart_data SSE 도 함께 발행. _build_chart_payload 가 whitelist 외
+                        # tool / 임계 미달 / 응답 형태 불일치 케이스는 None 을 돌려 자동 스킵.
+                        # Client ChartDataCard 가 recharts 로 라인/막대 차트 렌더.
+                        chart_payload = _build_chart_payload(
+                            call.tool_name if call else "",
+                            result,
+                        )
+                        if chart_payload is not None:
+                            yield _format_sse_event("chart_data", chart_payload)
 
                 # v3 Phase D: draft_emitter 완료 시 form_prefill SSE 이벤트 발행.
                 # Client 가 이 이벤트를 받으면 FormPrefillCard 를 렌더하고

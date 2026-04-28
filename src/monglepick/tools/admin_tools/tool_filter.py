@@ -70,8 +70,11 @@ _INTENT_TO_KINDS: dict[str, set[str]] = {
     # 쓰기 지향 — draft(폼 채우기) + navigate(위험 작업 화면 이동) + read(대상 검색용).
     # stats 는 불필요.
     "action": {"draft", "navigate", "read"},
-    # 보고서 — 아직 placeholder. 전 카테고리 허용(stats 중심).
-    "report": {"stats", "read"},
+    # 보고서(Phase 4, 2026-04-27) — stats + read + navigate 동시 허용.
+    # ReAct 루프에서 통계 KPI(stats_*) 와 도메인 조회(reports_list/posts_list 등) 를 묶어
+    # 종합 요약하고, 깊이 들여다볼 항목은 navigate(goto_*) 로 화면 이동을 권장한다.
+    # draft 는 보고서 작성 행위가 아니므로 제외(별도 의도이면 action 으로 분류됨).
+    "report": {"stats", "read", "navigate"},
     # SQL 은 미지원이라 사실상 smart_fallback 경로. 모든 것 허용해도 무해.
     "sql": {"read", "stats", "navigate", "draft"},
     # smalltalk 은 tool_selector 까지 오지 않지만 혹시 대비.
