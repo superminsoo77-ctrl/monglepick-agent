@@ -540,6 +540,96 @@ async def ensure_es_index() -> None:
 
 
 # ============================================================
+# 고객센터 정책 RAG 컬렉션 (support_policy_v1)
+# ============================================================
+
+#: 고객센터 정책 RAG Qdrant 컬렉션명.
+#: 'movies', 'admin_tool_registry' 와 동일 인스턴스 내에서 네임스페이스 분리.
+#: 설계서: docs/고객센터_AI에이전트_v4_재설계.md §6.1
+SUPPORT_POLICY_COLLECTION: str = "support_policy_v1"
+
+
+async def ensure_support_policy_collection() -> None:
+    """
+    Qdrant `support_policy_v1` 컬렉션이 없으면 생성하고 payload 인덱스를 설정한다.
+
+    고객센터 AI 봇(v4)의 정책 RAG 인프라 초기화 함수.
+    Agent 시작 시 `init_all_clients()` 에서 자동 호출된다.
+
+    설정 (docs/고객센터_AI에이전트_v4_재설계.md §6.1):
+    - 벡터 크기: 4096 (settings.EMBEDDING_DIMENSION — Upstage Solar)
+    - 거리 메트릭: Cosine
+    - HNSW: M=16, ef_construct=100
+    - on_disk=False — 정책 문서 청크는 수백~수천 개 수준으로 메모리 보관이 적절
+
+    Payload 인덱스:
+    - `policy_topic` (KEYWORD) — grade_benefit / ai_quota / subscription / refund / reward / payment / general
+      필터 검색 가속: "BRONZE 등급 AI 한도" 질문 시 policy_topic="grade_benefit" 로 범위 한정
+    - `doc_id` (KEYWORD) — 문서 단위 삭제·재인덱싱 시 must 필터로 기존 청크 일괄 삭제
+    - `doc_path` (KEYWORD) — 출처 문서 경로 (디버깅/감사 추적용)
+
+    이 함수는 멱등적이다 — 이미 존재하는 컬렉션이나 payload 인덱스에는 영향 없음.
+    기존 'movies' / 'admin_tool_registry' 컬렉션은 절대 건드리지 않는다.
+
+    Raises:
+        Exception: Qdrant 연결 실패 또는 API 오류 (호출자인 init_all_clients 가 try/except 로 격리)
+    """
+    client = await get_qdrant()
+
+    # ── 컬렉션 존재 여부 확인 ──
+    collections = await client.get_collections()
+    existing_names = [c.name for c in collections.collections]
+
+    if SUPPORT_POLICY_COLLECTION not in existing_names:
+        # 신규 생성 — 영화 컬렉션과 동일 벡터 설정, on_disk=False (소규모 컬렉션)
+        await client.create_collection(
+            collection_name=SUPPORT_POLICY_COLLECTION,
+            vectors_config=VectorParams(
+                size=settings.EMBEDDING_DIMENSION,  # 4096 (Upstage Solar)
+                distance=Distance.COSINE,
+                on_disk=False,  # 정책 청크는 수백~수천 개 — 메모리 보관이 빠름
+            ),
+            hnsw_config=HnswConfigDiff(
+                m=16,
+                ef_construct=100,
+            ),
+        )
+        logger.info(
+            "support_policy_collection_created",
+            name=SUPPORT_POLICY_COLLECTION,
+            dim=settings.EMBEDDING_DIMENSION,
+        )
+
+    # ── Payload 인덱스 설정 (이미 있으면 idempotent) ──
+    # Qdrant 는 인덱스가 이미 존재해도 에러를 던지는 경우가 있으므로 개별 try/except 처리.
+    keyword_fields = [
+        "policy_topic",  # grade_benefit / ai_quota / subscription / refund / reward / payment / general
+        "doc_id",        # 문서 단위 필터링 (재인덱싱 시 기존 청크 삭제 용도)
+        "doc_path",      # 출처 문서 경로 (감사 추적)
+    ]
+    for field in keyword_fields:
+        try:
+            await client.create_payload_index(
+                collection_name=SUPPORT_POLICY_COLLECTION,
+                field_name=field,
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+        except Exception as e:
+            # 이미 존재하거나 Qdrant 버전 차이로 에러가 날 수 있지만 운영상 무해.
+            logger.debug(
+                "support_policy_payload_index_skip",
+                field=field,
+                reason=str(e),
+            )
+
+    logger.info(
+        "support_policy_collection_ready",
+        collection=SUPPORT_POLICY_COLLECTION,
+        existed=SUPPORT_POLICY_COLLECTION in existing_names,
+    )
+
+
+# ============================================================
 # 전체 초기화 / 종료
 # ============================================================
 
@@ -623,6 +713,23 @@ async def init_all_clients() -> None:
         failed_dbs.append("mysql")
         logger.error(
             "mysql_init_error", error=str(e), error_type=type(e).__name__,
+            stack_trace=traceback.format_exc(), elapsed_ms=round(db_elapsed_ms, 1),
+        )
+
+    # ── 고객센터 정책 RAG 컬렉션 부트스트랩 ──
+    # Qdrant 클라이언트는 이미 위에서 초기화됐으므로 get_qdrant() 는 캐시 반환.
+    # 'movies' / 'admin_tool_registry' 컬렉션과 독립적으로 격리 초기화한다.
+    # 실패해도 채팅/추천 기능에 영향 없음 (고객센터 v4 기능만 degraded).
+    try:
+        db_start = time.perf_counter()
+        await ensure_support_policy_collection()
+        db_elapsed_ms = (time.perf_counter() - db_start) * 1000
+        logger.info("support_policy_collection_init_done", elapsed_ms=round(db_elapsed_ms, 1))
+    except Exception as e:
+        db_elapsed_ms = (time.perf_counter() - db_start) * 1000
+        failed_dbs.append("support_policy_qdrant")
+        logger.error(
+            "support_policy_collection_init_error", error=str(e), error_type=type(e).__name__,
             stack_trace=traceback.format_exc(), elapsed_ms=round(db_elapsed_ms, 1),
         )
 

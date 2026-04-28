@@ -152,9 +152,11 @@ async def _handle_stats_point_distribution(
     """
     `GET /api/v1/admin/stats/point-economy/distribution` (파라미터 없음).
 
-    포인트 유형(earn/spend/bonus/expire/refund/revoke) 분포 —
+    포인트 유형(earn/spend/bonus/expire/refund/revoke + admin_grant/admin_revoke) 분포 —
     PointTypeDistributionResponse{distribution: [{pointType, label, count, totalAmount, percentage}]}.
     Phase 4 후속 (2026-04-28) 에서 pie 차트로 시각화 (한국어 label 을 슬라이스 라벨로).
+    admin_grant/admin_revoke 는 운영 조정 전용 분류 — 백엔드가 "운영 지급"/"운영 회수"
+    라벨로 응답하며 KPI(총발행/총소비) 합산에서는 자동 제외된다.
     """
     raw = await get_admin_json(
         "/api/v1/admin/stats/point-economy/distribution",
