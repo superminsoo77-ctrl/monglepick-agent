@@ -55,15 +55,15 @@ class TestThresholdsExternalized:
         assert _LLM_CALL_HIGH == settings.REVIEW_VERIFICATION_LLM_CALL_HIGH
 
     def test_default_values(self):
-        """기본값 — 설계서 §4 와 동일."""
-        assert _THRESHOLD_HIGH == 0.7
-        assert _THRESHOLD_LOW == 0.3
-        assert _LLM_CALL_LOW == 0.5
-        assert _LLM_CALL_HIGH == 0.8
+        """기본값 — 0.39 임계점 기준."""
+        assert _THRESHOLD_HIGH == pytest.approx(0.39)
+        assert _THRESHOLD_LOW == pytest.approx(0.2)
+        assert _LLM_CALL_LOW == pytest.approx(0.2)
+        assert _LLM_CALL_HIGH == pytest.approx(0.39)
 
     def test_threshold_ordering(self):
-        """LOW < LLM_CALL_LOW <= LLM_CALL_HIGH < HIGH 순서가 깨지면 로직 결함."""
-        assert _THRESHOLD_LOW < _LLM_CALL_LOW
+        """LOW <= LLM_CALL_LOW <= LLM_CALL_HIGH < HIGH 순서가 깨지면 로직 결함."""
+        assert _THRESHOLD_LOW <= _LLM_CALL_LOW
         assert _LLM_CALL_LOW <= _LLM_CALL_HIGH
         assert _LLM_CALL_HIGH < 1.0
         assert _THRESHOLD_HIGH > _LLM_CALL_LOW
@@ -90,7 +90,7 @@ class TestCleanText:
 
     def test_truncate_long_text(self):
         long = "가" * 2000
-        assert len(_clean_text(long)) == 1500
+        assert len(_clean_text(long)) == 500
 
     def test_empty_input(self):
         assert _clean_text("") == ""
@@ -354,9 +354,9 @@ class TestLlmRevalidator:
         state = {
             "early_exit": False, "verification_id": 1,
             "clean_review": "x", "clean_plot": "y",
-            "similarity_score": 0.7, "keyword_score": 0.5,
+            "similarity_score": 0.3, "keyword_score": 0.3,
         }
-        # confidence_draft = 0.7 * 0.7 + 0.3 * 0.5 = 0.64 (구간 안)
+        # confidence_draft = 0.7 * 0.3 + 0.3 * 0.3 = 0.30 (구간 [0.2, 0.4] 안)
         fake_response = MagicMock()
         fake_response.content = "YES"
 
@@ -372,8 +372,9 @@ class TestLlmRevalidator:
         state = {
             "early_exit": False, "verification_id": 1,
             "clean_review": "x", "clean_plot": "y",
-            "similarity_score": 0.7, "keyword_score": 0.5,
+            "similarity_score": 0.3, "keyword_score": 0.3,
         }
+        # confidence_draft = 0.7 * 0.3 + 0.3 * 0.3 = 0.30 (구간 [0.2, 0.4] 안)
         fake_response = MagicMock()
         fake_response.content = "NO"
 
@@ -444,9 +445,10 @@ class TestThresholdDecider:
     async def test_mid_confidence_needs_review(self):
         state = {
             "early_exit": False, "verification_id": 1,
-            "confidence_draft": 0.5, "llm_adjustment": 0.0,
-            "similarity_score": 0.5, "matched_keywords": ["기생충"],
+            "confidence_draft": 0.3, "llm_adjustment": 0.0,
+            "similarity_score": 0.3, "matched_keywords": ["기생충"],
         }
+        # final = 0.3 → [0.2, 0.4) 구간이므로 NEEDS_REVIEW
         result = await threshold_decider(state)
         assert result["review_status"] == "NEEDS_REVIEW"
         assert "검수" in result["rationale"]
