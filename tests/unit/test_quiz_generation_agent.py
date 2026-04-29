@@ -36,6 +36,7 @@ from monglepick.agents.quiz_generation.nodes import (
     _build_fallback_draft,
     _contains_spoiler,
     _is_valid_options,
+    _normalize_genre_filter,
     _parse_json_array,
     _parse_quiz_json,
     _select_category,
@@ -114,6 +115,59 @@ class TestParseJsonArray:
 
     def test_whitespace_strip(self):
         assert _parse_json_array('[" 액션 ", "SF"]') == ["액션", "SF"]
+
+
+# ============================================================
+# 1-1) 헬퍼: _normalize_genre_filter (2026-04-29)
+#
+# Admin 트리거가 영어 코드(action) 를 보냈을 때 DB 가 한국어 배열로 저장된
+# `movies.genres` 와 LIKE 매칭되도록 정규화하는지 검증한다.
+# 회귀 차단: 매핑 누락 시 후보 0개 → "퀴즈 0개 생성 완료" 사고가 재발한다.
+# ============================================================
+
+
+class TestNormalizeGenreFilter:
+    """프론트가 보낸 장르 파라미터를 DB LIKE 매칭 가능한 형태로 정규화."""
+
+    def test_none_returns_none(self):
+        # None 또는 빈 문자열은 필터 비활성으로 간주
+        assert _normalize_genre_filter(None) is None
+        assert _normalize_genre_filter("") is None
+        assert _normalize_genre_filter("   ") is None
+
+    def test_english_code_to_korean(self):
+        # 가장 흔한 영어 코드 5종 — 매핑 적중 여부
+        assert _normalize_genre_filter("action") == "액션"
+        assert _normalize_genre_filter("drama") == "드라마"
+        assert _normalize_genre_filter("comedy") == "코미디"
+        assert _normalize_genre_filter("horror") == "공포"
+        assert _normalize_genre_filter("romance") == "로맨스"
+
+    def test_english_code_case_insensitive(self):
+        # 대문자 / 혼합 대소문자도 매핑 (UI 가 어떻게 보내든 안전)
+        assert _normalize_genre_filter("ACTION") == "액션"
+        assert _normalize_genre_filter("Action") == "액션"
+
+    def test_sci_fi_aliases(self):
+        # SF 만 영어 → 영어로 정규화 (DB 라벨도 'SF') + 흔한 변형 모두 흡수
+        assert _normalize_genre_filter("sci-fi") == "SF"
+        assert _normalize_genre_filter("scifi") == "SF"
+        assert _normalize_genre_filter("sf") == "SF"
+
+    def test_korean_passthrough(self):
+        # 한국어가 들어오면 그대로 유지 (Admin UI 가 이미 한국어로 통일됨)
+        assert _normalize_genre_filter("액션") == "액션"
+        assert _normalize_genre_filter("드라마") == "드라마"
+        assert _normalize_genre_filter("SF") == "SF"
+
+    def test_unknown_english_passthrough(self):
+        # 매핑 사전에 없는 영어 키워드는 원본 그대로 — 커스텀/신규 장르 대응
+        assert _normalize_genre_filter("steampunk") == "steampunk"
+
+    def test_strip_whitespace(self):
+        # 양 끝 공백은 strip
+        assert _normalize_genre_filter("  action  ") == "액션"
+        assert _normalize_genre_filter("\t액션\n") == "액션"
 
 
 # ============================================================

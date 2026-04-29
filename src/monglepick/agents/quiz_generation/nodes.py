@@ -48,6 +48,55 @@ logger = structlog.get_logger()
 # ============================================================
 
 
+# 영어 장르 코드 → DB 한국어 라벨 매핑 (2026-04-29).
+# Admin 프론트가 영어 코드(`action`, `drama`)를 보내면 `WHERE genres LIKE '%action%'` 매칭에 실패한다.
+# DB(`movies.genres`) 는 한국어 배열(`["SF","드라마"]`)로 적재되기 때문 (data_pipeline/models.py).
+# Admin UI 는 이미 한국어 value 로 통일했지만, 외부 호출/하위 호환을 위한 안전망으로 둔다.
+# 매핑되지 않는 값은 그대로 LIKE 파라미터로 사용한다.
+_GENRE_EN_TO_KO: dict[str, str] = {
+    "action": "액션",
+    "drama": "드라마",
+    "comedy": "코미디",
+    "horror": "공포",
+    "romance": "로맨스",
+    "sci-fi": "SF",
+    "scifi": "SF",
+    "sf": "SF",
+    "thriller": "스릴러",
+    "animation": "애니메이션",
+    "fantasy": "판타지",
+    "crime": "범죄",
+    "mystery": "미스터리",
+    "documentary": "다큐멘터리",
+    "war": "전쟁",
+    "western": "서부",
+    "musical": "뮤지컬",
+    "family": "가족",
+    "history": "역사",
+    "adventure": "모험",
+}
+
+
+def _normalize_genre_filter(raw: Optional[str]) -> Optional[str]:
+    """
+    퀴즈 생성 요청의 genre 파라미터를 DB LIKE 매칭 가능한 형태로 정규화한다.
+
+    - None/빈 문자열 → None (필터 비활성)
+    - 한국어가 그대로 들어오면 그대로 사용
+    - 영어 코드(소문자)면 한국어로 변환
+    - 매핑이 없으면 원본 그대로 (커스텀 장르 케이스 보존)
+    """
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    # ASCII 만 들어왔다면 영어 코드로 간주하여 매핑 시도
+    if cleaned.isascii():
+        return _GENRE_EN_TO_KO.get(cleaned.lower(), cleaned)
+    return cleaned
+
+
 def _parse_json_array(raw: Any) -> list[str]:
     """
     JSON 배열 컬럼(genres/cast_members/keywords) 을 list[str] 로 파싱한다.
@@ -157,7 +206,9 @@ async def movie_selector(state: QuizGenerationState) -> dict:
         - popularity_score DESC ORDER + RAND() 가벼운 셔플로 인기도 가중 + 다양성 확보
         - 빈 DB / 매칭 실패 시 빈 리스트 + selector_message 로 안내
     """
-    genre = (state.get("genre") or "").strip() or None
+    # 영어 코드(action) → 한국어(액션) 정규화 — DB(movies.genres) 가 한국어 배열로 저장되므로 필수.
+    # 한국어 입력은 그대로 통과한다.
+    genre = _normalize_genre_filter(state.get("genre"))
     count = max(1, int(state.get("count") or 5))
     exclude_recent_days = max(0, int(state.get("exclude_recent_days") or 7))
 
