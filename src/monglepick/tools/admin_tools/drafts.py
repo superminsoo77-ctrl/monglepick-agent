@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from monglepick.api.admin_backend_client import AdminApiResult
 from monglepick.tools.admin_tools import ToolContext, ToolSpec, register_tool
@@ -61,6 +61,50 @@ NoticeDisplayTypeLiteral = Literal["LIST_ONLY", "BANNER", "POPUP", "MODAL"]
 
 # Draft 공통 mode 타입 — 모든 Args 가 이 값을 default="create" 로 받는다.
 DraftModeLiteral = Literal["create", "update"]
+
+
+# ============================================================
+# 2026-04-29 (잔존 결함 P1 패치) — Draft Args 공용 Mixin
+# ============================================================
+# 결함: mode="update" 인데 target_id 가 None/0/"" 으로 전달되면
+#       _resolve_target_path 가 조용히 create 모달로 폴백 → 사용자가 "수정해달라"
+#       고 했는데 새 게시글이 만들어지는 사고 발생.
+#
+# 처방: Pydantic 단계에서 차단. mode/target_id 필드는 각 Args 가 자체 정의(타입·
+#       description 이 도메인마다 다르므로 mixin 에서 강제로 못 박지 않음).
+#       mixin 은 검증 규칙만 제공하며, `check_fields=False` 로 자식 클래스의
+#       target_id 필드에 대해 검증을 위임 받는다.
+#
+# 적용 클래스: mode/target_id 가 정의된 Draft Args 10종 (TicketReplyDraftArgs 는
+#             mode/target_id 가 없으므로 inherit 하지 않는다).
+class _DraftWithModeMixin(BaseModel):
+    """`mode="update"` 일 때 `target_id` 필수 강제 — Draft Args 공용 mixin.
+
+    구현 메모:
+    - Pydantic v2 의 `field_validator(check_fields=False)` 는 mixin 에서 자식의 필드
+      이름과 매핑할 수 있지만, 자식 클래스가 같은 이름의 필드를 다시 정의하면
+      mixin 의 validator 가 등록 시점에 자식의 필드 객체와 연결되지 않아 실제
+      검증 단계에서 누락되는 케이스가 있다(테스트로 확인됨).
+    - 따라서 모델 전체에 대해 동작하는 `model_validator(mode='after')` 로 강제한다.
+      자식 클래스가 `mode`, `target_id` 필드를 정의했다는 전제하에 self attribute 로
+      직접 접근한다 (TicketReplyDraftArgs 처럼 mixin 을 상속하지 않은 클래스에는
+      애초에 호출되지 않으므로 안전).
+    """
+
+    @model_validator(mode="after")
+    def _validate_update_requires_target_id(self):
+        # mode 와 target_id 는 자식 클래스가 항상 정의하지만, 방어적으로 getattr 사용.
+        mode = getattr(self, "mode", None)
+        target_id = getattr(self, "target_id", None)
+        if mode == "update" and target_id in (None, "", 0):
+            raise ValueError(
+                "mode='update' 일 때 target_id (수정 대상 PK) 는 반드시 채워야 합니다. "
+                "발화에서 ID 가 명확하지 않으면 먼저 read 도구로 목록을 조회해 PK 를 "
+                "식별한 뒤 그 ID 를 target_id 에 넣어 주세요. ID 를 끝까지 모르겠다면 "
+                "수정 의도를 mode='create' 로 바꿔 새 항목을 만드는 게 아니라, "
+                "narrator 로 '어떤 항목을 수정할지 알려주세요' 라고 되물어 주세요."
+            )
+        return self
 
 
 def _resolve_target_path(
@@ -139,7 +183,7 @@ _FINANCE_ROLES: set[str] = {
 # Args Schemas (LLM bind 용 Pydantic 모델)
 # ============================================================
 
-class NoticeDraftArgs(BaseModel):
+class NoticeDraftArgs(_DraftWithModeMixin):
     """
     공지사항 초안 생성/수정 인자.
 
@@ -233,7 +277,7 @@ class NoticeDraftArgs(BaseModel):
     )
 
 
-class FaqDraftArgs(BaseModel):
+class FaqDraftArgs(_DraftWithModeMixin):
     """
     FAQ 초안 생성/수정 인자.
 
@@ -296,7 +340,7 @@ class FaqDraftArgs(BaseModel):
     )
 
 
-class HelpArticleDraftArgs(BaseModel):
+class HelpArticleDraftArgs(_DraftWithModeMixin):
     """
     도움말 아티클 초안 생성/수정 인자.
 
@@ -361,7 +405,7 @@ class TicketReplyDraftArgs(BaseModel):
     )
 
 
-class BannerDraftArgs(BaseModel):
+class BannerDraftArgs(_DraftWithModeMixin):
     """배너 초안 생성/수정 인자."""
 
     mode: DraftModeLiteral = Field(
@@ -393,7 +437,7 @@ class BannerDraftArgs(BaseModel):
     )
 
 
-class QuizDraftArgs(BaseModel):
+class QuizDraftArgs(_DraftWithModeMixin):
     """영화 퀴즈 초안 생성/수정 인자."""
 
     mode: DraftModeLiteral = Field(
@@ -423,7 +467,7 @@ class QuizDraftArgs(BaseModel):
     )
 
 
-class ChatSuggestionDraftArgs(BaseModel):
+class ChatSuggestionDraftArgs(_DraftWithModeMixin):
     """채팅 추천 칩(빠른 질문) 초안 생성/수정 인자."""
 
     mode: DraftModeLiteral = Field(
@@ -453,7 +497,7 @@ class ChatSuggestionDraftArgs(BaseModel):
     )
 
 
-class TermDraftArgs(BaseModel):
+class TermDraftArgs(_DraftWithModeMixin):
     """약관 초안 생성/수정 인자."""
 
     mode: DraftModeLiteral = Field(
@@ -478,7 +522,7 @@ class TermDraftArgs(BaseModel):
     )
 
 
-class WorldcupCandidateDraftArgs(BaseModel):
+class WorldcupCandidateDraftArgs(_DraftWithModeMixin):
     """이상형 월드컵 후보 초안 생성/수정 인자."""
 
     mode: DraftModeLiteral = Field(
@@ -498,7 +542,7 @@ class WorldcupCandidateDraftArgs(BaseModel):
     )
 
 
-class RewardPolicyDraftArgs(BaseModel):
+class RewardPolicyDraftArgs(_DraftWithModeMixin):
     """리워드 정책 초안 생성/수정 인자."""
 
     mode: DraftModeLiteral = Field(
@@ -527,7 +571,7 @@ class RewardPolicyDraftArgs(BaseModel):
     )
 
 
-class PointPackDraftArgs(BaseModel):
+class PointPackDraftArgs(_DraftWithModeMixin):
     """포인트 팩 상품 초안 생성/수정 인자."""
 
     mode: DraftModeLiteral = Field(

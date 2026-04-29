@@ -379,6 +379,12 @@ async def response_formatter(state: SupportAssistantState) -> dict:
         )
         needs_human = True
 
+    # 2026-04-29 — 서비스 이름 환각 최후 가드.
+    # 어떤 경로로 LLM 출력이 흘러왔든 (smalltalk_responder / narrator(faq) / generate_narrator_response /
+    # smart_fallback) 이 노드에서 한 번 더 '몽블랑'/'몽글 ' 등 잘못된 표기를 '몽글픽' 으로 강제 교정한다.
+    # 각 호출 지점의 정규화가 실수로 누락되거나 새 LLM 호출 경로가 추가되어도 본 노드에서 잡힌다.
+    text = _normalize_service_name(text)
+
     # 체크포인트 복원 방어 — reply 가 dict 로 보존된 경우도 정상 복원 가능.
     reply = ensure_reply(state.get("reply"))
     if reply is not None:
@@ -464,12 +470,34 @@ async def intent_classifier(state: SupportAssistantState) -> dict:
     - history 가 빈 첫 턴은 기존 동작과 동일.
 
     실패 시 faq intent 로 폴백 (에러 전파 금지).
+
+    ### 2026-04-29 가드 강화 — capability 질의 강제 smalltalk
+    "뭘 할 수 있어?" / "넌 뭐야?" 같은 capability 질의는 LLM 분류 결과와 무관하게
+    smalltalk 으로 강제 변환한다. Solar intent 가 이를 faq 로 분류하면 narrator
+    경로로 빠지고, vLLM/Solar 가 서비스 이름을 환각(몽블랑 등)할 위험이 있기 때문.
+    smalltalk_responder 의 capability_intercept 고정 답변이 항상 작동하도록 보장.
     """
     user_message = (state.get("user_message") or "").strip()
     is_guest = bool(state.get("is_guest", False))
     session_id = state.get("session_id", "")
     history = state.get("history") or []
     history_context = _format_history_context(history, max_turns=3)
+
+    # capability 질의는 LLM 분류 우회 — 항상 smalltalk 으로 강제.
+    # smalltalk_responder 의 _is_capability_question 가드가 다음 노드에서 fixed-string 처리.
+    if _is_capability_question(user_message):
+        from monglepick.chains.support_intent_chain import SupportIntent
+        logger.info(
+            "support_intent_capability_force_smalltalk",
+            user_message_preview=user_message[:60],
+        )
+        return {
+            "intent": SupportIntent(
+                kind="smalltalk",
+                confidence=1.0,
+                reason="capability_keyword_force_smalltalk",
+            )
+        }
 
     try:
         # lazy import — 순환 의존성 방지
@@ -516,6 +544,7 @@ async def intent_classifier(state: SupportAssistantState) -> dict:
 # Python 키워드 매칭으로 가로채 고정 문자열을 반환한다.
 # (스마트한 LLM 분류 대신 짧은 휴리스틱으로 안정성 확보.)
 _CAPABILITY_QUESTION_KEYWORDS: tuple[str, ...] = (
+    # "뭘/뭐/무엇 + 할 수 있" 계열
     "뭘 할 수 있",
     "뭘할 수 있",
     "뭘할수있",
@@ -525,6 +554,23 @@ _CAPABILITY_QUESTION_KEYWORDS: tuple[str, ...] = (
     "뭐 할 수 있",
     "뭐할 수 있",
     "뭐할수있",
+    "뭐 해줄 수 있",
+    "뭐해줄수있",
+    "뭐 해줄수있",
+    # 봇/챗봇/너 정체성·역할 질의 — 환각 위험 가장 큰 패턴
+    "넌 뭐",
+    "너는 뭐",
+    "당신은 뭐",
+    "니가 뭐",
+    "네가 뭐",
+    "넌 누구",
+    "너는 누구",
+    "당신은 누구",
+    "니가 누구",
+    "네가 누구",
+    "몽글이가 뭐",
+    "몽글봇이 뭐",
+    # 기능·도움 직접 질의
     "어떤 기능",
     "어떤 도움",
     "어떻게 사용",
@@ -533,8 +579,13 @@ _CAPABILITY_QUESTION_KEYWORDS: tuple[str, ...] = (
     "할 수 있는 일",
     "할 수 있는게",
     "할수있는게",
+    "도와줄 수 있는",
+    "도와줄수있는",
+    # 영문
     "what can you",
+    "who are you",
     "capabilities",
+    "what do you do",
 )
 
 # 서비스 이름 환각 자동 교정 — vLLM EXAONE 1.2B 가 "몽블랑" / "몽글" 등으로
