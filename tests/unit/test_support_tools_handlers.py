@@ -106,22 +106,110 @@ def _get_params(mock_call) -> dict:
 # ============================================================
 
 class TestLookupMyPointHistory:
-    """포인트 이력 조회 tool 단위 테스트."""
+    """
+    포인트 이력 조회 tool 단위 테스트.
+
+    2026-04-29 회귀 (Backend `Page<HistoryResponse>` 호환 + days 클라이언트 필터):
+      - tool 은 Backend 에 `?page=0&size=100` 으로 호출하며 `days` 는 보내지 않는다.
+      - 응답의 `content` 배열을 평면화해 `{amount, type, description, createdAt}` 로 정규화한다.
+      - days 보다 오래된 createdAt 항목은 제외한다.
+    """
+
+    @staticmethod
+    def _backend_page(content: list[dict]) -> dict:
+        """Spring `Page<HistoryResponse>` JSON 직렬화 결과를 모사한다."""
+        return {
+            "content": content,
+            "pageable": {"pageNumber": 0, "pageSize": 100},
+            "totalElements": len(content),
+            "totalPages": 1 if content else 0,
+            "first": True,
+            "last": True,
+        }
 
     @pytest.mark.asyncio
-    async def test_normal_response(self, auth_ctx):
-        """정상 응답 — Backend 데이터가 그대로 반환된다."""
-        mock_data = [
-            {"amount": 100, "type": "EARN", "source": "REVIEW",    "createdAt": "2026-04-27T10:00:00"},
-            {"amount": -50, "type": "USE",  "source": "AI_USAGE",  "createdAt": "2026-04-26T09:00:00"},
+    async def test_normal_response_normalizes_page_content(self, auth_ctx):
+        """Backend Page 응답 → 평면화된 {amount, type, description, createdAt} 배열로 정규화."""
+        backend_now_iso = "2026-04-29T08:00:00"  # cutoff 7일 안쪽
+        backend_content = [
+            {
+                "id": 1001,
+                "pointChange": 100,
+                "pointAfter": 600,
+                "pointType": "earn",
+                "description": "리뷰 작성 보상",
+                "createdAt": backend_now_iso,
+            },
+            {
+                "id": 1000,
+                "pointChange": -50,
+                "pointAfter": 500,
+                "pointType": "spend",
+                "description": "AI 추천 1회",
+                "createdAt": "2026-04-28T09:00:00",
+            },
         ]
         with patch(_MOCK_PATH, new_callable=AsyncMock) as mock_call:
-            mock_call.return_value = _ok(mock_data)
+            mock_call.return_value = _ok(self._backend_page(backend_content))
             result = await _h_point_history(auth_ctx, days=7)
 
         assert result["ok"] is True
-        assert result["data"] == mock_data
-        assert _get_params(mock_call)["days"] == 7
+        assert result["data"] == [
+            {
+                "amount": 100,
+                "type": "earn",
+                "description": "리뷰 작성 보상",
+                "createdAt": backend_now_iso,
+            },
+            {
+                "amount": -50,
+                "type": "spend",
+                "description": "AI 추천 1회",
+                "createdAt": "2026-04-28T09:00:00",
+            },
+        ]
+        # Backend 시그니처 일치: days 가 아니라 page/size 를 보낸다
+        params = _get_params(mock_call)
+        assert params == {"page": 0, "size": 100}
+
+    @pytest.mark.asyncio
+    async def test_days_filters_out_older_entries(self, auth_ctx):
+        """days=7 이면 cutoff 보다 오래된 항목은 제외된다."""
+        backend_content = [
+            # 충분히 최근 — 포함
+            {"id": 2, "pointChange": 10, "pointAfter": 110,
+             "pointType": "earn", "description": "출석",
+             "createdAt": "2026-04-28T00:00:00"},
+            # cutoff 보다 훨씬 오래됨 (60일 전) — 제외
+            {"id": 1, "pointChange": 5, "pointAfter": 100,
+             "pointType": "earn", "description": "이벤트",
+             "createdAt": "2026-02-01T00:00:00"},
+        ]
+        with patch(_MOCK_PATH, new_callable=AsyncMock) as mock_call:
+            mock_call.return_value = _ok(self._backend_page(backend_content))
+            result = await _h_point_history(auth_ctx, days=7)
+
+        assert result["ok"] is True
+        assert len(result["data"]) == 1
+        assert result["data"][0]["description"] == "출석"
+
+    @pytest.mark.asyncio
+    async def test_flat_list_response_compatibility(self, auth_ctx):
+        """향후 Backend 가 평면 list 로 바뀌어도 안전하게 처리한다."""
+        flat_list = [
+            {"id": 1, "pointChange": 7, "pointAfter": 7,
+             "pointType": "earn", "description": "보너스",
+             "createdAt": "2026-04-29T00:00:00"},
+        ]
+        with patch(_MOCK_PATH, new_callable=AsyncMock) as mock_call:
+            mock_call.return_value = _ok(flat_list)
+            result = await _h_point_history(auth_ctx, days=7)
+
+        assert result["ok"] is True
+        assert result["data"] == [
+            {"amount": 7, "type": "earn", "description": "보너스",
+             "createdAt": "2026-04-29T00:00:00"},
+        ]
 
     @pytest.mark.asyncio
     async def test_guest_blocked(self, guest_ctx):
@@ -135,7 +223,7 @@ class TestLookupMyPointHistory:
     async def test_bola_ctx_user_id_passed(self, auth_ctx):
         """BOLA 차단 — call_backend_get 의 첫 번째 인자가 ctx 이고 user_id 가 일치한다."""
         with patch(_MOCK_PATH, new_callable=AsyncMock) as mock_call:
-            mock_call.return_value = _ok([])
+            mock_call.return_value = _ok(self._backend_page([]))
             await _h_point_history(auth_ctx, days=7)
 
         passed_ctx = mock_call.call_args.args[0]
@@ -144,7 +232,7 @@ class TestLookupMyPointHistory:
 
     @pytest.mark.asyncio
     async def test_http_4xx(self, auth_ctx):
-        """HTTP 4xx → ok=False, error 필드 존재."""
+        """HTTP 4xx → ok=False, error 필드 그대로 전파."""
         with patch(_MOCK_PATH, new_callable=AsyncMock) as mock_call:
             mock_call.return_value = _err("http_404", 404)
             result = await _h_point_history(auth_ctx, days=7)

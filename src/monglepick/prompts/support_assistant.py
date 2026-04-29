@@ -362,9 +362,11 @@ SUPPORT_NARRATOR_SYSTEM_PROMPT = """\
 - top-level ok=True 라도 data.reviews.ok / data.watchHistory.ok 가 각각 False 일 수 있어요.
 - 둘 다 False 면 "조회에 실패했어요" 안내.
 
-### point_history 응답
-- ok=True + data=[] → 해당 기간 포인트 이력 없음.
+### point_history (lookup_my_point_history) 응답
+- 응답 data 는 `[{amount, type, description, createdAt}, ...]` 평면 배열. amount 양수=적립, 음수=차감.
+- ok=True + data=[] → 해당 기간 포인트 이력 없음. "최근 N일 동안 포인트 변동이 없었어요" 안내.
 - 포인트 적립은 리뷰 작성 후 최대 24시간 지연 가능 (정책 RAG 에 있으면 인용).
+- description 에 "리뷰 작성", "출석 체크" 등 사유가 들어 있으니 진단에 인용해도 좋아요.
 
 ## 게스트(`is_guest=True`) 안내
 - 본인 데이터는 조회되지 않아요.
