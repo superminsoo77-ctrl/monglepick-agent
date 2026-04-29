@@ -96,6 +96,7 @@ async def classify_support_intent(
     user_message: str,
     is_guest: bool = False,
     request_id: str = "",
+    history_context: str = "",
 ) -> SupportIntent:
     """
     사용자 발화를 SupportIntent(6종 kind) 로 분류한다.
@@ -111,6 +112,9 @@ async def classify_support_intent(
         user_message: 사용자가 입력한 발화 (1줄 이상)
         is_guest: True 면 게스트 사용자. 프롬프트에 힌트로 포함 (분류 결과는 무영향).
         request_id: 세마포어/로그용 요청 식별자 (선택)
+        history_context: 최근 멀티턴 대화 텍스트 블록.
+            "사용자: ... \n몽글이: ... " 형식. 비어 있으면 단일턴으로 분류.
+            (2026-04-28 추가) 짧은 후속 질문 의도 정확도 향상을 위함.
 
     Returns:
         SupportIntent — kind/confidence/reason 3필드.
@@ -120,12 +124,23 @@ async def classify_support_intent(
     try:
         llm = get_structured_llm(schema=SupportIntent, temperature=0.1, use_api=True)
 
+        # 멀티턴 컨텍스트 — 프롬프트 내 별도 [이전 대화] 섹션으로 주입.
+        # SUPPORT_INTENT_HUMAN_PROMPT 의 placeholder 와 호환되도록 한 줄 prefix 만 추가.
+        # ChatPromptTemplate 에 새 변수를 추가하면 기존 호출/테스트가 깨지므로
+        # human prompt 본문에 합성하는 방식으로 호환성 유지.
+        if history_context:
+            user_message_with_context = (
+                f"[이전 대화]\n{history_context}\n\n[현재 발화]\n{user_message.strip()}"
+            )
+        else:
+            user_message_with_context = user_message.strip()
+
         # `_support_intent_prompt | llm` chain 패턴을 쓰지 않는 이유:
         # 단위 테스트에서 `with_structured_output()` 이 반환하는 MagicMock 에 `|` 연산자가
         # 없어 RunnableSequence 구성이 깨지기 때문. llm 직접 호출은 mock 과 실 모듈 모두 호환.
         # (admin_intent_chain.py 동일 패턴 참조)
         prompt_value = _support_intent_prompt.format_prompt(
-            user_message=user_message.strip(),
+            user_message=user_message_with_context,
             is_guest="게스트(비로그인)" if is_guest else "로그인 사용자",
         )
         result = await guarded_ainvoke(

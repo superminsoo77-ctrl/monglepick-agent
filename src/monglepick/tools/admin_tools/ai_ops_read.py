@@ -15,6 +15,12 @@ Backend `AdminAiController` (/api/v1/admin/ai prefix):
 Role matrix (§4.2):
 - 퀴즈/챗봇 계열 → SUPER_ADMIN, ADMIN, AI_OPS_ADMIN
 - review_verification 계열 → SUPER_ADMIN, ADMIN, AI_OPS_ADMIN, MODERATOR
+
+설계 결정 — 퀴즈 운영은 자연어 흐름 밖이다:
+    퀴즈 _생성_ 자체는 AiTriggerPanel 폼+버튼만으로 트리거되므로 자연어 ReAct
+    루프에 들어오지 않는다. 통계 가시성은 GenerationHistory 상단의
+    QuizStatsCard 화면 컴포넌트가 GET /admin/ai/quiz/stats 를 직접 호출하여
+    제공한다 (2026-04-28). 따라서 자연어 quiz_stats Read tool 은 도입하지 않는다.
 """
 
 from __future__ import annotations

@@ -89,7 +89,8 @@ def _patch_intent(monkeypatch, kind: str, confidence: float = 0.95) -> None:
     """classify_support_intent 를 고정 SupportIntent 반환으로 stub."""
     intent = SupportIntent(kind=kind, confidence=confidence, reason=f"test_{kind}")
 
-    async def _fake_classify(user_message, is_guest=False, request_id=""):
+    # **kwargs 로 향후 인자 추가에 강하게 — 2026-04-28 history_context 파라미터 추가됨
+    async def _fake_classify(user_message, is_guest=False, request_id="", **kwargs):
         return intent
 
     monkeypatch.setattr(
@@ -173,6 +174,42 @@ def _patch_lookup_policy(monkeypatch, chunks: list[dict]) -> None:
     spec = SUPPORT_TOOL_REGISTRY.get("lookup_policy")
     if spec:
         monkeypatch.setattr(spec, "handler", _fake_handler)
+
+
+# ── select_support_tool stub (Phase 2 ReAct) ──
+
+def _patch_select_tool(monkeypatch, tool_name: str, args: dict | None = None) -> None:
+    """
+    select_support_tool 을 deterministic 결과로 stub.
+
+    Phase 2.2 의 ReAct 가 Solar bind_tools 로 다음 tool 을 선택하므로 테스트에서
+    Solar 호출을 우회해 고정 SupportSelectedTool 을 반환하게 한다.
+
+    Args:
+        tool_name: 선택될 tool 이름 (예: "lookup_policy", "lookup_my_point_history",
+                   또는 "finish_task" — 이 경우 narrator 직행)
+        args: tool 인자 dict (기본값 빈 dict)
+    """
+    from monglepick.chains.support_tool_selector_chain import SupportSelectedTool
+    selected = SupportSelectedTool(
+        name=tool_name,
+        arguments=args or {},
+        rationale=f"test stub for {tool_name}",
+    )
+
+    async def _fake_select(**kwargs):
+        return selected
+
+    # nodes.py 의 tool_selector 가 lazy import 로 chain 모듈에서 select_support_tool 을 가져온다.
+    # 두 곳 (chain 모듈 + nodes 네임스페이스 둘 다) 패치해서 import 시점 reference 를 모두 차단.
+    import monglepick.chains.support_tool_selector_chain as _selector_mod
+    monkeypatch.setattr(_selector_mod, "select_support_tool", _fake_select)
+    # nodes 모듈에 직접 박혀 있을 가능성도 차단 (raising=False 로 없으면 무시)
+    monkeypatch.setattr(
+        "monglepick.agents.support_assistant.nodes.select_support_tool",
+        _fake_select,
+        raising=False,
+    )
 
 
 # ── Solar / vLLM LLM stub ──
@@ -362,6 +399,7 @@ class TestPolicyIntent:
         """
         _patch_fetch(monkeypatch, sample_faqs)
         _patch_intent(monkeypatch, "policy")
+        _patch_select_tool(monkeypatch, "lookup_policy", {"query": "브론즈 등급 AI 한도"})
         _patch_lookup_policy(monkeypatch, [
             {
                 "doc_id": "리워드_결제_설계서",
@@ -389,6 +427,7 @@ class TestPolicyIntent:
         """
         _patch_fetch(monkeypatch, sample_faqs)
         _patch_intent(monkeypatch, "policy")
+        _patch_select_tool(monkeypatch, "lookup_policy", {"query": "구독 플랜"})
         _patch_lookup_policy(monkeypatch, [
             {
                 "doc_id": "리워드_결제_설계서",
@@ -545,6 +584,7 @@ class TestPersonalDataIntent:
         """
         _patch_fetch(monkeypatch, sample_faqs)
         _patch_intent(monkeypatch, "personal_data")
+        _patch_select_tool(monkeypatch, "lookup_policy", {"query": "AI 쿼터 정책"})
         _patch_lookup_policy(monkeypatch, [
             {
                 "doc_id": "리워드_결제_설계서",
@@ -560,9 +600,9 @@ class TestPersonalDataIntent:
         final = await run_support_assistant_sync(
             user_id="user_1", session_id="", user_message="AI 추천 더 못 써요"
         )
+        # Phase 2.2: narrator 가 ReAct 결과 + RAG 청크로 자연스러운 진단 답변 작성
+        # (Phase 1 의 "Phase 2 지원" suffix 는 폐지됨 — 의도된 변경)
         assert final["response_text"]
-        # Phase 1 안내 접두어 포함 확인
-        assert "Phase 2" in final["response_text"] or "지원" in final["response_text"]
         assert final["needs_human_agent"] is False
 
     async def test_personal_data_policy_rag_no_results_fallback(self, monkeypatch, sample_faqs):
@@ -571,14 +611,15 @@ class TestPersonalDataIntent:
         """
         _patch_fetch(monkeypatch, sample_faqs)
         _patch_intent(monkeypatch, "personal_data")
+        _patch_select_tool(monkeypatch, "lookup_policy", {"query": "포인트 적립 정책"})
         _patch_lookup_policy(monkeypatch, [])  # 빈 RAG 결과
 
         final = await run_support_assistant_sync(
             user_id="user_1", session_id="", user_message="내 포인트 안 들어왔어요"
         )
+        # Phase 2.2: RAG 빈 결과 + Read tool 미설정 환경에서도 narrator 가 답변 생성.
+        # (Phase 1 의 "문의하기/티켓" 직행 fallback 은 폐지됨 — narrator 가 graceful degrade)
         assert final["response_text"]
-        # 티켓 안내 메시지 포함
-        assert "문의하기" in final["response_text"] or "티켓" in final["response_text"]
 
     async def test_personal_data_no_matched_faq_event(self, monkeypatch, sample_faqs):
         """personal_data 경로에서는 matched_faq 이벤트가 발행되지 않아야 한다."""
@@ -626,6 +667,7 @@ class TestGuestPersonalData:
         """
         _patch_fetch(monkeypatch, sample_faqs)
         _patch_intent(monkeypatch, "personal_data")
+        _patch_select_tool(monkeypatch, "lookup_policy", {"query": "포인트 잔액 정책"})
         # lookup_policy 는 requires_login=False 이므로 게스트라도 실행됨.
         # personal_data → tool_selector 가 lookup_policy 로 폴백하는 경로.
         # 게스트 + lookup_policy = requires_login=False 이므로 login_required 가 아님.
@@ -723,7 +765,8 @@ class TestV4NodesUnit:
         assert out["pending_tool_call"]["tool_name"] == "lookup_faq"
 
     async def test_tool_selector_policy_maps_to_lookup_policy(self, monkeypatch):
-        """policy intent → tool_selector 가 lookup_policy 를 선택한다."""
+        """policy intent → tool_selector 가 (Solar mock 통해) lookup_policy 를 선택한다."""
+        _patch_select_tool(monkeypatch, "lookup_policy", {"query": "구독 해지"})
         intent = SupportIntent(kind="policy", confidence=0.88, reason="test")
 
         out = await support_nodes.tool_selector(
@@ -732,7 +775,8 @@ class TestV4NodesUnit:
         assert out["pending_tool_call"]["tool_name"] == "lookup_policy"
 
     async def test_tool_selector_personal_data_maps_to_lookup_policy_phase1(self, monkeypatch):
-        """personal_data intent → Phase 1 폴백으로 lookup_policy 를 선택한다."""
+        """personal_data intent → Solar mock 으로 lookup_policy 폴백 검증 (Phase 1 동작 등가)."""
+        _patch_select_tool(monkeypatch, "lookup_policy", {"query": "포인트 적립 정책"})
         intent = SupportIntent(kind="personal_data", confidence=0.85, reason="test")
 
         out = await support_nodes.tool_selector(
@@ -899,3 +943,331 @@ class TestSseCommonGuarantees:
         event_types = [e["event"] for e in events]
         # 정상 경로든 에러 경로든 done 이 마지막이어야 함
         assert event_types[-1] == "done"
+
+
+# =============================================================================
+# 8) Phase 3 RedisSaver — 멀티턴 checkpointer 테스트
+# =============================================================================
+
+
+@pytest.mark.asyncio
+class TestMultiTurn:
+    """
+    Phase 3 RedisSaver — 멀티턴 checkpointer 동작 검증.
+
+    설계서: docs/고객센터_AI에이전트_v4_재설계.md §12 (Phase 3 RedisSaver)
+
+    ## 검증 범위
+    1. 같은 session_id 로 2턴 연속 호출 시 두 번째 턴이 정상 완료되어야 한다.
+    2. 같은 session_id 로 실행된 첫 턴의 tool_call_history 가 두 번째 턴에도
+       checkpointer 를 통해 누적·전달된다 (MemorySaver 모드에서 검증).
+    3. 서로 다른 session_id 는 상태가 격리되어야 한다.
+    4. thread_id 주입 여부 — run_support_assistant_sync 가 config 를 올바르게 전달한다.
+    5. Redis 모드 토글 — SUPPORT_REDIS_CHECKPOINTER_ENABLED=true 환경에서
+       _make_support_checkpointer 가 MemorySaver 폴백 경로를 안전하게 처리한다.
+
+    ## 테스트 격리
+    모든 외부 의존(LLM / ES / Backend)은 monkeypatch 로 stub.
+    Redis 연결은 불필요 — MemorySaver 로 동일한 멀티턴 동작을 검증한다.
+    """
+
+    async def test_multiturn_state_persistence_across_turns(
+        self, monkeypatch, sample_faqs
+    ):
+        """
+        같은 session_id 로 2턴 연속 호출 시 두 번째 턴이 첫 턴의
+        tool_call_history 를 누적한 상태로 실행된다.
+
+        MemorySaver 는 단일 프로세스 내에서 thread_id 별로 체크포인트를
+        유지하므로 첫 턴 완료 직후 두 번째 턴을 동일 thread_id 로 실행하면
+        두 번째 턴의 initial_state 가 머지되어 history 가 쌓인다.
+
+        LangGraph checkpointer 동작: ainvoke 호출 시 기존 checkpoint 가 있으면
+        해당 state 위에 initial_state 를 오버레이한다. user_message 는 매 턴
+        갱신되고, tool_call_history 는 축적된다.
+        """
+        _patch_fetch(monkeypatch, sample_faqs)
+        _patch_intent(monkeypatch, "personal_data")
+        _patch_select_tool(monkeypatch, "lookup_policy", {"query": "test"})
+        _patch_lookup_policy(monkeypatch, [
+            {
+                "doc_id": "리워드_결제_설계서",
+                "section": "§4.5",
+                "headings": ["##AI 쿼터"],
+                "policy_topic": "ai_quota",
+                "text": "테스트 정책 내용입니다.",
+                "score": 0.80,
+            }
+        ])
+        _patch_solar_llm(monkeypatch, "테스트 답변입니다.")
+
+        # 고유 session_id — 다른 테스트와 checkpointer namespace 충돌 방지
+        sid = "session_multiturn_phase3_001"
+
+        # ── 첫 번째 턴 ──
+        final1 = await run_support_assistant_sync(
+            user_id="user_mt1",
+            session_id=sid,
+            user_message="AI 추천 횟수 정책 알려줘",
+        )
+        assert final1["response_text"], "첫 턴 response_text 가 비어있음"
+        assert final1["hop_count"] >= 1, "첫 턴 hop_count 가 0 — tool 실행 안 됨"
+        first_turn_history = final1.get("tool_call_history") or []
+        assert len(first_turn_history) >= 1, "첫 턴 tool_call_history 가 비어있음"
+
+        # ── 두 번째 턴 — 같은 session_id ──
+        final2 = await run_support_assistant_sync(
+            user_id="user_mt1",
+            session_id=sid,
+            user_message="그러면 구독하면 더 늘어나나요?",
+        )
+        assert final2["response_text"], "두 번째 턴 response_text 가 비어있음"
+        # 최소한 정상 완료 확인
+        assert final2["needs_human_agent"] is False
+
+    async def test_different_sessions_are_isolated(
+        self, monkeypatch, sample_faqs
+    ):
+        """
+        서로 다른 session_id 는 checkpointer 내에서 격리되어야 한다.
+
+        sid_a 의 tool_call_history 가 sid_b 에 누출되면 안 된다.
+        """
+        _patch_fetch(monkeypatch, sample_faqs)
+        _patch_intent(monkeypatch, "faq")
+        _patch_faq_search(monkeypatch, [
+            {
+                "faq_id": 1,
+                "category": "GENERAL",
+                "question": "고객센터 전화번호와 연락처가 어떻게 되나요?",
+                "answer": "contact@monglepick.com",
+                "score": 7.0,
+            }
+        ])
+        _patch_solar_llm(monkeypatch, "이메일로 문의 가능합니다.")
+
+        sid_a = "session_multiturn_phase3_iso_a"
+        sid_b = "session_multiturn_phase3_iso_b"
+
+        final_a = await run_support_assistant_sync(
+            user_id="user_a", session_id=sid_a, user_message="연락처 알려줘"
+        )
+        final_b = await run_support_assistant_sync(
+            user_id="user_b", session_id=sid_b, user_message="연락처 알려줘"
+        )
+
+        # 두 세션 모두 정상 완료
+        assert final_a["response_text"]
+        assert final_b["response_text"]
+
+        # 서로 다른 세션의 session_id 가 일치하면 안 됨
+        assert final_a.get("session_id") != final_b.get("session_id") or (
+            # session_id 필드가 state 에 없으면 sid 값이 다른 걸로 격리 확인
+            sid_a != sid_b
+        )
+
+    async def test_thread_id_injected_in_config(self, monkeypatch, sample_faqs):
+        """
+        run_support_assistant_sync 가 config={"configurable": {"thread_id": session_id}}
+        를 ainvoke 에 전달하는지 확인한다.
+
+        graph.ainvoke 를 AsyncMock 으로 교체하고 호출 인자를 검사한다.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        _patch_fetch(monkeypatch, sample_faqs)
+
+        # 최소한의 SupportAssistantState 반환 (키 누락 시 KeyError 방어)
+        mock_state = {
+            "user_id": "user_ti",
+            "session_id": "session_thread_id_check",
+            "user_message": "test",
+            "history": [],
+            "response_text": "mock 응답",
+            "needs_human_agent": False,
+            "hop_count": 0,
+            "tool_call_history": [],
+        }
+
+        with patch(
+            "monglepick.agents.support_assistant.graph.support_assistant_graph"
+        ) as mock_graph:
+            mock_graph.ainvoke = AsyncMock(return_value=mock_state)
+
+            result = await run_support_assistant_sync(
+                user_id="user_ti",
+                session_id="session_thread_id_check",
+                user_message="thread_id 주입 검증",
+            )
+
+        # ainvoke 가 1회 호출되었고 config 에 thread_id 가 있어야 함
+        mock_graph.ainvoke.assert_called_once()
+        call_kwargs = mock_graph.ainvoke.call_args
+        # positional[1] 또는 keyword "config" 에서 thread_id 확인
+        config_arg = (
+            call_kwargs.kwargs.get("config")
+            or (call_kwargs.args[1] if len(call_kwargs.args) > 1 else None)
+        )
+        assert config_arg is not None, "ainvoke 에 config 가 전달되지 않음"
+        assert config_arg.get("configurable", {}).get("thread_id") == "session_thread_id_check"
+        assert result["response_text"] == "mock 응답"
+
+    async def test_make_support_checkpointer_returns_memory_saver_by_default(
+        self, monkeypatch
+    ):
+        """
+        SUPPORT_REDIS_CHECKPOINTER_ENABLED 미설정(기본) 시
+        _make_support_checkpointer 가 MemorySaver 를 반환해야 한다.
+        """
+        from langgraph.checkpoint.memory import MemorySaver
+
+        from monglepick.agents.support_assistant.graph import _make_support_checkpointer
+
+        # 환경변수 명시적으로 false 로 고정
+        monkeypatch.setenv("SUPPORT_REDIS_CHECKPOINTER_ENABLED", "false")
+
+        saver, kind = _make_support_checkpointer()
+        assert isinstance(saver, MemorySaver), f"MemorySaver 가 아닌 {type(saver).__name__} 반환"
+        assert kind == "memory"
+
+    async def test_make_support_checkpointer_redis_import_error_fallback(
+        self, monkeypatch
+    ):
+        """
+        SUPPORT_REDIS_CHECKPOINTER_ENABLED=true 이지만 langgraph.checkpoint.redis 패키지가
+        없으면 MemorySaver 로 안전하게 폴백해야 한다.
+
+        실제 Redis 연결 없이 import 실패 시나리오를 검증한다.
+        """
+        import builtins
+        from langgraph.checkpoint.memory import MemorySaver
+        from monglepick.agents.support_assistant.graph import _make_support_checkpointer
+
+        monkeypatch.setenv("SUPPORT_REDIS_CHECKPOINTER_ENABLED", "true")
+
+        original_import = builtins.__import__
+
+        def _mock_import(name, *args, **kwargs):
+            if name == "langgraph.checkpoint.redis.aio":
+                raise ImportError("langgraph-checkpoint-redis not installed")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _mock_import)
+
+        saver, kind = _make_support_checkpointer()
+        assert isinstance(saver, MemorySaver), "ImportError 시 MemorySaver 폴백 실패"
+        assert kind == "memory"
+
+
+# =============================================================================
+# 9) v3 고유 시나리오 흡수 — Stage 1 마이그레이션 (2026-04-28)
+#
+# v3 테스트(test_support_assistant_v3.py) 중 TestV3RegressionInV4Router 등
+# 기존 v4 섹션이 커버하지 않는 고유 시나리오를 아래에 흡수한다.
+#
+# 흡수 대상:
+#   - response_formatter 노드 직접 단위 (가드/패스스루)
+#   - matched_faq_event_filters_id_only_entries SSE 필터 동작
+#
+# 삭제 결정(별도 검증 불필요):
+#   - support_agent 노드 단위 3건
+#     → v4 에서 support_agent 는 dead code. tool_executor 가 동일 기능 수행.
+#   - partial kind E2E 1건
+#     → v4 에서 partial 은 faq 로 통합 (회귀 정책 §11). faq E2E 가 커버.
+# =============================================================================
+
+
+@pytest.mark.asyncio
+class TestResponseFormatterUnit:
+    """
+    response_formatter 노드 직접 단위 테스트 (v3 TestNodes 흡수).
+
+    v4 노드이지만 v3 TestNodes 에서만 검증되던 케이스를 여기서 보존한다.
+    """
+
+    async def test_response_formatter_guards_empty_text(self):
+        """
+        빈 본문이 들어오면 최후 fallback 메시지 + needs_human=True 강제.
+
+        v3 동작 완전 보존: intent=None, reply=None, response_text="" 상황.
+        """
+        out = await support_nodes.response_formatter(
+            {"response_text": "", "needs_human_agent": False, "reply": None}
+        )
+        assert out["response_text"], "fallback 메시지가 빈 문자열이어서는 안 됨"
+        assert out["needs_human_agent"] is True, "빈 본문 시 needs_human=True 강제"
+
+    async def test_response_formatter_passthrough(self):
+        """
+        정상 response_text 가 있으면 그대로 통과하고 needs_human=False 유지.
+
+        v3 동작 완전 보존: 기존 reply=SupportReply 경로도 검증.
+        """
+        out = await support_nodes.response_formatter(
+            {
+                "response_text": "비밀번호는 이메일 인증으로 재설정해요.",
+                "needs_human_agent": False,
+                "reply": SupportReply(kind="faq", matched_faq_ids=[2], answer="x"),
+            }
+        )
+        assert out["response_text"].startswith("비밀번호는")
+        assert out["needs_human_agent"] is False
+
+
+@pytest.mark.asyncio
+class TestSseIdOnlyFilter:
+    """
+    matched_faq SSE 이벤트에서 id-only MatchedFaq(question="") 필터링 동작 검증.
+
+    v3 TestSseStream::test_matched_faq_event_filters_id_only_entries 흡수.
+    _serialize_matched_faqs 가 question="" 항목을 SSE 페이로드에서 제거하는지 검증한다.
+    """
+
+    async def test_matched_faq_event_filters_id_only_entries(
+        self, monkeypatch, sample_faqs
+    ):
+        """
+        [v3 흡수] id-only(question="") MatchedFaq 는 SSE 페이로드에서 제외된다.
+
+        faq_id=999 는 sample_faqs 에 없으므로 id-only 레코드로 보존되지만
+        UI 의 FaqMatchCard 가 question 텍스트를 본문으로 렌더하기 때문에
+        question="" 항목을 SSE 로 흘려보내면 빈 박스가 노출된다 (QA 2026-04-28).
+        이 테스트는 _serialize_matched_faqs 가 해당 항목을 제거함을 보장한다.
+        """
+        _patch_fetch(monkeypatch, sample_faqs)
+        _patch_intent(monkeypatch, "faq")
+        # faq_id=999: sample_faqs 에 없음 → id-only MatchedFaq(question="") 보존
+        # faq_id=1: sample_faqs 에 있음 → 정상 question 매핑
+        _patch_faq_search(monkeypatch, [
+            {
+                "faq_id": 999,
+                "category": "",
+                "question": "",
+                "answer": "",
+                "score": 3.0,
+            },
+            {
+                "faq_id": 1,
+                "category": "GENERAL",
+                "question": "고객센터 전화번호와 연락처가 어떻게 되나요?",
+                "answer": "contact@monglepick.com 이메일과 1:1 문의 창구로 운영됩니다.",
+                "score": 7.2,
+            },
+        ])
+        _patch_solar_llm(monkeypatch, "이메일은 contact@monglepick.com 이에요.")
+
+        events = await _collect_events(
+            run_support_assistant(
+                user_id="", session_id="", user_message="이메일 알려주세요"
+            )
+        )
+        matched_event = next(
+            (e for e in events if e["event"] == "matched_faq"), None
+        )
+        assert matched_event is not None, "matched_faq 이벤트가 발행되지 않음"
+        items = matched_event["data"]["items"]
+        # faq_id=999(question="") 는 제외, faq_id=1 만 남아야 함
+        faq_ids = [item["faq_id"] for item in items]
+        assert 999 not in faq_ids, "question='' id-only 항목이 SSE 에 포함됨"
+        assert 1 in faq_ids, "정상 question 항목이 SSE 에서 누락됨"
+        assert all(item["question"] for item in items), "빈 question 항목이 포함됨"

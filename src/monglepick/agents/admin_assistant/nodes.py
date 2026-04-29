@@ -81,6 +81,81 @@ _NOT_ADMIN_MESSAGE = (
 
 
 # ============================================================
+# 2026-04-28 (길 A v3 보강) — tool_history_summary 용 헬퍼
+# ============================================================
+# 이전 hop 결과 이력을 다음 hop 의 tool_selector 프롬프트에 주입할 때, tool 이름만
+# 담으면 LLM 이 "같은 tool 이지만 다른 인자" 라고 합리화해 중복 호출하는 사고가 잦았다.
+# 핵심 필터값을 함께 넣어 "stats_trends(period=7d)" 형식으로 렌더한다.
+
+# 본문성 필드 — observation 단계에서 이력에 안 담음 (LLM 프롬프트 토큰 절약).
+_HEAVY_BODY_FIELDS: frozenset[str] = frozenset({
+    "content",
+    "answer",
+    "explanation",
+    "body",
+})
+
+# 핵심 필터/식별 필드 우선순위 — 이력 라인에 보일 키 순서.
+_PRIORITY_HISTORY_KEYS: tuple[str, ...] = (
+    "mode", "target_id", "ticket_id", "noticeId", "userId", "orderId",
+    "subscriptionId", "reportId", "page", "size", "period", "from", "to",
+    "status", "category", "keyword", "q", "type", "noticeType", "displayType",
+)
+
+_HISTORY_VALUE_MAX_LEN: int = 24  # 한 값 최대 표기 길이
+
+
+def _compact_args_for_history(args: dict[str, Any] | None) -> dict[str, Any]:
+    """
+    pending_tool_call.arguments 를 받아 이력 저장용 축약 dict 로 변환한다.
+
+    - 본문성 필드(content/answer/explanation/body) 는 길이만 표기 ("len=NNN").
+    - 나머지는 그대로 두되 너무 긴 문자열/리스트는 truncate.
+    - None 값은 제외.
+    """
+    if not args or not isinstance(args, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for k, v in args.items():
+        if v is None:
+            continue
+        if k in _HEAVY_BODY_FIELDS and isinstance(v, str):
+            compact[k] = f"len={len(v)}"
+            continue
+        if isinstance(v, str) and len(v) > _HISTORY_VALUE_MAX_LEN:
+            compact[k] = v[: _HISTORY_VALUE_MAX_LEN] + "…"
+            continue
+        if isinstance(v, list) and len(v) > 3:
+            compact[k] = f"list({len(v)})"
+            continue
+        compact[k] = v
+    return compact
+
+
+def _format_history_args(args: dict[str, Any] | None) -> str:
+    """
+    축약 args dict 를 LLM 프롬프트용 단일 라인 문자열로 렌더한다.
+
+    형식: "mode=update target_id=1 keyword=환불"
+    빈 dict 면 빈 문자열 반환.
+    우선순위 키부터 표기 → 나머지 키는 사전순.
+    """
+    if not args:
+        return ""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for key in _PRIORITY_HISTORY_KEYS:
+        if key in args:
+            parts.append(f"{key}={args[key]}")
+            seen.add(key)
+    for key in sorted(args.keys()):
+        if key in seen:
+            continue
+        parts.append(f"{key}={args[key]}")
+    return " ".join(parts)
+
+
+# ============================================================
 # intent 별 placeholder 응답 (Step 1: tool 실행 미구현)
 # ============================================================
 
@@ -423,8 +498,10 @@ async def tool_selector(state: AdminAssistantState) -> dict:
     # 현재 hop 카운트 (iteration_count 재사용)
     hop_count: int = state.get("iteration_count") or 0
 
-    # 이전 hop 결과 이력에서 tool_history_summary 생성
-    # 형식: "1. tool_name → ok=True row_count=5\n2. ..."
+    # 이전 hop 결과 이력에서 tool_history_summary 생성 (2026-04-28 v3 보강).
+    # 형식: "1. tool_name(mode=update target_id=1) → ok=True row_count=5"
+    # 핵심 필터값을 args 부분에 노출해 LLM 이 "같은 tool 이지만 다른 인자라 또 호출해도 됨"
+    # 으로 합리화하는 사고를 줄인다.
     results_history: list[dict[str, Any]] = list(state.get("tool_results_history") or [])
     summary_lines: list[str] = []
     for idx, entry in enumerate(results_history, start=1):
@@ -432,7 +509,10 @@ async def tool_selector(state: AdminAssistantState) -> dict:
         ok = entry.get("ok", False)
         row_count = entry.get("row_count")
         row_str = f" row_count={row_count}" if row_count is not None else ""
-        summary_lines.append(f"{idx}. {tool_name} → ok={ok}{row_str}")
+        # arguments 축약본 라인 — 빈 dict 면 () 만 표기
+        args_str = _format_history_args(entry.get("arguments") or {})
+        args_part = f"({args_str})" if args_str else "()"
+        summary_lines.append(f"{idx}. {tool_name}{args_part} → ok={ok}{row_str}")
     tool_history_summary: str = "\n".join(summary_lines) if summary_lines else ""
 
     if not admin_role or not user_message.strip():
@@ -877,8 +957,16 @@ async def observation(state: AdminAssistantState) -> dict:
             ok = False
             row_count = None
 
+        # 2026-04-28 보강 (길 A v3): arguments 핵심 필터값을 같이 저장 → 다음 hop 의
+        # tool_history_summary 가 "stats_trends(period=7d)" 형식으로 렌더되어 LLM 이
+        # 같은 도구를 같은 인자로 다시 호출하는 사고를 줄여준다.
+        # 너무 큰 dict (content / answer 같은 본문) 은 길이를 자르고, 핵심 필터값만 보존.
+        compact_args = _compact_args_for_history(
+            call.arguments if call else {},
+        )
         results_history.append({
             "tool_name": call.tool_name if call else "",
+            "arguments": compact_args,
             "ok": ok,
             "row_count": row_count,
             "summary": "",  # 필요 시 narrator 가 full result 에서 생성

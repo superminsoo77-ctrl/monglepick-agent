@@ -28,12 +28,78 @@ Role 매트릭스 (§5):
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
 from monglepick.api.admin_backend_client import AdminApiResult
 from monglepick.tools.admin_tools import ToolContext, ToolSpec, register_tool
+
+
+# ============================================================
+# 2026-04-28 (길 A v3 보강) — Draft Tool 공용 상수
+# ============================================================
+# 모든 Draft Args 가 공유하는 두 개의 운영 필드:
+#   - mode: "create" | "update" — 생성 vs 수정 분기. LLM 이 사용자 발화에서 ID·번호·
+#     "수정/보강/다시 쓰" 어휘를 보고 update 로 판정해 target_id 와 함께 채워야 한다.
+#   - target_id: 수정 대상 PK (정수 또는 문자열). update 일 때 필수, create 일 때 None.
+# 핸들러는 이 두 값을 보고 target_path 의 modal 을 create/edit 으로 분기한다.
+
+# FAQ 카테고리는 Backend SupportCategory enum (6종) 과 1:1 동기화.
+# 자유 텍스트 허용 시 "환불" 같은 사용자 발화가 그대로 들어가 Backend 400 → "잘못된 입력입니다".
+FaqCategoryLiteral = Literal[
+    "GENERAL",         # 일반 문의
+    "ACCOUNT",         # 계정 / 회원
+    "CHAT",            # AI 채팅
+    "RECOMMENDATION",  # 영화 추천
+    "COMMUNITY",       # 커뮤니티 게시판
+    "PAYMENT",         # 결제 / 구독 / 포인트
+]
+
+# 공지사항 노출 방식 — Backend NoticeCreateRequest.displayType (Size 20) 와 매칭.
+NoticeDisplayTypeLiteral = Literal["LIST_ONLY", "BANNER", "POPUP", "MODAL"]
+
+# Draft 공통 mode 타입 — 모든 Args 가 이 값을 default="create" 로 받는다.
+DraftModeLiteral = Literal["create", "update"]
+
+
+def _resolve_target_path(
+    base_path: str,
+    mode: str,
+    target_id: Optional[int | str],
+    create_modal: str = "create",
+    edit_modal: str = "edit",
+) -> str:
+    """
+    mode + target_id 조합으로 Client 가 열 모달 경로를 만든다.
+
+    - mode=="update" + target_id 가 truthy → `{base_path}&modal={edit_modal}&id={target_id}`
+    - 그 외 → `{base_path}&modal={create_modal}`
+
+    Client(SupportPage, ContentEventsPage 등) 는 modal=edit&id= 를 보고 기존 데이터를
+    Backend 에서 조회해 폼에 prefill 한 뒤 draft_fields 로 덮어쓴다 (보강 워크플로우).
+    """
+    base = base_path.rstrip("&")
+    if mode == "update" and target_id not in (None, "", 0):
+        return f"{base}&modal={edit_modal}&id={target_id}"
+    return f"{base}&modal={create_modal}"
+
+
+def _build_draft_summary(
+    mode: str,
+    target_id: Optional[int | str],
+    create_phrase: str,
+    update_phrase: str,
+) -> str:
+    """
+    mode 에 따라 자연스러운 한국어 요약 문장을 만든다.
+
+    create_phrase: "공지 초안 'X' 을(를) 준비했어요. 검토 후 저장해주세요."
+    update_phrase: "공지 #ID 'X' 을(를) 보강했어요. 검토 후 저장해주세요."
+    """
+    if mode == "update" and target_id not in (None, "", 0):
+        return update_phrase
+    return create_phrase
 
 
 # ============================================================
@@ -74,70 +140,240 @@ _FINANCE_ROLES: set[str] = {
 # ============================================================
 
 class NoticeDraftArgs(BaseModel):
-    """공지사항 초안 생성 인자."""
+    """
+    공지사항 초안 생성/수정 인자.
 
+    Backend DTO: AdminSupportDto.NoticeCreateRequest / NoticeUpdateRequest 와 1:1 매칭.
+    필수 필드: title, content (NotBlank). 그 외는 선택 — Client 가 기본값으로 채운다.
+
+    수정(update) 흐름:
+    - 사용자 발화에 공지 ID/번호 또는 "수정·보강·다시 써" 어휘가 있으면 mode="update" + target_id.
+    - LLM 은 먼저 read_notices/get_notice_by_id 로 기존 본문을 읽고, 그 본문을 토대로
+      content 필드에 **보강된 전체 본문** 을 채워야 한다 (절대 "내용을 보강합니다" 같은
+      메타 문구만 넣지 말 것).
+    """
+
+    mode: DraftModeLiteral = Field(
+        default="create",
+        description=(
+            "동작 모드. 'create'=새 공지 생성, 'update'=기존 공지 수정. "
+            "사용자 발화에 공지 ID·번호·'수정/보강' 어휘가 있으면 'update' 로 채우고 "
+            "target_id 도 함께 지정한다."
+        ),
+    )
+    target_id: Optional[int] = Field(
+        default=None,
+        description=(
+            "mode='update' 일 때 수정 대상 공지의 PK (notice_id, BIGINT). "
+            "발화에서 'N번 공지', '공지 #N', '첫번째 공지(=목록 첫 항목)' 같은 어휘가 있으면 "
+            "먼저 read tool 로 ID 를 확인한 뒤 채워야 한다. mode='create' 일 때는 None."
+        ),
+    )
     title: str = Field(
-        description="공지 제목 (예: '서비스 점검 안내', '신기능 업데이트').",
-    )
-    type: str = Field(
-        default="NOTICE",
-        description="공지 유형. 'NOTICE'(일반 공지) | 'NEWS'(뉴스) | 'EVENT'(이벤트).",
-    )
-    pinned: bool = Field(
-        default=False,
-        description="상단 고정 여부. 중요 공지는 True 로 설정.",
+        description=(
+            "공지 제목 (예: '서비스 점검 안내', '신기능 업데이트'). "
+            "수정 모드에서도 반드시 채워야 함 (NotBlank). 기존 제목 유지가 필요하면 "
+            "read 로 가져온 원본 제목을 그대로 넣는다."
+        ),
     )
     content: str = Field(
-        default="",
-        description="공지 본문 내용.",
+        description=(
+            "공지 본문 — **즉시 게시 가능한 수준의 구체적이고 풍부한 내용**. "
+            "수정 모드에서 '내용 보강' 요청이면 read 로 가져온 원본을 토대로 단락을 추가하고 "
+            "구체 일정·범위·문의처 등을 보충해 완성된 본문을 채운다. "
+            "절대 '내용을 보강합니다' 같은 placeholder 문구만 넣지 말 것."
+        ),
+    )
+    noticeType: str = Field(
+        default="NOTICE",
+        description="콘텐츠 카테고리. 'NOTICE'(일반) | 'UPDATE'(업데이트) | 'MAINTENANCE'(점검) | 'EVENT'(이벤트).",
+    )
+    displayType: NoticeDisplayTypeLiteral = Field(
+        default="LIST_ONLY",
+        description=(
+            "노출 방식. 'LIST_ONLY'(목록만) | 'BANNER'(배너) | 'POPUP'(팝업) | 'MODAL'(모달). "
+            "Backend 기본값은 LIST_ONLY."
+        ),
+    )
+    isPinned: bool = Field(
+        default=False,
+        description="상단 고정 여부. 중요 공지는 True.",
+    )
+    sortOrder: Optional[int] = Field(
+        default=None,
+        description="정렬 순서 (선택). 미입력 시 Backend 가 부여.",
+    )
+    publishedAt: Optional[str] = Field(
+        default=None,
+        description="공개 시각 (ISO 8601, 예: '2026-05-01T00:00:00'). 없으면 즉시 공개.",
+    )
+    linkUrl: Optional[str] = Field(
+        default=None,
+        description="배너/팝업 클릭 시 이동 URL (선택, 최대 500자).",
+    )
+    imageUrl: Optional[str] = Field(
+        default=None,
+        description="배너/팝업 이미지 URL (선택, 최대 500자).",
     )
     startAt: Optional[str] = Field(
         default=None,
-        description="게시 시작 일시 (ISO 8601, 예: '2026-05-01T00:00:00'). 없으면 즉시 게시.",
+        description="앱 메인 노출 시작 일시 (ISO 8601). 없으면 즉시.",
     )
     endAt: Optional[str] = Field(
         default=None,
-        description="게시 종료 일시 (ISO 8601). 없으면 무기한.",
+        description="앱 메인 노출 종료 일시 (ISO 8601). 없으면 무기한.",
+    )
+    priority: Optional[int] = Field(
+        default=None,
+        description="앱 메인 노출 우선순위 (숫자가 클수록 상위). 미입력 시 0.",
+    )
+    isActive: Optional[bool] = Field(
+        default=None,
+        description="앱 메인 노출 활성 토글. 미입력 시 Client 기본값 사용.",
     )
 
 
 class FaqDraftArgs(BaseModel):
-    """FAQ 초안 생성 인자."""
+    """
+    FAQ 초안 생성/수정 인자.
 
-    category: str = Field(
-        description="FAQ 카테고리 (예: '결제', '회원', 'AI 추천', '서비스 이용').",
+    Backend DTO: AdminSupportDto.FaqCreateRequest / FaqUpdateRequest 와 1:1 매칭.
+    필수: category, question(<=500자), answer (모두 NotBlank).
+
+    category 강제 enum:
+        GENERAL · ACCOUNT · CHAT · RECOMMENDATION · COMMUNITY · PAYMENT
+    이 외의 값을 LLM 이 채우면 Backend 400 → "잘못된 입력입니다" 에러가 난다.
+    사용자 발화 예시 → 매핑:
+      "환불·결제·포인트 관련 FAQ" → PAYMENT
+      "로그인·비밀번호·탈퇴 FAQ"   → ACCOUNT
+      "AI 채팅 사용법 FAQ"        → CHAT
+      "추천 알고리즘 FAQ"         → RECOMMENDATION
+      "게시판/댓글/신고 FAQ"      → COMMUNITY
+      "그 외 일반 FAQ"            → GENERAL
+    """
+
+    mode: DraftModeLiteral = Field(
+        default="create",
+        description="'create'=신규, 'update'=기존 FAQ 수정. 발화에 FAQ ID·번호가 있으면 'update'.",
+    )
+    target_id: Optional[int] = Field(
+        default=None,
+        description="mode='update' 일 때 수정 대상 FAQ 의 PK (faq_id, BIGINT).",
+    )
+    category: FaqCategoryLiteral = Field(
+        description=(
+            "FAQ 카테고리 — 반드시 6종 enum 중 하나. "
+            "GENERAL/ACCOUNT/CHAT/RECOMMENDATION/COMMUNITY/PAYMENT. "
+            "한국어 발화는 위 매핑표에 따라 영문 enum 으로 변환해서 채울 것."
+        ),
     )
     question: str = Field(
-        description="FAQ 질문 문구 (예: '포인트 환불이 가능한가요?').",
+        max_length=500,
+        description=(
+            "FAQ 질문 문구 (최대 500자, NotBlank). "
+            "예: '포인트 환불이 가능한가요?', '비밀번호 재설정은 어떻게 하나요?'."
+        ),
     )
     answer: str = Field(
-        description="FAQ 답변 내용.",
+        description=(
+            "FAQ 답변 — **사용자가 바로 따라할 수 있는 구체적이고 친절한 안내**. "
+            "절차가 있으면 단계별로, 정책이 있으면 조건과 제한을 명시. "
+            "수정 모드에서 '내용 보강' 요청이면 기존 답변을 그대로 두지 말고 보강된 전체 본문을 채운다. "
+            "절대 '내용을 보강합니다' 같은 placeholder 금지."
+        ),
     )
-    tags: Optional[list[str]] = Field(
+    keywords: Optional[str] = Field(
         default=None,
-        description="검색·분류용 태그 목록 (예: ['포인트', '환불']). 없으면 빈 리스트.",
+        description=(
+            "ES 검색 키워드 힌트 (쉼표 구분 동의어 문자열). "
+            "예: '환불,반환,취소,돈' / '비밀번호,패스워드,암호,재설정'. "
+            "Backend 는 list 가 아니라 문자열을 받으므로 반드시 쉼표 구분 1줄 문자열로 채울 것."
+        ),
+    )
+    sortOrder: Optional[int] = Field(
+        default=None,
+        description="표시 순서 (선택). 미입력 시 Backend 가 부여.",
     )
 
 
 class HelpArticleDraftArgs(BaseModel):
-    """도움말 아티클 초안 생성 인자."""
+    """
+    도움말 아티클 초안 생성/수정 인자.
 
-    title: str = Field(
-        description="도움말 제목 (예: 'AI 추천 서비스 이용 방법').",
+    Backend DTO: AdminSupportDto.HelpArticleCreateRequest / HelpArticleUpdateRequest.
+    필수: category, title(<=200자), content (모두 NotBlank). category 는 FAQ 와 동일 enum.
+    """
+
+    mode: DraftModeLiteral = Field(
+        default="create",
+        description="'create'=신규, 'update'=기존 도움말 수정. 발화에 도움말 ID/번호가 있으면 'update'.",
     )
-    category: str = Field(
-        description="도움말 카테고리 (예: 'AI 서비스', '결제', '계정').",
+    target_id: Optional[int] = Field(
+        default=None,
+        description="mode='update' 일 때 수정 대상 도움말 PK (article_id, BIGINT).",
+    )
+    title: str = Field(
+        max_length=200,
+        description=(
+            "도움말 제목 (최대 200자, NotBlank). 예: 'AI 추천 서비스 이용 방법'."
+        ),
+    )
+    category: FaqCategoryLiteral = Field(
+        description=(
+            "도움말 카테고리 — FAQ 와 동일 enum 6종. "
+            "GENERAL/ACCOUNT/CHAT/RECOMMENDATION/COMMUNITY/PAYMENT."
+        ),
     )
     content: str = Field(
-        description="도움말 본문. 마크다운 허용.",
+        description=(
+            "도움말 본문 (마크다운 허용). **즉시 게시 가능한 수준의 풍부한 내용** 으로 채움. "
+            "단계별 설명, 스크린샷 자리표시, 자주 묻는 질문 섹션 등을 마크다운으로 구조화. "
+            "수정 모드의 보강 요청 시 기존 본문을 토대로 단락을 추가하고 누락된 절차/예외/문의처를 보충."
+        ),
+    )
+
+
+class TicketReplyDraftArgs(BaseModel):
+    """
+    고객센터 티켓 답변 초안 생성 인자 — 길 A v3 보강 (2026-04-28 신설).
+
+    Backend DTO: AdminSupportDto.TicketReplyRequest (필수: content NotBlank).
+    티켓별 단건 답변. 일괄("전부 답변") 발화는 LLM 이 첫 건에 대해서만 draft 를 만들고
+    "1건 prefill 했어요. 저장 후 다음 티켓을 처리해 주세요" 라고 안내하도록 프롬프트가 강제.
+
+    target_path: /admin/support?tab=tickets&ticketId={ticket_id}&modal=reply&prefill=1
+    Client TicketTab 이 modal=reply 를 보고 답변 모달을 띄운 뒤 draft.content 를 textarea 에 주입.
+    """
+
+    ticket_id: int = Field(
+        description=(
+            "답변할 티켓의 PK (ticket_id, BIGINT). 사용자 발화에서 'N번 티켓'·'#N' 으로 "
+            "특정되거나, 직전 read_tickets/get_ticket 결과에서 식별된 ID 를 그대로 채운다."
+        ),
+    )
+    content: str = Field(
+        description=(
+            "티켓 답변 본문 — **사용자가 곧바로 받아볼 수 있는 친절한 한국어 응답**. "
+            "사용자 질문을 한 줄로 요약 → 원인/안내 → 추가 도움 안내 (가능 시 도움말/FAQ 링크) → "
+            "마무리 인사 순서로 구체적이고 풍부하게 작성한다. 절대 '내용을 보강합니다' 같은 "
+            "placeholder 금지. 정책 모르면 LLM 이 추측하지 말고 짧게 '확인 후 답변드릴게요' 톤."
+        ),
     )
 
 
 class BannerDraftArgs(BaseModel):
-    """배너 초안 생성 인자."""
+    """배너 초안 생성/수정 인자."""
 
+    mode: DraftModeLiteral = Field(
+        default="create",
+        description="'create'=신규, 'update'=기존 배너 수정.",
+    )
+    target_id: Optional[int] = Field(
+        default=None,
+        description="mode='update' 일 때 수정 대상 배너 PK.",
+    )
     title: str = Field(
-        description="배너 제목 또는 문구.",
+        description="배너 제목 또는 문구. 클릭 유도가 분명한 짧은 카피로 채운다.",
     )
     imageUrl: str = Field(
         default="",
@@ -158,8 +394,16 @@ class BannerDraftArgs(BaseModel):
 
 
 class QuizDraftArgs(BaseModel):
-    """영화 퀴즈 초안 생성 인자."""
+    """영화 퀴즈 초안 생성/수정 인자."""
 
+    mode: DraftModeLiteral = Field(
+        default="create",
+        description="'create'=신규, 'update'=기존 퀴즈 수정.",
+    )
+    target_id: Optional[int] = Field(
+        default=None,
+        description="mode='update' 일 때 수정 대상 퀴즈 PK.",
+    )
     movieId: str = Field(
         description="퀴즈 대상 영화 ID (movie_id 문자열).",
     )
@@ -180,8 +424,16 @@ class QuizDraftArgs(BaseModel):
 
 
 class ChatSuggestionDraftArgs(BaseModel):
-    """채팅 추천 칩(빠른 질문) 초안 생성 인자."""
+    """채팅 추천 칩(빠른 질문) 초안 생성/수정 인자."""
 
+    mode: DraftModeLiteral = Field(
+        default="create",
+        description="'create'=신규, 'update'=기존 추천 칩 수정.",
+    )
+    target_id: Optional[int] = Field(
+        default=None,
+        description="mode='update' 일 때 수정 대상 추천 칩 PK.",
+    )
     surface: str = Field(
         description=(
             "노출 채널. 'user_chat'(사용자 채팅) | 'admin_assistant'(관리자 AI) | "
@@ -202,8 +454,16 @@ class ChatSuggestionDraftArgs(BaseModel):
 
 
 class TermDraftArgs(BaseModel):
-    """약관 초안 생성 인자."""
+    """약관 초안 생성/수정 인자."""
 
+    mode: DraftModeLiteral = Field(
+        default="create",
+        description="'create'=신규 버전 등록, 'update'=기존 약관 버전 수정.",
+    )
+    target_id: Optional[int] = Field(
+        default=None,
+        description="mode='update' 일 때 수정 대상 약관 PK.",
+    )
     type: str = Field(
         description=(
             "약관 유형. 'SERVICE'(서비스 이용약관) | 'PRIVACY'(개인정보처리방침) | "
@@ -219,8 +479,16 @@ class TermDraftArgs(BaseModel):
 
 
 class WorldcupCandidateDraftArgs(BaseModel):
-    """이상형 월드컵 후보 초안 생성 인자."""
+    """이상형 월드컵 후보 초안 생성/수정 인자."""
 
+    mode: DraftModeLiteral = Field(
+        default="create",
+        description="'create'=후보 추가, 'update'=기존 후보 수정.",
+    )
+    target_id: Optional[int] = Field(
+        default=None,
+        description="mode='update' 일 때 수정 대상 후보 PK.",
+    )
     movieId: str = Field(
         description="월드컵 후보로 추가할 영화 ID (movie_id 문자열).",
     )
@@ -231,8 +499,16 @@ class WorldcupCandidateDraftArgs(BaseModel):
 
 
 class RewardPolicyDraftArgs(BaseModel):
-    """리워드 정책 초안 생성 인자."""
+    """리워드 정책 초안 생성/수정 인자."""
 
+    mode: DraftModeLiteral = Field(
+        default="create",
+        description="'create'=신규 정책 등록, 'update'=기존 정책 수정.",
+    )
+    target_id: Optional[int] = Field(
+        default=None,
+        description="mode='update' 일 때 수정 대상 리워드 정책 PK.",
+    )
     code: str = Field(
         description=(
             "정책 코드 (예: 'REVIEW_WRITE', 'DAILY_LOGIN', 'FIRST_AI_USE'). "
@@ -252,8 +528,16 @@ class RewardPolicyDraftArgs(BaseModel):
 
 
 class PointPackDraftArgs(BaseModel):
-    """포인트 팩 상품 초안 생성 인자."""
+    """포인트 팩 상품 초안 생성/수정 인자."""
 
+    mode: DraftModeLiteral = Field(
+        default="create",
+        description="'create'=신규 팩 등록, 'update'=기존 팩 수정.",
+    )
+    target_id: Optional[int] = Field(
+        default=None,
+        description="mode='update' 일 때 수정 대상 포인트 팩 PK.",
+    )
     packCode: str = Field(
         description="팩 고유 코드 (예: 'PACK_10P', 'PACK_50P'). 영문 대문자 + 언더스코어.",
     )
@@ -275,32 +559,70 @@ class PointPackDraftArgs(BaseModel):
 async def _handle_notice_draft(
     ctx: ToolContext,
     title: str,
-    type: str = "NOTICE",
-    pinned: bool = False,
-    content: str = "",
+    content: str,
+    mode: str = "create",
+    target_id: int | None = None,
+    noticeType: str = "NOTICE",
+    displayType: str = "LIST_ONLY",
+    isPinned: bool = False,
+    sortOrder: int | None = None,
+    publishedAt: str | None = None,
+    linkUrl: str | None = None,
+    imageUrl: str | None = None,
     startAt: str | None = None,
     endAt: str | None = None,
+    priority: int | None = None,
+    isActive: bool | None = None,
 ) -> AdminApiResult:
     """
-    공지사항 초안 payload 를 조립한다.
+    공지사항 초안 payload 조립 — create/update 분기.
 
-    Backend 호출 없이 draft_fields dict 를 구성해 AdminApiResult 로 래핑 반환.
-    None 값 필드는 payload 에 그대로 포함 — Client 가 undefined 로 처리한다.
+    update 시 target_path 에 modal=edit&id={target_id} 가 붙어 Client SupportPage 가
+    edit 모달을 띄우고 Backend GET /api/v1/admin/notices/{id} 로 기존 데이터를 prefetch 한 뒤
+    draft_fields 로 덮어쓴다.
     """
+    # Backend NoticeCreateRequest / NoticeUpdateRequest 모든 필드를 draft_fields 에 담는다.
+    # None 값은 Client 가 기본값으로 채우므로 그대로 전달.
     draft_fields: dict = {
         "title": title,
-        "type": type,
-        "pinned": pinned,
         "content": content,
+        "noticeType": noticeType,
+        "displayType": displayType,
+        "isPinned": isPinned,
+        "sortOrder": sortOrder,
+        "publishedAt": publishedAt,
+        "linkUrl": linkUrl,
+        "imageUrl": imageUrl,
         "startAt": startAt,
         "endAt": endAt,
+        "priority": priority,
+        "isActive": isActive,
     }
+    target_path = _resolve_target_path(
+        base_path="/admin/support?tab=notice",
+        mode=mode,
+        target_id=target_id,
+    )
+    summary = _build_draft_summary(
+        mode=mode,
+        target_id=target_id,
+        create_phrase=f"공지 초안 '{title}'을(를) 준비했어요. 검토 후 저장해주세요.",
+        update_phrase=(
+            f"공지 #{target_id} '{title}' 보강안을 준비했어요. "
+            "수정 모달에서 검토 후 저장해주세요."
+        ),
+    )
+    action_label = (
+        "공지사항 수정 화면 열기" if mode == "update" and target_id else "공지사항 작성 화면 열기"
+    )
     data = {
-        "target_path": "/admin/support?tab=notice&modal=create",
+        "target_path": target_path,
         "draft_fields": draft_fields,
-        "action_label": "공지사항 작성 화면 열기",
-        "summary": f"공지 초안 '{title}'을 준비했어요. 검토 후 저장해주세요.",
+        "action_label": action_label,
+        "summary": summary,
         "tool_name": "notice_draft",
+        "mode": mode,
+        "target_id": target_id,
     }
     return AdminApiResult(
         ok=True,
@@ -317,25 +639,49 @@ async def _handle_faq_draft(
     category: str,
     question: str,
     answer: str,
-    tags: list[str] | None = None,
+    mode: str = "create",
+    target_id: int | None = None,
+    keywords: str | None = None,
+    sortOrder: int | None = None,
 ) -> AdminApiResult:
     """
-    FAQ 초안 payload 를 조립한다.
+    FAQ 초안 payload 조립 — create/update 분기.
 
-    category/question/answer 는 필수. tags 는 선택 (미입력 시 빈 리스트로 정규화).
+    Backend FaqCreateRequest/FaqUpdateRequest 와 1:1. category 는 SupportCategory enum 6종.
+    keywords 는 list 가 아니라 쉼표 구분 문자열 (Backend 가 그대로 받음).
     """
     draft_fields: dict = {
         "category": category,
         "question": question,
         "answer": answer,
-        "tags": tags or [],
+        "keywords": keywords,
+        "sortOrder": sortOrder,
     }
+    target_path = _resolve_target_path(
+        base_path="/admin/support?tab=faq",
+        mode=mode,
+        target_id=target_id,
+    )
+    summary = _build_draft_summary(
+        mode=mode,
+        target_id=target_id,
+        create_phrase=f"FAQ 초안 '{question}'을(를) 준비했어요. 검토 후 저장해주세요.",
+        update_phrase=(
+            f"FAQ #{target_id} '{question}' 보강안을 준비했어요. "
+            "수정 모달에서 검토 후 저장해주세요."
+        ),
+    )
+    action_label = (
+        "FAQ 수정 화면 열기" if mode == "update" and target_id else "FAQ 작성 화면 열기"
+    )
     data = {
-        "target_path": "/admin/support?tab=faq&modal=create",
+        "target_path": target_path,
         "draft_fields": draft_fields,
-        "action_label": "FAQ 작성 화면 열기",
-        "summary": f"FAQ 초안 '{question}'을 준비했어요. 검토 후 저장해주세요.",
+        "action_label": action_label,
+        "summary": summary,
         "tool_name": "faq_draft",
+        "mode": mode,
+        "target_id": target_id,
     }
     return AdminApiResult(
         ok=True,
@@ -352,23 +698,84 @@ async def _handle_help_article_draft(
     title: str,
     category: str,
     content: str,
+    mode: str = "create",
+    target_id: int | None = None,
 ) -> AdminApiResult:
-    """
-    도움말 아티클 초안 payload 를 조립한다.
-
-    title/category/content 모두 필수 — 도움말은 구조화된 내용이 핵심.
-    """
+    """도움말 아티클 초안 payload — create/update 분기."""
     draft_fields: dict = {
         "title": title,
         "category": category,
         "content": content,
     }
+    target_path = _resolve_target_path(
+        base_path="/admin/support?tab=help",
+        mode=mode,
+        target_id=target_id,
+    )
+    summary = _build_draft_summary(
+        mode=mode,
+        target_id=target_id,
+        create_phrase=f"도움말 초안 '{title}'을(를) 준비했어요. 검토 후 저장해주세요.",
+        update_phrase=(
+            f"도움말 #{target_id} '{title}' 보강안을 준비했어요. "
+            "수정 모달에서 검토 후 저장해주세요."
+        ),
+    )
+    action_label = (
+        "도움말 수정 화면 열기" if mode == "update" and target_id else "도움말 작성 화면 열기"
+    )
     data = {
-        "target_path": "/admin/support?tab=help&modal=create",
+        "target_path": target_path,
         "draft_fields": draft_fields,
-        "action_label": "도움말 작성 화면 열기",
-        "summary": f"도움말 초안 '{title}'을 준비했어요. 검토 후 저장해주세요.",
+        "action_label": action_label,
+        "summary": summary,
         "tool_name": "help_article_draft",
+        "mode": mode,
+        "target_id": target_id,
+    }
+    return AdminApiResult(
+        ok=True,
+        status_code=200,
+        data=data,
+        error="",
+        latency_ms=0,
+        row_count=None,
+    )
+
+
+# ============================================================
+# 2026-04-28 신설 — Ticket Reply Draft handler (11번째 Draft tool)
+# ============================================================
+
+async def _handle_ticket_reply_draft(
+    ctx: ToolContext,
+    ticket_id: int,
+    content: str,
+) -> AdminApiResult:
+    """
+    티켓 답변 초안 payload — Backend TicketReplyRequest(content) 와 매칭.
+
+    target_path: /admin/support?tab=tickets&ticketId={ticket_id}&modal=reply&prefill=1
+    Client TicketTab 이 modal=reply 를 보고 답변 모달을 띄운 뒤 draft.content 를 textarea
+    에 주입한다. 관리자가 [전송] 버튼을 누르면 Backend POST /api/v1/admin/tickets/{id}/reply.
+    """
+    draft_fields: dict = {
+        "content": content,
+    }
+    target_path = (
+        f"/admin/support?tab=tickets&ticketId={ticket_id}&modal=reply&prefill=1"
+    )
+    data = {
+        "target_path": target_path,
+        "draft_fields": draft_fields,
+        "action_label": f"티켓 #{ticket_id} 답변 모달 열기",
+        "summary": (
+            f"티켓 #{ticket_id} 답변 초안을 준비했어요. 모달에서 내용 확인 후 [전송] 을 눌러주세요. "
+            "여러 티켓을 답변해야 하면 한 건씩 차례대로 처리해 주세요."
+        ),
+        "tool_name": "ticket_reply_draft",
+        "mode": "create",
+        "target_id": ticket_id,
     }
     return AdminApiResult(
         ok=True,
@@ -387,12 +794,10 @@ async def _handle_banner_draft(
     link: str = "",
     position: str = "HOME",
     priority: int = 0,
+    mode: str = "create",
+    target_id: int | None = None,
 ) -> AdminApiResult:
-    """
-    배너 초안 payload 를 조립한다.
-
-    imageUrl/link 는 기획 확정 전 빈 문자열 허용. Client 가 배너 편집 폼에 세팅 후 직접 업로드.
-    """
+    """배너 초안 payload — create/update 분기."""
     draft_fields: dict = {
         "title": title,
         "imageUrl": imageUrl,
@@ -400,12 +805,31 @@ async def _handle_banner_draft(
         "position": position,
         "priority": priority,
     }
+    target_path = _resolve_target_path(
+        base_path="/admin/settings?tab=banners",
+        mode=mode,
+        target_id=target_id,
+    )
+    summary = _build_draft_summary(
+        mode=mode,
+        target_id=target_id,
+        create_phrase=f"배너 초안 '{title}'을(를) 준비했어요. 이미지 업로드 후 저장해주세요.",
+        update_phrase=(
+            f"배너 #{target_id} '{title}' 보강안을 준비했어요. "
+            "수정 모달에서 검토 후 저장해주세요."
+        ),
+    )
+    action_label = (
+        "배너 수정 화면 열기" if mode == "update" and target_id else "배너 작성 화면 열기"
+    )
     data = {
-        "target_path": "/admin/settings?tab=banners&modal=create",
+        "target_path": target_path,
         "draft_fields": draft_fields,
-        "action_label": "배너 작성 화면 열기",
-        "summary": f"배너 초안 '{title}'을 준비했어요. 이미지 업로드 후 저장해주세요.",
+        "action_label": action_label,
+        "summary": summary,
         "tool_name": "banner_draft",
+        "mode": mode,
+        "target_id": target_id,
     }
     return AdminApiResult(
         ok=True,
@@ -424,12 +848,10 @@ async def _handle_quiz_draft(
     choices: list[str],
     answerIndex: int,
     explanation: str | None = None,
+    mode: str = "create",
+    target_id: int | None = None,
 ) -> AdminApiResult:
-    """
-    영화 퀴즈 초안 payload 를 조립한다.
-
-    choices 는 2개 이상 필수. answerIndex 는 0-based — choices[answerIndex] 가 정답.
-    """
+    """영화 퀴즈 초안 payload — create/update 분기."""
     draft_fields: dict = {
         "movieId": movieId,
         "question": question,
@@ -437,16 +859,29 @@ async def _handle_quiz_draft(
         "answerIndex": answerIndex,
         "explanation": explanation,
     }
+    # 2026-04-27 정정: quiz CRUD 는 ContentEventsPage 의 quiz 탭이 담당.
+    target_path = _resolve_target_path(
+        base_path="/admin/content-events?tab=quiz",
+        mode=mode,
+        target_id=target_id,
+    )
+    summary = _build_draft_summary(
+        mode=mode,
+        target_id=target_id,
+        create_phrase=f"퀴즈 초안 '{question}'을(를) 준비했어요. 정답 확인 후 저장해주세요.",
+        update_phrase=f"퀴즈 #{target_id} 보강안을 준비했어요. 수정 모달에서 검토 후 저장해주세요.",
+    )
+    action_label = (
+        "퀴즈 수정 화면 열기" if mode == "update" and target_id else "퀴즈 작성 화면 열기"
+    )
     data = {
-        # 2026-04-27 정정: quiz CRUD 는 ContentEventsPage 의 quiz 탭이 담당
-        # (`features/contentEvents/components/QuizManagementTab.jsx`).
-        # AiOpsPage 에는 quiz 탭이 없어 기존 `/admin/ai?tab=quiz` 로 이동 시
-        # 첫 탭(trigger) 으로 폴백되어 모달이 열리지 않던 결함 수정.
-        "target_path": "/admin/content-events?tab=quiz&modal=create",
+        "target_path": target_path,
         "draft_fields": draft_fields,
-        "action_label": "퀴즈 작성 화면 열기",
-        "summary": f"퀴즈 초안 '{question}'을 준비했어요. 정답 확인 후 저장해주세요.",
+        "action_label": action_label,
+        "summary": summary,
         "tool_name": "quiz_draft",
+        "mode": mode,
+        "target_id": target_id,
     }
     return AdminApiResult(
         ok=True,
@@ -464,25 +899,39 @@ async def _handle_chat_suggestion_draft(
     text: str,
     reason: str | None = None,
     tags: list[str] | None = None,
+    mode: str = "create",
+    target_id: int | None = None,
 ) -> AdminApiResult:
-    """
-    채팅 추천 칩 초안 payload 를 조립한다.
-
-    surface 3채널: user_chat / admin_assistant / faq_chatbot.
-    tags 는 선택 (미입력 시 빈 리스트로 정규화).
-    """
+    """채팅 추천 칩 초안 payload — create/update 분기."""
     draft_fields: dict = {
         "surface": surface,
         "text": text,
         "reason": reason,
         "tags": tags or [],
     }
+    target_path = _resolve_target_path(
+        base_path="/admin/ai?tab=chat-suggestions",
+        mode=mode,
+        target_id=target_id,
+    )
+    summary = _build_draft_summary(
+        mode=mode,
+        target_id=target_id,
+        create_phrase=f"채팅 추천 칩 초안 '{text}'을(를) 준비했어요. 검토 후 저장해주세요.",
+        update_phrase=f"채팅 추천 칩 #{target_id} 보강안을 준비했어요. 수정 모달에서 검토 후 저장해주세요.",
+    )
+    action_label = (
+        "채팅 추천 칩 수정 화면 열기" if mode == "update" and target_id
+        else "채팅 추천 칩 작성 화면 열기"
+    )
     data = {
-        "target_path": "/admin/ai?tab=chat-suggestions&modal=create",
+        "target_path": target_path,
         "draft_fields": draft_fields,
-        "action_label": "채팅 추천 칩 작성 화면 열기",
-        "summary": f"채팅 추천 칩 초안 '{text}'을 준비했어요. 검토 후 저장해주세요.",
+        "action_label": action_label,
+        "summary": summary,
         "tool_name": "chat_suggestion_draft",
+        "mode": mode,
+        "target_id": target_id,
     }
     return AdminApiResult(
         ok=True,
@@ -499,23 +948,40 @@ async def _handle_term_draft(
     type: str,
     version: str,
     content: str,
+    mode: str = "create",
+    target_id: int | None = None,
 ) -> AdminApiResult:
-    """
-    약관 초안 payload 를 조립한다.
-
-    type/version/content 모두 필수. 약관 전문은 마크다운 형식 권장.
-    """
+    """약관 초안 payload — create/update 분기."""
     draft_fields: dict = {
         "type": type,
         "version": version,
         "content": content,
     }
+    target_path = _resolve_target_path(
+        base_path="/admin/settings?tab=terms",
+        mode=mode,
+        target_id=target_id,
+    )
+    summary = _build_draft_summary(
+        mode=mode,
+        target_id=target_id,
+        create_phrase=f"약관({type}) 버전 '{version}' 초안을 준비했어요. 법적 검토 후 저장해주세요.",
+        update_phrase=(
+            f"약관 #{target_id} ({type}) 버전 '{version}' 보강안을 준비했어요. "
+            "수정 모달에서 검토 후 저장해주세요."
+        ),
+    )
+    action_label = (
+        "약관 수정 화면 열기" if mode == "update" and target_id else "약관 작성 화면 열기"
+    )
     data = {
-        "target_path": "/admin/settings?tab=terms&modal=create",
+        "target_path": target_path,
         "draft_fields": draft_fields,
-        "action_label": "약관 작성 화면 열기",
-        "summary": f"약관({type}) 버전 '{version}' 초안을 준비했어요. 법적 검토 후 저장해주세요.",
+        "action_label": action_label,
+        "summary": summary,
         "tool_name": "term_draft",
+        "mode": mode,
+        "target_id": target_id,
     }
     return AdminApiResult(
         ok=True,
@@ -531,25 +997,40 @@ async def _handle_worldcup_candidate_draft(
     ctx: ToolContext,
     movieId: str,
     tier: str | None = None,
+    mode: str = "create",
+    target_id: int | None = None,
 ) -> AdminApiResult:
-    """
-    이상형 월드컵 후보 초안 payload 를 조립한다.
-
-    movieId 필수. tier 는 운영 정책에 따라 선택 입력.
-    """
+    """이상형 월드컵 후보 초안 payload — create/update 분기."""
     draft_fields: dict = {
         "movieId": movieId,
         "tier": tier,
     }
+    # 2026-04-27 정정: ContentEventsPage SUB_TABS 의 실제 key=worldcup_candidate.
+    target_path = _resolve_target_path(
+        base_path="/admin/content-events?tab=worldcup_candidate",
+        mode=mode,
+        target_id=target_id,
+    )
+    summary = _build_draft_summary(
+        mode=mode,
+        target_id=target_id,
+        create_phrase=(
+            f"이상형 월드컵 후보(영화 ID: {movieId}) 초안을 준비했어요. 검토 후 저장해주세요."
+        ),
+        update_phrase=f"월드컵 후보 #{target_id} 보강안을 준비했어요. 수정 모달에서 검토 후 저장해주세요.",
+    )
+    action_label = (
+        "월드컵 후보 수정 화면 열기" if mode == "update" and target_id
+        else "월드컵 후보 추가 화면 열기"
+    )
     data = {
-        # 2026-04-27 정정: ContentEventsPage SUB_TABS 의 실제 key 가
-        # `worldcup_candidate` (snake_case 풀네임). 기존 `tab=worldcup` 으로 이동 시
-        # 첫 탭(roadmap_course) 으로 폴백되던 결함 수정.
-        "target_path": "/admin/content-events?tab=worldcup_candidate&modal=create",
+        "target_path": target_path,
         "draft_fields": draft_fields,
-        "action_label": "월드컵 후보 추가 화면 열기",
-        "summary": f"이상형 월드컵 후보(영화 ID: {movieId}) 초안을 준비했어요. 검토 후 저장해주세요.",
+        "action_label": action_label,
+        "summary": summary,
         "tool_name": "worldcup_candidate_draft",
+        "mode": mode,
+        "target_id": target_id,
     }
     return AdminApiResult(
         ok=True,
@@ -566,26 +1047,44 @@ async def _handle_reward_policy_draft(
     code: str,
     pointAmount: int,
     condition: str,
+    mode: str = "create",
+    target_id: int | None = None,
 ) -> AdminApiResult:
-    """
-    리워드 정책 초안 payload 를 조립한다.
-
-    code 는 영문 대문자 + 언더스코어 관례. pointAmount 는 1 이상 정수.
-    """
+    """리워드 정책 초안 payload — create/update 분기."""
     draft_fields: dict = {
         "code": code,
         "pointAmount": pointAmount,
         "condition": condition,
     }
-    data = {
-        "target_path": "/admin/payment?tab=reward_policy&modal=create",
-        "draft_fields": draft_fields,
-        "action_label": "리워드 정책 작성 화면 열기",
-        "summary": (
-            f"리워드 정책 초안 '{code}' ({pointAmount}P)을 준비했어요. "
+    target_path = _resolve_target_path(
+        base_path="/admin/payment?tab=reward_policy",
+        mode=mode,
+        target_id=target_id,
+    )
+    summary = _build_draft_summary(
+        mode=mode,
+        target_id=target_id,
+        create_phrase=(
+            f"리워드 정책 초안 '{code}' ({pointAmount}P)을(를) 준비했어요. "
             "조건 검토 후 저장해주세요."
         ),
+        update_phrase=(
+            f"리워드 정책 #{target_id} '{code}' 보강안을 준비했어요. "
+            "수정 모달에서 검토 후 저장해주세요."
+        ),
+    )
+    action_label = (
+        "리워드 정책 수정 화면 열기" if mode == "update" and target_id
+        else "리워드 정책 작성 화면 열기"
+    )
+    data = {
+        "target_path": target_path,
+        "draft_fields": draft_fields,
+        "action_label": action_label,
+        "summary": summary,
         "tool_name": "reward_policy_draft",
+        "mode": mode,
+        "target_id": target_id,
     }
     return AdminApiResult(
         ok=True,
@@ -602,26 +1101,44 @@ async def _handle_point_pack_draft(
     packCode: str,
     points: int,
     priceKrw: int,
+    mode: str = "create",
+    target_id: int | None = None,
 ) -> AdminApiResult:
-    """
-    포인트 팩 상품 초안 payload 를 조립한다.
-
-    packCode 는 영문 대문자 + 언더스코어 관례. 1P=10원 정책(v3.2) 기준으로 가격 확인 권장.
-    """
+    """포인트 팩 상품 초안 payload — create/update 분기."""
     draft_fields: dict = {
         "packCode": packCode,
         "points": points,
         "priceKrw": priceKrw,
     }
-    data = {
-        "target_path": "/admin/payment?tab=point_pack&modal=create",
-        "draft_fields": draft_fields,
-        "action_label": "포인트 팩 작성 화면 열기",
-        "summary": (
-            f"포인트 팩 초안 '{packCode}' ({points}P / {priceKrw:,}원)을 준비했어요. "
+    target_path = _resolve_target_path(
+        base_path="/admin/payment?tab=point_pack",
+        mode=mode,
+        target_id=target_id,
+    )
+    summary = _build_draft_summary(
+        mode=mode,
+        target_id=target_id,
+        create_phrase=(
+            f"포인트 팩 초안 '{packCode}' ({points}P / {priceKrw:,}원)을(를) 준비했어요. "
             "가격 정책 확인 후 저장해주세요."
         ),
+        update_phrase=(
+            f"포인트 팩 #{target_id} '{packCode}' 보강안을 준비했어요. "
+            "수정 모달에서 검토 후 저장해주세요."
+        ),
+    )
+    action_label = (
+        "포인트 팩 수정 화면 열기" if mode == "update" and target_id
+        else "포인트 팩 작성 화면 열기"
+    )
+    data = {
+        "target_path": target_path,
+        "draft_fields": draft_fields,
+        "action_label": action_label,
+        "summary": summary,
         "tool_name": "point_pack_draft",
+        "mode": mode,
+        "target_id": target_id,
     }
     return AdminApiResult(
         ok=True,
@@ -638,7 +1155,11 @@ async def _handle_point_pack_draft(
 # ============================================================
 _DRAFT_SUFFIX = (
     " 폼을 채워 해당 관리 화면을 열 수 있도록 초안을 생성합니다. "
-    "저장은 관리자가 직접 화면에서 실행합니다."
+    "저장은 관리자가 직접 화면에서 실행합니다. "
+    "**중요**: 본문/답변 같은 내용 필드는 placeholder 가 아니라 즉시 게시 가능한 수준으로 "
+    "구체적이고 풍부하게 채워야 합니다. "
+    "기존 항목 수정(보강) 요청이면 mode='update' + target_id 를 함께 채우세요. "
+    "필요하면 먼저 read 도구로 원본을 가져온 뒤 그 내용을 토대로 보강안을 작성합니다."
 )
 
 
@@ -651,13 +1172,18 @@ register_tool(ToolSpec(
     tier=0,
     required_roles=_SUPPORT_CONTENT_ROLES,
     description=(
-        "공지사항 초안을 생성합니다. 제목·유형(공지/뉴스/이벤트)·본문·상단 고정 여부·게시 기간을 "
-        "사용자 발화에서 추출해 공지사항 작성 폼에 미리 채워줍니다." + _DRAFT_SUFFIX
+        "공지사항 초안 생성 또는 수정용 폼 prefill. 제목·노출 방식·본문·상단 고정·게시 기간 등을 "
+        "사용자 발화에서 추출해 공지 작성/수정 폼에 미리 채워줍니다. "
+        "발화에 'N번 공지', '첫번째 공지 수정', '내용 보강' 같은 어휘가 있으면 mode='update' + "
+        "target_id 를 채워 수정 모달로 보냅니다 (read 로 원본 본문을 먼저 가져온 뒤 보강)."
+        + _DRAFT_SUFFIX
     ),
     example_questions=[
         "공지 초안 써줘",
         "서비스 점검 공지 만들어줘",
         "이번 주 이벤트 공지 초안 잡아줘",
+        "1번 공지 내용 보강해서 수정해줘",   # update 모드 예시
+        "최근 공지 내용 다시 써줘",          # update 모드 예시
     ],
     args_schema=NoticeDraftArgs,
     handler=_handle_notice_draft,
@@ -668,13 +1194,18 @@ register_tool(ToolSpec(
     tier=0,
     required_roles=_SUPPORT_CONTENT_ROLES,
     description=(
-        "FAQ 항목 초안을 생성합니다. 카테고리·질문·답변·태그를 사용자 발화에서 추출해 "
-        "FAQ 작성 폼에 미리 채워줍니다." + _DRAFT_SUFFIX
+        "FAQ 항목 초안 생성 또는 수정용 폼 prefill. category 는 반드시 "
+        "GENERAL/ACCOUNT/CHAT/RECOMMENDATION/COMMUNITY/PAYMENT 6종 enum 중 하나로 채워야 합니다. "
+        "한국어 발화는 의미상 가장 가까운 enum 으로 변환 (환불/결제 → PAYMENT, 비밀번호/탈퇴 → ACCOUNT). "
+        "수정 의도면 mode='update' + target_id."
+        + _DRAFT_SUFFIX
     ),
     example_questions=[
         "FAQ 하나 초안으로 만들어줘",
         "포인트 환불 FAQ 초안 써줘",
         "AI 추천 이용 방법 FAQ 만들어줘",
+        "FAQ 3번 답변 다시 써줘",            # update 모드 예시
+        "환불 FAQ 새로 작성해줘",            # category=PAYMENT 예시
     ],
     args_schema=FaqDraftArgs,
     handler=_handle_faq_draft,
@@ -685,16 +1216,41 @@ register_tool(ToolSpec(
     tier=0,
     required_roles=_SUPPORT_CONTENT_ROLES,
     description=(
-        "도움말 아티클 초안을 생성합니다. 제목·카테고리·본문을 사용자 발화에서 추출해 "
-        "도움말 작성 폼에 미리 채워줍니다." + _DRAFT_SUFFIX
+        "도움말 아티클 초안 생성 또는 수정용 폼 prefill. category 는 FAQ 와 동일한 6종 enum. "
+        "본문은 마크다운으로 단계별·구체적으로 작성. 수정 의도면 mode='update' + target_id."
+        + _DRAFT_SUFFIX
     ),
     example_questions=[
         "도움말 아티클 초안 만들어줘",
         "AI 추천 서비스 이용 방법 도움말 초안 써줘",
         "회원 탈퇴 절차 도움말 초안 잡아줘",
+        "5번 도움말 내용 보강해서 수정해줘",  # update 모드 예시
     ],
     args_schema=HelpArticleDraftArgs,
     handler=_handle_help_article_draft,
+))
+
+# 2026-04-28 신설 — 티켓 답변 Draft (11번째)
+register_tool(ToolSpec(
+    name="ticket_reply_draft",
+    tier=0,
+    required_roles=_SUPPORT_CONTENT_ROLES,
+    description=(
+        "고객 문의 티켓에 대한 관리자 답변 초안을 생성해 답변 모달을 엽니다. "
+        "ticket_id 는 사용자 발화에서 'N번 티켓' 으로 특정되거나 직전 read 결과에서 식별된 ID. "
+        "content 는 사용자가 곧바로 받아볼 수 있는 친절하고 구체적인 한국어 응답으로 작성합니다. "
+        "여러 티켓을 답변해야 한다면 한 번에 한 건씩 차례대로 prefill 하고, 사용자에게 "
+        "'1건 prefill 했어요. 저장 후 다음 티켓을 처리해 주세요' 라고 안내합니다."
+        + _DRAFT_SUFFIX
+    ),
+    example_questions=[
+        "5번 티켓에 답변 초안 써줘",
+        "최근 OPEN 티켓 답변 초안 만들어줘",
+        "환불 문의 티켓 답변 작성해줘",
+        "이 티켓 답변 다시 써줘",
+    ],
+    args_schema=TicketReplyDraftArgs,
+    handler=_handle_ticket_reply_draft,
 ))
 
 register_tool(ToolSpec(

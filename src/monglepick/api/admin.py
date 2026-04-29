@@ -10,8 +10,6 @@ AI 운영 탭:
 - POST /api/v1/admin/ai/quiz/generate — LLM 기반 영화 퀴즈 자동 생성 + quizzes 테이블 PENDING INSERT
 """
 
-import json
-import re
 import time
 import traceback
 from typing import Any, Optional
@@ -19,7 +17,6 @@ from typing import Any, Optional
 import httpx
 import structlog
 from fastapi import APIRouter, HTTPException
-from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -31,7 +28,6 @@ from monglepick.db.clients import (
     get_qdrant,
     get_redis,
 )
-from monglepick.llm import get_conversation_llm, guarded_ainvoke
 
 logger = structlog.get_logger()
 
@@ -504,29 +500,33 @@ async def get_vllm_status():
 
 
 # ============================================================
-# POST /admin/ai/quiz/generate — LLM 기반 영화 퀴즈 자동 생성
+# POST /admin/ai/quiz/generate — LangGraph 기반 영화 퀴즈 자동 생성
 # ============================================================
 #
 # 관리자 페이지 "AI 운영 → 퀴즈 생성" 카드가 호출하는 엔드포인트.
-# 기존에는 Backend(Spring Boot)가 관리자 입력값을 그대로 quizzes 테이블에 INSERT 하는
-# 스텁 경로를 사용했으나, 2026-04-08부로 Agent(FastAPI)가 LLM을 이용해 실제 문항을
-# 자동 생성하고 PENDING 상태로 저장하는 경로로 전환한다.
 #
-# 설계 결정:
-# - 입력: {genre?, difficulty?, count?} (AiTriggerPanel 폼과 일치)
-# - 1) MySQL에서 count 편 수의 후보 영화 샘플링 (genre LIKE 필터)
-# - 2) 영화마다 LLM 호출하여 4지선다 퀴즈 1개 생성
-# - 3) LLM 실패 시 장르/개봉연도 기반 fallback 템플릿 사용
-# - 4) quizzes 테이블에 status=PENDING 으로 직접 INSERT (Agent도 MySQL read/write 권한 보유)
-# - 5) 관리자는 이후 Backend의 quiz_history / approve 엔드포인트로 검수한다
-# - 빈 DB 대응: 영화가 한 편도 없을 경우 success=False, count=0 로 반환 (500 금지)
+# 변경 이력:
+# - 2026-04-08: Backend 의 dead-code 스텁을 Agent(FastAPI)로 이관하여 인라인 LLM 호출 구현.
+# - 2026-04-28: 인라인 헬퍼들을 LangGraph 7노드 에이전트(`agents.quiz_generation`)로 승격.
+#               영화 후보군 인기·다양성 가중, 메타데이터(시놉시스/감독/출연) 보강,
+#               카테고리 라운드로빈, 스포일러 검증, 배치 내 중복 제거를 추가했다.
+#               본 핸들러는 그래프 호출 + 응답 변환만 담당한다 (단일 진실 원본).
+#
+# 입력: {genre?, difficulty?, count?, excludeRecentDays?, rewardPoint?}
+#  - genre: 장르 LIKE 필터 (None/빈 문자열 → 전체)
+#  - difficulty: easy/medium/hard 난이도 힌트 (LLM 프롬프트 전달)
+#  - count: 1~50 생성 목표 편수
+#  - excludeRecentDays: 최근 N 일 quiz 가 있는 영화 제외 (기본 7)
+#  - rewardPoint: 정답 시 지급 포인트 (기본 10)
+#
+# 응답: {success, count, message, quizzes[]} — 빈 DB / 매칭 실패 시 success=False (HTTP 500 금지).
 
 
 class GenerateQuizRequest(BaseModel):
     """
     AI 퀴즈 자동 생성 요청 DTO.
 
-    AiTriggerPanel(monglepick-admin) 폼과 일치하는 필드만 받는다.
+    AiTriggerPanel(monglepick-admin) 폼과 호환되는 필드 + 운영 옵션 2 종.
     """
 
     genre: Optional[str] = Field(
@@ -542,6 +542,18 @@ class GenerateQuizRequest(BaseModel):
         ge=1,
         le=50,
         description="생성할 퀴즈 개수 (1~50).",
+    )
+    excludeRecentDays: int = Field(
+        default=7,
+        ge=0,
+        le=90,
+        description="최근 N 일 동안 quiz 가 생성된 영화 제외 (0=비활성).",
+    )
+    rewardPoint: int = Field(
+        default=10,
+        ge=1,
+        le=1000,
+        description="정답 시 지급할 보상 포인트 (기본 10).",
     )
 
 
@@ -568,383 +580,83 @@ class GenerateQuizResponse(BaseModel):
     quizzes: list[GeneratedQuizItem]
 
 
-# ──────────────────────────────────────────────────────────────
-# 내부 유틸: JSON 파서, fallback 생성기, 영화 조회, LLM 체인
-# ──────────────────────────────────────────────────────────────
-
-# LLM에 전달할 퀴즈 생성 시스템 프롬프트 (단일 영화/단일 문항용).
-# 로드맵 에이전트(agents/roadmap/nodes.py)의 _QUIZ_SYSTEM_PROMPT를 참고하되,
-# "객관식 1문항" 스키마로 단순화하여 Backend 엔티티 컬럼과 1:1 매핑한다.
-_ADMIN_QUIZ_SYSTEM_PROMPT = """당신은 영화 교육 퀴즈 전문가입니다.
-주어진 영화 한 편에 대해 객관식 4지선다 퀴즈 1문항을 생성하세요.
-
-반환 형식(JSON 객체만 출력, 설명/마크다운 금지):
-{
-  "question": "질문 텍스트",
-  "options": ["선택지1", "선택지2", "선택지3", "선택지4"],
-  "correctAnswer": "정답 선택지(options 배열 중 하나와 정확히 일치)",
-  "explanation": "정답 해설(1~2문장)"
-}
-
-규칙:
-- 스포일러 절대 금지 (결말/반전/인물 사망 등 핵심 내용 언급 불가)
-- 객관식 선택지는 반드시 4개
-- 오답 선택지는 그럴듯하되 사실과 다르게 구성
-- correctAnswer 는 options 배열에 존재하는 문자열과 100% 동일해야 함
-- 난이도는 '{difficulty}' 수준으로 맞출 것
-- 순수 JSON 객체만 출력 (마크다운 코드블록, 설명 문구 금지)"""
-
-
-def _parse_quiz_json(text: str) -> dict:
-    """
-    LLM 응답에서 퀴즈 JSON 객체를 추출한다.
-
-    마크다운 코드블록(```json ... ```)을 제거하고 파싱한다.
-    실패 시 빈 dict 반환.
-    """
-    try:
-        cleaned = re.sub(r"```(?:json)?\s*", "", text).strip()
-        cleaned = cleaned.rstrip("`").strip()
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        # 중괄호 블록 추출 시도
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group())
-            except json.JSONDecodeError:
-                pass
-        logger.warning("admin_quiz_json_parse_failed", preview=text[:200])
-        return {}
-
-
-def _make_admin_fallback_quiz(movie: dict) -> dict:
-    """
-    LLM 생성 실패 시 fallback 퀴즈 1문항을 장르/연도 기반 템플릿으로 구성한다.
-
-    Args:
-        movie: {"id", "title", "genres": list, "release_year"} 형태의 dict
-
-    Returns:
-        {question, options, correctAnswer, explanation} dict
-    """
-    title = movie.get("title", "이 영화")
-    genres: list[str] = movie.get("genres") or ["드라마"]
-    main_genre = genres[0] if genres else "드라마"
-
-    decoy_pool = [
-        "액션", "드라마", "코미디", "공포", "SF",
-        "스릴러", "로맨스", "판타지", "애니메이션",
-    ]
-    decoys = [g for g in decoy_pool if g != main_genre][:3]
-    options = [main_genre] + decoys
-
-    return {
-        "question": f"'{title}' 영화의 주요 장르는 무엇인가요?",
-        "options": options,
-        "correctAnswer": main_genre,
-        "explanation": (
-            f"'{title}'은(는) '{main_genre}' 장르의 대표적인 작품 중 하나입니다. "
-            f"포스터·로그라인·장르 태그를 통해 확인할 수 있습니다."
-        ),
-    }
-
-
-async def _sample_movies_for_quiz(
-    genre: Optional[str],
-    count: int,
-) -> list[dict]:
-    """
-    quizzes 생성용 후보 영화를 MySQL 에서 샘플링한다.
-
-    - 장르 필터가 있으면 genres 컬럼 LIKE 매칭
-    - popularity 상위 1000편 중 RAND() 로 count 편 랜덤 추출
-    - 빈 DB 환경(행 0개)에서도 빈 리스트를 안전하게 반환
-
-    Args:
-        genre: 장르 필터 (None/빈 문자열 이면 전체)
-        count: 추출할 편수
-
-    Returns:
-        [{"id","title","genres": list, "release_year"}] 형태의 dict 리스트
-    """
-    movies: list[dict] = []
-    try:
-        pool = await get_mysql()
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                # 장르 LIKE 필터 파라미터 구성
-                if genre:
-                    sql = (
-                        "SELECT movie_id, title, original_title, genres, release_date "
-                        "FROM movies "
-                        "WHERE genres LIKE %s "
-                        "ORDER BY RAND() "
-                        "LIMIT %s"
-                    )
-                    params: tuple = (f"%{genre}%", count)
-                else:
-                    # 장르 지정 없을 때는 전체 테이블에서 랜덤 추출.
-                    # LIMIT 이 작으므로 full-scan RAND() 비용은 수용 가능.
-                    sql = (
-                        "SELECT movie_id, title, original_title, genres, release_date "
-                        "FROM movies "
-                        "ORDER BY RAND() "
-                        "LIMIT %s"
-                    )
-                    params = (count,)
-
-                await cur.execute(sql, params)
-                rows = await cur.fetchall()
-
-        for row in rows:
-            movie_id, title, original_title, genres_raw, release_date = row
-
-            # 장르 파싱: JSON 배열 문자열 또는 쉼표 구분
-            parsed_genres: list[str] = []
-            if genres_raw:
-                try:
-                    g = json.loads(genres_raw)
-                    if isinstance(g, list):
-                        parsed_genres = [str(x) for x in g]
-                except (json.JSONDecodeError, TypeError):
-                    parsed_genres = [
-                        s.strip() for s in str(genres_raw).split(",") if s.strip()
-                    ]
-
-            # 연도 추출
-            release_year = ""
-            if release_date:
-                try:
-                    release_year = str(release_date)[:4]
-                except Exception:
-                    release_year = ""
-
-            movies.append({
-                "id": str(movie_id),
-                "title": title or original_title or "(제목 없음)",
-                "genres": parsed_genres,
-                "release_year": release_year,
-            })
-
-    except Exception as e:
-        logger.error("admin_quiz_sample_movies_failed", error=str(e))
-
-    return movies
-
-
-async def _generate_single_quiz_llm(movie: dict, difficulty: str) -> dict:
-    """
-    단일 영화에 대해 LLM 으로 4지선다 퀴즈 1문항을 생성한다.
-
-    LLM 실패 또는 파싱 실패 시 fallback 템플릿으로 돌린다.
-
-    Args:
-        movie:      {"id","title","genres","release_year"} dict
-        difficulty: 난이도 힌트 (easy/medium/hard)
-
-    Returns:
-        {question, options, correctAnswer, explanation} dict
-    """
-    title = movie.get("title", "")
-    genres = ", ".join(movie.get("genres") or [])
-    release_year = movie.get("release_year") or "미상"
-
-    user_prompt = (
-        f"다음 영화에 대해 객관식 4지선다 퀴즈 1문항을 만들어 주세요.\n\n"
-        f"- 제목: {title}\n"
-        f"- 장르: {genres or '정보 없음'}\n"
-        f"- 개봉연도: {release_year}\n\n"
-        f"위 규칙을 모두 지키고 JSON 객체로만 응답하세요."
-    )
-
-    try:
-        llm = get_conversation_llm()
-        messages = [
-            SystemMessage(content=_ADMIN_QUIZ_SYSTEM_PROMPT.format(difficulty=difficulty)),
-            HumanMessage(content=user_prompt),
-        ]
-        response = await guarded_ainvoke(llm, messages)
-        response_text = (
-            response.content if hasattr(response, "content") else str(response)
-        )
-        parsed = _parse_quiz_json(response_text)
-
-        # 스키마 검증: 필수 필드 존재 + options 4개 + correctAnswer 일치
-        if (
-            isinstance(parsed, dict)
-            and parsed.get("question")
-            and isinstance(parsed.get("options"), list)
-            and len(parsed["options"]) == 4
-            and parsed.get("correctAnswer") in parsed["options"]
-        ):
-            return {
-                "question": str(parsed["question"]),
-                "options": [str(o) for o in parsed["options"]],
-                "correctAnswer": str(parsed["correctAnswer"]),
-                "explanation": str(parsed.get("explanation") or ""),
-            }
-
-        logger.warning(
-            "admin_quiz_llm_invalid_schema",
-            movie_id=movie.get("id"),
-            parsed_keys=list(parsed.keys()) if isinstance(parsed, dict) else None,
-        )
-    except Exception as e:
-        logger.warning(
-            "admin_quiz_llm_failed",
-            movie_id=movie.get("id"),
-            error=str(e),
-        )
-
-    # fallback
-    return _make_admin_fallback_quiz(movie)
-
-
-async def _insert_quiz_pending(
-    movie_id: str,
-    question: str,
-    correct_answer: str,
-    options: list[str],
-    explanation: Optional[str],
-    reward_point: int = 10,
-) -> int:
-    """
-    생성된 퀴즈 1건을 quizzes 테이블에 PENDING 상태로 INSERT 하고 새 PK 를 반환한다.
-
-    Backend 의 Quiz 엔티티와 동일한 컬럼 구성이며, created_at 은 NOW() 로 세팅한다.
-    created_by 는 'ai-agent' 문자열을 박아 넣어 운영 로그에서 구분할 수 있게 한다.
-
-    Args:
-        movie_id:       movies.movie_id (VARCHAR(50))
-        question:       퀴즈 문제
-        correct_answer: 정답 문자열
-        options:        선택지 리스트 (JSON 으로 직렬화하여 저장)
-        explanation:    해설 (nullable)
-        reward_point:   보상 포인트 (기본 10)
-
-    Returns:
-        신규 quiz_id (BIGINT)
-    """
-    options_json = json.dumps(options, ensure_ascii=False)
-    pool = await get_mysql()
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            # Backend(Quiz 엔티티)와 동일 컬럼. status 는 'PENDING' 고정.
-            # created_by/updated_by 는 운영 식별용으로 'ai-agent' 저장.
-            await cur.execute(
-                """
-                INSERT INTO quizzes (
-                    movie_id, question, explanation, correct_answer,
-                    options, reward_point, status, quiz_date,
-                    created_at, updated_at, created_by, updated_by
-                ) VALUES (
-                    %s, %s, %s, %s,
-                    %s, %s, 'PENDING', NULL,
-                    NOW(), NOW(), 'ai-agent', 'ai-agent'
-                )
-                """,
-                (
-                    movie_id,
-                    question,
-                    explanation,
-                    correct_answer,
-                    options_json,
-                    reward_point,
-                ),
-            )
-            await conn.commit()
-            # LAST_INSERT_ID() — aiomysql 드라이버는 cursor.lastrowid 로 직접 제공
-            return int(cur.lastrowid or 0)
-
-
 @admin_router.post(
     "/ai/quiz/generate",
     response_model=GenerateQuizResponse,
-    summary="AI 퀴즈 자동 생성 (LLM)",
+    summary="AI 퀴즈 자동 생성 (LangGraph)",
     description=(
-        "LLM 을 사용해 영화 퀴즈를 자동 생성하고 quizzes 테이블에 "
-        "PENDING 상태로 저장한다. 관리자 검수 후 APPROVED/PUBLISHED 로 전환한다."
+        "LangGraph 7노드 에이전트(quiz_generation_graph)로 영화 퀴즈를 자동 생성하고 "
+        "quizzes 테이블에 PENDING 으로 저장한다. 관리자 검수 후 APPROVED/PUBLISHED "
+        "로 전환한다. 흐름: movie_selector → metadata_enricher → question_generator "
+        "→ quality_validator → diversity_checker → fallback_filler → persistence."
     ),
 )
 async def generate_admin_quiz(request: GenerateQuizRequest) -> GenerateQuizResponse:
     """
     관리자 AI 퀴즈 자동 생성 핸들러.
 
-    흐름:
-        1) MySQL 에서 후보 영화 count 편 샘플링 (장르 필터 선택)
-        2) 각 영화마다 LLM 호출 또는 fallback 으로 4지선다 퀴즈 1문항 생성
-        3) quizzes 테이블에 PENDING 상태로 INSERT
-        4) 생성 결과를 배열로 반환 (quizId 포함)
+    LangGraph quiz_generation 에이전트를 1회 ainvoke 호출하고,
+    그래프 종단 상태(persisted, final_message, success) 를 응답 DTO 로 변환한다.
 
-    빈 DB / 장르 매칭 실패 시 success=False, count=0 로 반환하여
-    UI 가 에러가 아닌 안내 메시지를 표시할 수 있게 한다.
+    그래프 자체가 빈 DB / LLM 실패 / 검증 실패에 대해 fallback 처리를 보장하므로
+    여기서는 추가 분기 로직을 두지 않는다. 모든 처리/로깅은 노드 내부에서 수행된다.
     """
+    # 그래프 모듈은 핸들러 호출 시점에 import — 순환 import 방지 + 모듈 로드 비용 분산.
+    from monglepick.agents.quiz_generation.graph import quiz_generation_graph
+
     logger.info(
         "admin_quiz_generate_start",
         genre=request.genre,
         difficulty=request.difficulty,
         count=request.count,
+        exclude_recent_days=request.excludeRecentDays,
+        reward_point=request.rewardPoint,
     )
 
-    # ── 1) 후보 영화 샘플링 ──
-    movies = await _sample_movies_for_quiz(
-        genre=(request.genre or "").strip() or None,
-        count=request.count,
-    )
+    # ── LangGraph 초기 상태 구성 (camelCase → snake_case) ──
+    initial_state: dict = {
+        "genre": (request.genre or "").strip() or None,
+        "difficulty": request.difficulty,
+        "count": request.count,
+        "exclude_recent_days": request.excludeRecentDays,
+        "reward_point": request.rewardPoint,
+    }
 
-    if not movies:
-        logger.warning(
-            "admin_quiz_generate_no_movies",
-            genre=request.genre,
+    try:
+        result_state = await quiz_generation_graph.ainvoke(initial_state)
+    except Exception as e:
+        # 그래프 자체가 예외를 throw 하는 일은 거의 없지만(노드별 try/except 가 흡수),
+        # 안전 그물로 500 대신 500 메시지를 200 으로 감싸 UI 에 안내한다.
+        logger.error(
+            "admin_quiz_generate_graph_failed",
+            error=str(e),
+            trace=traceback.format_exc()[-500:],
         )
-        # 빈 DB 또는 장르 매칭 실패 — UI 에 안내 메시지로 표시
         return GenerateQuizResponse(
             success=False,
             count=0,
-            message=(
-                "후보 영화가 없습니다. 영화 데이터를 먼저 적재하거나 "
-                "장르 필터를 해제해 주세요."
-            ),
+            message=f"퀴즈 생성 그래프 실행 중 오류: {e}",
             quizzes=[],
         )
 
-    # ── 2~3) 영화마다 LLM 호출 → DB INSERT ──
-    generated: list[GeneratedQuizItem] = []
-    for movie in movies:
-        try:
-            quiz_body = await _generate_single_quiz_llm(movie, request.difficulty)
+    # ── 상태 → 응답 DTO 변환 ──
+    persisted = result_state.get("persisted") or []
+    items: list[GeneratedQuizItem] = [
+        GeneratedQuizItem(
+            quizId=p.quiz_id,
+            movieId=p.movie_id,
+            movieTitle=p.movie_title,
+            question=p.question,
+            correctAnswer=p.correct_answer,
+            options=p.options,
+            explanation=p.explanation,
+            rewardPoint=p.reward_point,
+            status=p.status,
+        )
+        for p in persisted
+    ]
 
-            quiz_id = await _insert_quiz_pending(
-                movie_id=movie["id"],
-                question=quiz_body["question"],
-                correct_answer=quiz_body["correctAnswer"],
-                options=quiz_body["options"],
-                explanation=quiz_body.get("explanation") or None,
-                reward_point=10,
-            )
-
-            generated.append(GeneratedQuizItem(
-                quizId=quiz_id,
-                movieId=movie["id"],
-                movieTitle=movie["title"],
-                question=quiz_body["question"],
-                correctAnswer=quiz_body["correctAnswer"],
-                options=quiz_body["options"],
-                explanation=quiz_body.get("explanation") or None,
-                rewardPoint=10,
-                status="PENDING",
-            ))
-        except Exception as e:
-            # 한 편 실패는 전체 실패로 전파하지 않고 로그만 남기고 다음으로.
-            logger.error(
-                "admin_quiz_generate_per_movie_failed",
-                movie_id=movie.get("id"),
-                error=str(e),
-                trace=traceback.format_exc()[-500:],
-            )
-
-    count = len(generated)
+    count = len(items)
     logger.info(
         "admin_quiz_generate_complete",
         requested=request.count,
@@ -952,14 +664,10 @@ async def generate_admin_quiz(request: GenerateQuizRequest) -> GenerateQuizRespo
     )
 
     return GenerateQuizResponse(
-        success=count > 0,
+        success=bool(result_state.get("success", count > 0)),
         count=count,
-        message=(
-            f"AI 가 퀴즈 {count}개를 생성하여 PENDING 으로 등록했습니다."
-            if count > 0
-            else "퀴즈 생성에 실패했습니다. 로그를 확인해 주세요."
-        ),
-        quizzes=generated,
+        message=str(result_state.get("final_message") or ""),
+        quizzes=items,
     )
 
 

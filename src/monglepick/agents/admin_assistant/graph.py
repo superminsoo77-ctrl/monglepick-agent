@@ -759,7 +759,43 @@ _CHART_TOOL_SPECS: dict[str, dict] = {
 }
 
 
-def _build_chart_payload(tool_name: str, result: AdminApiResult) -> dict | None:
+# 2026-04-28 (길 A v3 보강) — table_data / chart_data SSE 카드 dedup
+# Client(TableDataCard / ChartDataCard) 가 카드 배열을 push 만 하면 같은 통계가
+# 여러 번 호출됐을 때 화면에 카드가 누적된다. payload 에 dedup_key 를 실어 Client 가
+# Map<dedup_key, card> 로 upsert 하도록 한다. 같은 tool 을 같은 인자로 다시 호출 시
+# 동일 키 → 카드 1장으로 유지.
+
+def _make_dedup_key(tool_name: str, arguments: dict | None) -> str:
+    """
+    tool_name + 정규화된 arguments 로 결정적 dedup_key 를 만든다.
+
+    arguments 가 같은 dict 라도 키 순서가 다르면 다른 키가 되지 않게 sort_keys.
+    값은 본문성 필드는 길이만 사용 (긴 문자열이 다를 수 있어도 같은 카드로 묶음).
+    """
+    if not arguments:
+        return tool_name
+    # 본문성 필드는 hash 부담 + 노출 위험으로 길이만 사용
+    _heavy = {"content", "answer", "explanation", "body"}
+    norm: dict = {}
+    for k, v in arguments.items():
+        if v is None:
+            continue
+        if k in _heavy and isinstance(v, str):
+            norm[k] = f"len={len(v)}"
+        else:
+            norm[k] = v
+    try:
+        canonical = json.dumps(norm, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        canonical = str(sorted(norm.items()))
+    return f"{tool_name}:{canonical}"
+
+
+def _build_chart_payload(
+    tool_name: str,
+    result: AdminApiResult,
+    arguments: dict | None = None,
+) -> dict | None:
     """
     AdminApiResult 의 등록된 시계열 응답에서 SSE chart_data payload 를 빌드한다.
 
@@ -834,6 +870,7 @@ def _build_chart_payload(tool_name: str, result: AdminApiResult) -> dict | None:
 
     return {
         "tool_name": tool_name,
+        "dedup_key": _make_dedup_key(tool_name, arguments),
         "title": spec["title"],
         "chart_type": spec["chart_type"],
         "unit": spec.get("unit", ""),
@@ -845,7 +882,11 @@ def _build_chart_payload(tool_name: str, result: AdminApiResult) -> dict | None:
     }
 
 
-def _build_table_payload(tool_name: str, result: AdminApiResult) -> dict | None:
+def _build_table_payload(
+    tool_name: str,
+    result: AdminApiResult,
+    arguments: dict | None = None,
+) -> dict | None:
     """
     AdminApiResult 의 list/Page 응답에서 SSE table_data payload 를 빌드한다.
 
@@ -909,6 +950,7 @@ def _build_table_payload(tool_name: str, result: AdminApiResult) -> dict | None:
 
     return {
         "tool_name": tool_name,
+        "dedup_key": _make_dedup_key(tool_name, arguments),
         "title": tool_name.replace("_", " ").strip().title(),
         "columns": columns,
         "rows": sample_rows,
@@ -1099,9 +1141,12 @@ async def run_admin_assistant(
                         # _build_table_payload 가 임계치(<3행) 이하 / 비list / 실패 케이스는
                         # None 을 돌려 자동 스킵된다. Client TableDataCard 가 이 payload 를
                         # 카드 형태로 렌더하고 navigate_path 가 있으면 "전체 보기" 버튼 노출.
+                        # 2026-04-28 (길 A v3): payload 에 dedup_key 포함 → Client 가 같은
+                        # 도구 재호출 시 카드 1장으로 upsert 하도록.
                         table_payload = _build_table_payload(
                             call.tool_name if call else "",
                             result,
+                            arguments=call.arguments if call else None,
                         )
                         if table_payload is not None:
                             yield _format_sse_event("table_data", table_payload)
@@ -1113,6 +1158,7 @@ async def run_admin_assistant(
                         chart_payload = _build_chart_payload(
                             call.tool_name if call else "",
                             result,
+                            arguments=call.arguments if call else None,
                         )
                         if chart_payload is not None:
                             yield _format_sse_event("chart_data", chart_payload)

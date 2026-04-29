@@ -38,7 +38,7 @@ Role 매트릭스 (설계서 §5):
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlencode
 
 import structlog
@@ -93,7 +93,13 @@ _AUDIT_NAV_ROLES: set[str] = {
 # ============================================================
 
 class _UserKeywordArgs(BaseModel):
-    """user 검색 계열 6개 공통 — 이메일/닉네임/user_id 키워드로 검색."""
+    """
+    user 검색 계열 6개 공통 — 이메일/닉네임/user_id 키워드로 검색.
+
+    2026-04-28 보강 (길 A v3): suspend / role_change / points_adjust / token_grant 같이
+    부가 정보(사유·기간·금액·역할 등)가 있는 발화를 위해 prefill 필드를 옵션으로 허용한다.
+    handler 가 query string 으로 실어 보내면 Client 가 폼에 prefill 한다.
+    """
 
     keyword: str = Field(
         ...,
@@ -101,6 +107,41 @@ class _UserKeywordArgs(BaseModel):
         description=(
             "이동할 사용자를 찾기 위한 검색어. 이메일·닉네임·user_id 중 하나 또는 일부."
             " 예: 'chulsoo', 'chulsoo@test.com', 'usr_abc123'."
+        ),
+    )
+
+    # 2026-04-28 prefill 필드 (모든 user_navigate handler 가 공통으로 받지만,
+    # action 의미가 맞는 handler 만 query string 에 실어 보낸다)
+    reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "정지/역할 변경/포인트 조정 등의 사유. 사용자 발화에 '~사유는 X', '~때문에' "
+            "같은 어휘가 있으면 그 부분을 그대로 채운다. handler 가 폼 prefill 로 전달."
+        ),
+    )
+    suspendUntil: Optional[str] = Field(
+        default=None,
+        description=(
+            "정지 해제 일시 (ISO 8601). '7일 정지', '한 달 정지' 같이 기간이 있으면 LLM 이 "
+            "오늘 기준으로 미래 시각으로 환산해 채운다. goto_user_suspend 만 사용."
+        ),
+    )
+    targetRole: Optional[str] = Field(
+        default=None,
+        description=(
+            "변경할 역할 (예: ADMIN, MODERATOR, USER). goto_user_role_change 만 사용."
+        ),
+    )
+    pointAmount: Optional[int] = Field(
+        default=None,
+        description=(
+            "조정할 포인트 양 (양수=지급, 음수=차감). goto_points_adjust 만 사용."
+        ),
+    )
+    tokenAmount: Optional[int] = Field(
+        default=None,
+        description=(
+            "발급할 AI 이용권 수량. goto_token_grant 만 사용."
         ),
     )
 
@@ -230,6 +271,7 @@ def _build_user_navigation_result(
     action_suffix: str,
     tool_name: str,
     action_label_template: str,
+    prefill_qs: str = "",
 ) -> dict:
     """
     후보 user 목록을 받아 navigation payload dict 를 구성한다.
@@ -240,6 +282,8 @@ def _build_user_navigation_result(
         action_suffix:        target_path 에 붙을 action 쿼리 (예: "&action=suspend")
         tool_name:            이 tool 의 이름 (SSE navigation 이벤트 페이로드)
         action_label_template: label 템플릿. "{display}" 를 실제 이름으로 치환한다.
+        prefill_qs:           target_path 에 추가로 붙을 prefill 쿼리 (예: "&reason=...&suspendUntil=...").
+                              빈 문자열이면 미적용. 2026-04-28 길 A 보강.
 
     Returns:
         navigation payload dict (AdminApiResult.data 에 담겨 반환됨)
@@ -263,7 +307,7 @@ def _build_user_navigation_result(
         uid = _uid(u)
         display = _display(u)
         return {
-            "target_path": f"/admin/users?userId={uid}{action_suffix}",
+            "target_path": f"/admin/users?userId={uid}{action_suffix}{prefill_qs}",
             "label": action_label_template.replace("{display}", display),
             "context_summary": f"'{keyword}' 로 1명을 찾았어요. 해당 화면으로 이동하실 수 있어요.",
             "tool_name": tool_name,
@@ -277,7 +321,7 @@ def _build_user_navigation_result(
         joined = _joined(u)
         label = display + (f" ({joined} 가입)" if joined else "")
         candidates.append({
-            "target_path": f"/admin/users?userId={uid}{action_suffix}",
+            "target_path": f"/admin/users?userId={uid}{action_suffix}{prefill_qs}",
             "label": label,
         })
 
@@ -293,12 +337,27 @@ def _build_user_navigation_result(
     }
 
 
+def _build_prefill_qs(prefill: dict[str, Any]) -> str:
+    """
+    suspend/role_change/points_adjust/token_grant 등에서 받은 prefill dict 를
+    target_path 끝에 붙일 query string 으로 변환한다.
+
+    None / 빈 문자열은 제외. urlencode 로 한국어·특수문자 안전 처리.
+    반환 형식: "&key1=val1&key2=val2" (앞에 & 가 붙어 기존 path 끝에 그대로 concat).
+    """
+    cleaned = {k: v for k, v in prefill.items() if v not in (None, "", 0)}
+    if not cleaned:
+        return ""
+    return "&" + urlencode({k: str(v) for k, v in cleaned.items()})
+
+
 async def _handle_user_navigate(
     ctx: ToolContext,
     keyword: str,
     action_suffix: str,
     tool_name: str,
     action_label_template: str,
+    prefill: dict[str, Any] | None = None,
 ) -> AdminApiResult:
     """
     user 검색 계열 6개 handler 의 공통 구현.
@@ -307,6 +366,8 @@ async def _handle_user_navigate(
     2. 후보 0건 → ok=False 에러
     3. 후보 1건 → 단건 navigation payload
     4. 후보 여러 건 → candidates 배열 포함 payload
+
+    prefill: 정지 사유·기간·역할·금액 등 폼 prefill 용 dict. None 또는 빈 dict 면 미적용.
     """
     result = await _search_users(ctx, keyword)
     if not result.ok:
@@ -325,12 +386,15 @@ async def _handle_user_navigate(
             row_count=0,
         )
 
+    prefill_qs = _build_prefill_qs(prefill or {})
+
     payload = _build_user_navigation_result(
         items=items,
         keyword=keyword,
         action_suffix=action_suffix,
         tool_name=tool_name,
         action_label_template=action_label_template,
+        prefill_qs=prefill_qs,
     )
 
     return AdminApiResult(
@@ -349,9 +413,14 @@ async def _handle_user_navigate(
 async def _handle_goto_user_detail(
     ctx: ToolContext,
     keyword: str,
+    reason: str | None = None,
+    suspendUntil: str | None = None,
+    targetRole: str | None = None,
+    pointAmount: int | None = None,
+    tokenAmount: int | None = None,
 ) -> AdminApiResult:
     """
-    user 검색 → 상세 화면 이동.
+    user 검색 → 상세 화면 이동. (상세 보기는 prefill 필드 미사용)
     target_path: /admin/users?userId={userId}
     """
     return await _handle_user_navigate(
@@ -360,17 +429,22 @@ async def _handle_goto_user_detail(
         action_suffix="",
         tool_name="goto_user_detail",
         action_label_template="{display} 상세 화면 열기",
+        prefill=None,
     )
 
 
 async def _handle_goto_user_suspend(
     ctx: ToolContext,
     keyword: str,
+    reason: str | None = None,
+    suspendUntil: str | None = None,
+    targetRole: str | None = None,
+    pointAmount: int | None = None,
+    tokenAmount: int | None = None,
 ) -> AdminApiResult:
     """
     user 검색 → 정지 처리 폼 화면 이동.
-    target_path: /admin/users?userId={userId}&action=suspend
-    실제 정지는 관리자가 해당 폼에서 직접 실행한다.
+    target_path: /admin/users?userId={userId}&action=suspend[&reason=...&suspendUntil=...]
     """
     return await _handle_user_navigate(
         ctx=ctx,
@@ -378,17 +452,22 @@ async def _handle_goto_user_suspend(
         action_suffix="&action=suspend",
         tool_name="goto_user_suspend",
         action_label_template="{display} 계정 정지 화면으로 이동",
+        prefill={"reason": reason, "suspendUntil": suspendUntil},
     )
 
 
 async def _handle_goto_user_activate(
     ctx: ToolContext,
     keyword: str,
+    reason: str | None = None,
+    suspendUntil: str | None = None,
+    targetRole: str | None = None,
+    pointAmount: int | None = None,
+    tokenAmount: int | None = None,
 ) -> AdminApiResult:
     """
     user 검색 → 계정 복구 폼 화면 이동.
-    target_path: /admin/users?userId={userId}&action=activate
-    실제 복구는 관리자가 해당 폼에서 직접 실행한다.
+    target_path: /admin/users?userId={userId}&action=activate[&reason=...]
     """
     return await _handle_user_navigate(
         ctx=ctx,
@@ -396,17 +475,22 @@ async def _handle_goto_user_activate(
         action_suffix="&action=activate",
         tool_name="goto_user_activate",
         action_label_template="{display} 계정 복구 화면으로 이동",
+        prefill={"reason": reason},
     )
 
 
 async def _handle_goto_user_role_change(
     ctx: ToolContext,
     keyword: str,
+    reason: str | None = None,
+    suspendUntil: str | None = None,
+    targetRole: str | None = None,
+    pointAmount: int | None = None,
+    tokenAmount: int | None = None,
 ) -> AdminApiResult:
     """
     user 검색 → 역할 변경 폼 화면 이동.
-    target_path: /admin/users?userId={userId}&action=role
-    실제 역할 변경은 관리자가 해당 폼에서 직접 실행한다.
+    target_path: /admin/users?userId={userId}&action=role[&targetRole=...&reason=...]
     """
     return await _handle_user_navigate(
         ctx=ctx,
@@ -414,17 +498,22 @@ async def _handle_goto_user_role_change(
         action_suffix="&action=role",
         tool_name="goto_user_role_change",
         action_label_template="{display} 역할 변경 화면으로 이동",
+        prefill={"targetRole": targetRole, "reason": reason},
     )
 
 
 async def _handle_goto_points_adjust(
     ctx: ToolContext,
     keyword: str,
+    reason: str | None = None,
+    suspendUntil: str | None = None,
+    targetRole: str | None = None,
+    pointAmount: int | None = None,
+    tokenAmount: int | None = None,
 ) -> AdminApiResult:
     """
     user 검색 → 포인트 조정 폼 화면 이동.
-    target_path: /admin/users?userId={userId}&action=points-adjust
-    실제 포인트 조정은 관리자가 해당 폼에서 직접 실행한다.
+    target_path: /admin/users?userId={userId}&action=points-adjust[&pointAmount=...&reason=...]
     """
     return await _handle_user_navigate(
         ctx=ctx,
@@ -432,17 +521,22 @@ async def _handle_goto_points_adjust(
         action_suffix="&action=points-adjust",
         tool_name="goto_points_adjust",
         action_label_template="{display} 포인트 조정 화면으로 이동",
+        prefill={"pointAmount": pointAmount, "reason": reason},
     )
 
 
 async def _handle_goto_token_grant(
     ctx: ToolContext,
     keyword: str,
+    reason: str | None = None,
+    suspendUntil: str | None = None,
+    targetRole: str | None = None,
+    pointAmount: int | None = None,
+    tokenAmount: int | None = None,
 ) -> AdminApiResult:
     """
     user 검색 → 이용권 발급 폼 화면 이동.
-    target_path: /admin/users?userId={userId}&action=tokens-grant
-    실제 이용권 발급은 관리자가 해당 폼에서 직접 실행한다.
+    target_path: /admin/users?userId={userId}&action=tokens-grant[&tokenAmount=...&reason=...]
     """
     return await _handle_user_navigate(
         ctx=ctx,
@@ -450,6 +544,7 @@ async def _handle_goto_token_grant(
         action_suffix="&action=tokens-grant",
         tool_name="goto_token_grant",
         action_label_template="{display} 이용권 발급 화면으로 이동",
+        prefill={"tokenAmount": tokenAmount, "reason": reason},
     )
 
 
@@ -1120,6 +1215,127 @@ async def _handle_goto_ticket_detail(
 
 
 # ============================================================
+# 2026-04-28 신설 — Notice navigate (공지사항 상세 / 목록)
+# ============================================================
+# 기존에는 공지사항 navigate tool 자체가 없어 "공지 옛날거 삭제해줘" 발화 시 LLM 이
+# notice_draft 로 잘못 매칭 → modal=create 폼이 떴다. 길 A 보강으로 별도 navigate tool 신설.
+
+class _NoticeNavArgs(BaseModel):
+    """공지 navigate 공통 — id 우선, 없으면 keyword 로 목록 화면."""
+
+    noticeId: Optional[int] = Field(
+        default=None,
+        description="이동할 공지 ID. 알고 있으면 즉시 단건 링크를 생성한다.",
+    )
+    keyword: Optional[str] = Field(
+        default=None,
+        description="공지 제목/본문 검색어. id 가 없을 때 목록 화면으로 보낼 검색어로 사용.",
+    )
+
+
+async def _handle_goto_notice_detail(
+    ctx: ToolContext,
+    noticeId: Optional[int] = None,
+    keyword: Optional[str] = None,
+) -> AdminApiResult:
+    """
+    공지사항 상세 화면 이동 (수정·삭제 모두 이 화면에서 수행).
+
+    target_path: /admin/support?tab=notice&noticeId={id}
+    Backend 조회 없이 ID 그대로 링크. ID 모르면 목록 화면(keyword 검색)으로 보냄.
+    실제 수정·삭제는 관리자가 화면에서 직접 수행한다.
+    """
+    tool_name = "goto_notice_detail"
+
+    if noticeId is not None:
+        return AdminApiResult(
+            ok=True,
+            status_code=200,
+            data={
+                "target_path": f"/admin/support?tab=notice&noticeId={noticeId}",
+                "label": f"공지 #{noticeId} 상세 화면으로 이동",
+                "context_summary": (
+                    f"공지 #{noticeId} 화면으로 바로 이동할 수 있어요. "
+                    "삭제·수정은 화면 우측 상단 메뉴에서 직접 수행해 주세요."
+                ),
+                "tool_name": tool_name,
+            },
+            latency_ms=0,
+            row_count=1,
+        )
+
+    if not keyword:
+        return AdminApiResult(
+            ok=False,
+            status_code=400,
+            data=None,
+            error="noticeId 또는 keyword 중 하나는 입력해야 해요.",
+            latency_ms=0,
+            row_count=0,
+        )
+
+    # keyword 만 있으면 목록 화면 + 검색어로 fallback
+    qs = urlencode({"q": keyword})
+    return AdminApiResult(
+        ok=True,
+        status_code=200,
+        data={
+            "target_path": f"/admin/support?tab=notice&{qs}",
+            "label": f"공지 '{keyword}' 검색 화면으로 이동",
+            "context_summary": (
+                f"공지 ID 를 모르므로 '{keyword}' 검색 결과 화면으로 이동해요. "
+                "목록에서 대상 공지를 클릭한 뒤 삭제·수정해 주세요."
+            ),
+            "tool_name": tool_name,
+        },
+        latency_ms=0,
+        row_count=None,
+    )
+
+
+async def _handle_goto_notice_list(
+    ctx: ToolContext,
+    noticeId: Optional[int] = None,
+    keyword: Optional[str] = None,
+) -> AdminApiResult:
+    """
+    공지사항 목록 화면 이동 (전체 목록 + 선택적 검색어).
+
+    target_path: /admin/support?tab=notice[&q=keyword]
+    keyword 미입력이면 전체 목록.
+    """
+    tool_name = "goto_notice_list"
+
+    if keyword:
+        qs = urlencode({"q": keyword})
+        return AdminApiResult(
+            ok=True,
+            status_code=200,
+            data={
+                "target_path": f"/admin/support?tab=notice&{qs}",
+                "label": f"공지 '{keyword}' 검색 화면으로 이동",
+                "context_summary": f"공지 '{keyword}' 검색 결과 화면으로 이동해요.",
+                "tool_name": tool_name,
+            },
+            latency_ms=0,
+            row_count=None,
+        )
+
+    return AdminApiResult(
+        ok=True,
+        status_code=200,
+        data={
+            "target_path": "/admin/support?tab=notice",
+            "label": "공지사항 목록 화면으로 이동",
+            "context_summary": "전체 공지사항 목록 화면으로 이동해요.",
+            "tool_name": tool_name,
+        },
+        latency_ms=0,
+        row_count=None,
+    )
+
+
+# ============================================================
 # Handler — goto_audit_log
 # ============================================================
 
@@ -1203,13 +1419,17 @@ register_tool(ToolSpec(
     required_roles=_USER_NAV_ROLES,
     description=(
         "이메일·닉네임·user_id 키워드로 사용자를 검색해 계정 정지 처리 폼 화면으로 이동할 "
-        "링크를 제공합니다. 실제 처리는 관리자가 화면에서 직접 수행합니다. "
-        "검색으로 대상을 찾아 해당 관리 화면으로 이동할 링크를 제공합니다."
+        "링크를 제공합니다. **사용자 발화에 정지 사유나 기간이 있으면 reason / suspendUntil "
+        "필드를 함께 채워야 합니다.** 예: '~사유는 X' → reason='X', '7일 정지' → suspendUntil 을 "
+        "오늘+7일 ISO 8601 로 환산. Client 폼이 prefill 받아 자동 채움. "
+        "실제 처리는 관리자가 화면에서 직접 수행합니다."
     ),
     example_questions=[
         "chulsoo 계정 정지시켜줘",
         "spammer@test.com 유저 정지 처리 화면으로 이동",
         "abuser 닉네임 계정 정지 폼 열어줘",
+        "이민수 계정 정지해줘 사유는 욕설 반복이야",   # reason 채우기
+        "chulsoo 7일 정지 처리해줘",                   # suspendUntil 채우기
     ],
     args_schema=_UserKeywordArgs,
     handler=_handle_goto_user_suspend,
@@ -1384,6 +1604,45 @@ register_tool(ToolSpec(
     ],
     args_schema=_TicketNavArgs,
     handler=_handle_goto_ticket_detail,
+))
+
+
+# 2026-04-28 신설 — 공지사항 navigate 2개
+register_tool(ToolSpec(
+    name="goto_notice_detail",
+    tier=0,
+    required_roles=_CONTENT_SUPPORT_NAV_ROLES,
+    description=(
+        "공지 ID 또는 제목 키워드로 공지사항을 찾아 상세 관리 화면으로 이동할 링크를 제공합니다. "
+        "수정·삭제는 모두 이 화면 우측 상단 메뉴에서 직접 수행합니다. "
+        "공지 삭제/수정/조회 의도 발화에 모두 이 도구를 사용하세요. "
+        "ID 가 없으면 목록 검색 화면으로 fallback 합니다."
+    ),
+    example_questions=[
+        "공지 1번 보여줘",
+        "최신 공지 화면으로 이동",
+        "공지사항 옛날거 삭제하러 가자",
+        "서비스 점검 공지 화면으로 이동",
+    ],
+    args_schema=_NoticeNavArgs,
+    handler=_handle_goto_notice_detail,
+))
+
+register_tool(ToolSpec(
+    name="goto_notice_list",
+    tier=0,
+    required_roles=_CONTENT_SUPPORT_NAV_ROLES,
+    description=(
+        "공지사항 전체 목록 화면으로 이동할 링크를 제공합니다. keyword 가 있으면 검색 결과 화면. "
+        "어떤 공지를 다룰지 특정되지 않을 때(여러 공지 정리·검토) 사용하세요."
+    ),
+    example_questions=[
+        "공지 목록 보여줘",
+        "공지사항 화면으로 이동",
+        "이번 달 공지 검색해줘",
+    ],
+    args_schema=_NoticeNavArgs,
+    handler=_handle_goto_notice_list,
 ))
 
 

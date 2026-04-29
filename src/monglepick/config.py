@@ -280,6 +280,13 @@ class Settings(BaseSettings):
     # 풀 최대 연결 수 (동시 쿼리 허용 상한)
     MYSQL_POOL_MAX: int = 10
 
+    # ── Support Assistant Checkpointer (Phase 3 RedisSaver) ──
+    # false(기본): MemorySaver — 단일 프로세스 인스턴스, 재시작 시 세션 소멸.
+    # true: AsyncRedisSaver — 멀티 인스턴스 배포 간 세션 공유 + 재시작 후에도 상태 유지.
+    # 운영 전환 시 Redis 메모리 사용량 및 키 정리 정책(TTL 24h) 반드시 확인.
+    # 키 prefix: support_assistant:checkpoint / support_assistant:cp_blob / support_assistant:cp_write
+    SUPPORT_REDIS_CHECKPOINTER_ENABLED: bool = False
+
     # ── Support FAQ ES 검색 (support_assistant v3.3) ──
     # ES BM25 점수 임계값 — HIGH: LLM 호출 없이 즉시 faq 확정
     # MID 이상 HIGH 미만: Solar 재랭킹 호출

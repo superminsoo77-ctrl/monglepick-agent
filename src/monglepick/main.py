@@ -196,6 +196,18 @@ async def lifespan(app: FastAPI):
             error=str(e), error_type=type(e).__name__,
         )
 
+    # ── [3.5] Support Assistant Checkpointer setup ──
+    # SUPPORT_REDIS_CHECKPOINTER_ENABLED=true 면 Redis Search 인덱스 생성.
+    # MemorySaver(기본) 면 no-op. 실패해도 앱 기동 차단 X.
+    try:
+        from monglepick.agents.support_assistant.graph import setup_support_assistant_checkpointer
+        await setup_support_assistant_checkpointer()
+    except Exception as e:
+        logger.error(
+            "support_checkpointer_setup_unexpected_error",
+            error=str(e), error_type=type(e).__name__,
+        )
+
     startup_elapsed_ms = (time.perf_counter() - startup_start) * 1000
     logger.info("app_startup_complete", version=APP_VERSION, elapsed_ms=round(startup_elapsed_ms, 1))
 
