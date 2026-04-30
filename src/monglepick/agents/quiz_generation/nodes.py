@@ -156,7 +156,7 @@ def _contains_spoiler(text: str) -> bool:
     return any(word in text for word in SPOILER_BLACKLIST)
 
 
-def _build_fallback_draft(movie: CandidateMovie) -> QuizDraft:
+def _build_fallback_draft(movie: CandidateMovie, quiz_type: str = "auto") -> QuizDraft:
     """
     LLM 생성 실패 또는 quality_validator 거부 시 사용할 장르 기반 템플릿 fallback.
 
@@ -185,6 +185,7 @@ def _build_fallback_draft(movie: CandidateMovie) -> QuizDraft:
             f"포스터·로그라인·장르 태그를 통해 확인할 수 있습니다."
         ),
         category="genre",
+        quiz_type=quiz_type,
         is_fallback=True,
         valid=True,
     )
@@ -200,12 +201,54 @@ async def movie_selector(state: QuizGenerationState) -> dict:
     """
     퀴즈 생성 후보 영화를 MySQL 에서 샘플링한다.
 
-    조회 전략:
+    forced_movie_id 가 설정된 경우 해당 영화만 단건 조회하고 샘플링을 건너뛴다.
+    그 외:
         - 장르 필터: genres LIKE '%<genre>%' (필요 시)
         - 최근 N 일 동안 quiz 가 이미 생성된 영화는 제외 (중복 출제 방지)
         - popularity_score DESC ORDER + RAND() 가벼운 셔플로 인기도 가중 + 다양성 확보
         - 빈 DB / 매칭 실패 시 빈 리스트 + selector_message 로 안내
     """
+    forced_movie_id = (state.get("forced_movie_id") or "").strip() or None
+
+    # ── 관리자 지정 영화 모드: 단건 조회 ──
+    if forced_movie_id:
+        try:
+            pool = await get_mysql()
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT movie_id, title, title_en, genres, release_year, release_date "
+                        "FROM movies WHERE movie_id = %s LIMIT 1",
+                        (forced_movie_id,),
+                    )
+                    row = await cur.fetchone()
+
+            if not row:
+                logger.warning("quiz_generation_forced_movie_not_found", movie_id=forced_movie_id)
+                return {
+                    "candidates": [],
+                    "selector_message": f"영화 ID '{forced_movie_id}'를 찾을 수 없습니다.",
+                }
+
+            movie_id, title, title_en, genres_raw, release_year, release_date = row
+            year_str = str(release_year) if release_year else (str(release_date)[:4] if release_date else "")
+            candidate = CandidateMovie(
+                movie_id=str(movie_id),
+                title=title or title_en or "(제목 없음)",
+                genres=_parse_json_array(genres_raw),
+                release_year=year_str,
+            )
+            logger.info("quiz_generation_forced_movie_selected", movie_id=forced_movie_id, title=candidate.title)
+            return {"candidates": [candidate], "selector_message": ""}
+
+        except Exception as e:
+            logger.error("quiz_generation_forced_movie_failed", error=str(e))
+            return {
+                "candidates": [],
+                "selector_message": f"지정 영화 조회 중 오류가 발생했습니다: {e}",
+            }
+
+    # ── 자동 샘플링 모드 ──
     # 영어 코드(action) → 한국어(액션) 정규화 — DB(movies.genres) 가 한국어 배열로 저장되므로 필수.
     # 한국어 입력은 그대로 통과한다.
     genre = _normalize_genre_filter(state.get("genre"))
@@ -394,10 +437,31 @@ def _select_category(movie: CandidateMovie, index: int) -> str:
     return rotated
 
 
+def _select_forced_category(movie: CandidateMovie, quiz_type: str) -> str:
+    """
+    관리자 지정 quiz_type 을 카테고리로 변환한다.
+
+    메타가 비어있으면 'general' 로 강등하여 LLM 환각을 방지한다.
+    """
+    from monglepick.agents.quiz_generation.prompts import CATEGORY_GUIDES
+    if quiz_type not in CATEGORY_GUIDES:
+        return "general"
+    if quiz_type == "plot" and not movie.overview:
+        return "general"
+    if quiz_type == "cast" and not movie.cast_members:
+        return "general"
+    if quiz_type == "director" and not movie.director:
+        return "general"
+    if quiz_type == "year" and not movie.release_year:
+        return "general"
+    return quiz_type
+
+
 async def _generate_one_quiz_llm(
     movie: CandidateMovie,
     category: str,
     difficulty: str,
+    quiz_type: str = "auto",
 ) -> QuizDraft:
     """
     단일 영화에 대해 LLM 호출 1회로 4지선다 1문항을 생성한다.
@@ -444,6 +508,7 @@ async def _generate_one_quiz_llm(
                 correct_answer=str(parsed["correctAnswer"]).strip(),
                 explanation=str(parsed.get("explanation") or "").strip(),
                 category=str(parsed.get("category") or category),
+                quiz_type=quiz_type,
                 is_fallback=False,
                 valid=True,
             )
@@ -460,7 +525,7 @@ async def _generate_one_quiz_llm(
             error=str(e),
         )
 
-    return _build_fallback_draft(movie)
+    return _build_fallback_draft(movie, quiz_type=quiz_type)
 
 
 @traceable(name="quiz_generation.question_generator")
@@ -468,6 +533,7 @@ async def question_generator(state: QuizGenerationState) -> dict:
     """
     enriched_candidates 각각에 대해 LLM 으로 4지선다 1문항을 생성한다.
 
+    quiz_type 이 'auto' 가 아니면 해당 카테고리를 강제 사용한다.
     영화별 호출은 asyncio.gather 로 병렬화하여 전체 지연시간을 줄인다.
     개별 영화 실패는 _generate_one_quiz_llm 내부에서 fallback 초안으로 흡수된다.
     """
@@ -476,12 +542,15 @@ async def question_generator(state: QuizGenerationState) -> dict:
         return {"drafts": []}
 
     difficulty = (state.get("difficulty") or "medium").lower()
+    quiz_type = (state.get("quiz_type") or "auto").lower()
 
-    # 영화 인덱스 별 카테고리 라운드로빈
     tasks = []
     for i, m in enumerate(movies):
-        category = _select_category(m, i)
-        tasks.append(_generate_one_quiz_llm(m, category, difficulty))
+        if quiz_type == "auto":
+            category = _select_category(m, i)
+        else:
+            category = _select_forced_category(m, quiz_type)
+        tasks.append(_generate_one_quiz_llm(m, category, difficulty, quiz_type=quiz_type))
 
     drafts = await asyncio.gather(*tasks, return_exceptions=False)
     drafts_list: list[QuizDraft] = list(drafts)
@@ -489,6 +558,7 @@ async def question_generator(state: QuizGenerationState) -> dict:
     logger.info(
         "quiz_generation_question_done",
         total=len(drafts_list),
+        quiz_type=quiz_type,
         fallback_count=sum(1 for d in drafts_list if d.is_fallback),
     )
     return {"drafts": drafts_list}
@@ -634,10 +704,24 @@ async def fallback_filler(state: QuizGenerationState) -> dict:
     """
     valid=False 처리된 초안을 fallback 으로 1회 보충한다.
 
-    같은 영화의 fallback 초안이 이미 valid 로 들어있다면 보충하지 않는다.
-    이 노드 이후 final_drafts 의 valid=True 만 persistence 가 INSERT 한다.
+    관리자가 특정 영화를 직접 지정한 모드(forced_movie_id + quiz_type != 'auto')에서는
+    장르 fallback 을 생성하지 않는다 — 퀄리티 보장 목적.
+    그 외 자동 모드에서는 같은 영화의 valid 초안이 없을 때만 장르 fallback 1건을 추가한다.
     """
     drafts: list[QuizDraft] = list(state.get("diversified_drafts") or [])
+    forced_movie_id = (state.get("forced_movie_id") or "").strip() or None
+    quiz_type = (state.get("quiz_type") or "auto").lower()
+
+    # 영화 선택 모드: 검증 통과한 초안만 반환 (장르 fallback 금지)
+    if forced_movie_id and quiz_type != "auto":
+        final = [d for d in drafts if d.valid]
+        logger.info(
+            "quiz_generation_fallback_skipped_forced_mode",
+            kept=len(final),
+            rejected=len(drafts) - len(final),
+        )
+        return {"final_drafts": final}
+
     candidates: list[CandidateMovie] = list(
         state.get("enriched_candidates") or state.get("candidates") or []
     )
@@ -659,7 +743,7 @@ async def fallback_filler(state: QuizGenerationState) -> dict:
         if not movie:
             continue
 
-        fb = _build_fallback_draft(movie)
+        fb = _build_fallback_draft(movie, quiz_type=quiz_type)
         valid_movie_ids.add(d.movie_id)
         final.append(fb)
 
@@ -683,11 +767,13 @@ async def _insert_quiz_pending(
     options: list[str],
     explanation: Optional[str],
     reward_point: int,
+    quiz_type: str = "auto",
 ) -> int:
     """
     검증 통과한 퀴즈 초안 1건을 quizzes 테이블에 PENDING 으로 INSERT 한다.
 
     Backend(Quiz 엔티티) 컬럼 1:1 매핑. created_by/updated_by 는 'ai-agent'.
+    quiz_type: 'auto' | 'plot' | 'cast' | 'director' | 'genre'
     """
     options_json = json.dumps(options, ensure_ascii=False)
     pool = await get_mysql()
@@ -698,11 +784,11 @@ async def _insert_quiz_pending(
                 INSERT INTO quizzes (
                     movie_id, question, explanation, correct_answer,
                     options, reward_point, status, quiz_date,
-                    created_at, updated_at, created_by, updated_by
+                    quiz_type, created_at, updated_at, created_by, updated_by
                 ) VALUES (
                     %s, %s, %s, %s,
                     %s, %s, 'PENDING', NULL,
-                    NOW(), NOW(), 'ai-agent', 'ai-agent'
+                    %s, NOW(), NOW(), 'ai-agent', 'ai-agent'
                 )
                 """,
                 (
@@ -712,6 +798,7 @@ async def _insert_quiz_pending(
                     correct_answer,
                     options_json,
                     reward_point,
+                    quiz_type,
                 ),
             )
             await conn.commit()
@@ -740,6 +827,7 @@ async def persistence(state: QuizGenerationState) -> dict:
                 options=d.options,
                 explanation=d.explanation or None,
                 reward_point=reward_point,
+                quiz_type=d.quiz_type,
             )
             persisted.append(GeneratedQuizRecord(
                 quiz_id=quiz_id,

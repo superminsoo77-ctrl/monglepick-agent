@@ -62,6 +62,10 @@ class QuizDraft(BaseModel):
         default="general",
         description="질문 카테고리 (genre/director/year/cast/plot/general)",
     )
+    quiz_type: str = Field(
+        default="auto",
+        description="퀴즈 유형 (auto/plot/cast/director/genre) — quizzes.quiz_type 컬럼에 저장",
+    )
     is_fallback: bool = Field(
         default=False,
         description="True 면 LLM 생성 실패 → 템플릿 fallback 사용",
@@ -113,6 +117,8 @@ class QuizGenerationState(TypedDict, total=False):
     count: int                      # 생성 목표 편수 (1~50)
     exclude_recent_days: int        # 최근 N 일 quiz 가 있는 영화 제외 (기본 7)
     reward_point: int               # 정답 시 포인트 (기본 10)
+    forced_movie_id: Optional[str]  # 관리자 지정 영화 ID (설정 시 movie_selector 샘플링 스킵)
+    quiz_type: str                  # 'auto' | 'plot' | 'cast' | 'director' | 'genre'
 
     # ── movie_selector 출력 ─────────────────────────────────────
     candidates: list[CandidateMovie]      # 샘플링된 후보 영화 풀

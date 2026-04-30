@@ -526,7 +526,8 @@ class GenerateQuizRequest(BaseModel):
     """
     AI 퀴즈 자동 생성 요청 DTO.
 
-    AiTriggerPanel(monglepick-admin) 폼과 호환되는 필드 + 운영 옵션 2 종.
+    AiTriggerPanel(monglepick-admin) 폼과 호환되는 필드 + 운영 옵션.
+    movieId 를 지정하면 movie_selector 샘플링을 건너뛰고 해당 영화만 사용한다.
     """
 
     genre: Optional[str] = Field(
@@ -554,6 +555,14 @@ class GenerateQuizRequest(BaseModel):
         ge=1,
         le=1000,
         description="정답 시 지급할 보상 포인트 (기본 10).",
+    )
+    movieId: Optional[str] = Field(
+        default=None,
+        description="관리자 지정 영화 ID. 설정 시 movie_selector 샘플링을 건너뛰고 해당 영화만 사용.",
+    )
+    quizType: str = Field(
+        default="auto",
+        description="퀴즈 유형: 'auto'(자동/카테고리 라운드로빈) | 'plot'(줄거리) | 'cast'(출연진) | 'director'(감독) | 'genre'(장르)",
     )
 
 
@@ -611,6 +620,8 @@ async def generate_admin_quiz(request: GenerateQuizRequest) -> GenerateQuizRespo
         count=request.count,
         exclude_recent_days=request.excludeRecentDays,
         reward_point=request.rewardPoint,
+        movie_id=request.movieId,
+        quiz_type=request.quizType,
     )
 
     # ── LangGraph 초기 상태 구성 (camelCase → snake_case) ──
@@ -620,6 +631,8 @@ async def generate_admin_quiz(request: GenerateQuizRequest) -> GenerateQuizRespo
         "count": request.count,
         "exclude_recent_days": request.excludeRecentDays,
         "reward_point": request.rewardPoint,
+        "forced_movie_id": (request.movieId or "").strip() or None,
+        "quiz_type": request.quizType or "auto",
     }
 
     try:
