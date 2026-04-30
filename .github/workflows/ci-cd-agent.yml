@@ -70,9 +70,20 @@ jobs:
     timeout-minutes: 10
     # develop 브랜치 push 시에만 배포 (PR은 테스트만)
     if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    env:
+      STAGING_HOST: ${{ secrets.STAGING_HOST }}
 
     steps:
+      # STAGING_HOST 시크릿 미설정 시 배포를 건너뛰고 안내만 출력한다.
+      - name: Check deployment secrets
+        if: env.STAGING_HOST == ''
+        run: |
+          echo "::warning::STAGING_HOST secret not configured — skipping SSH deployment"
+          echo "Repository secrets 에 아래 항목을 추가하면 자동 배포가 활성화됩니다:"
+          echo "  STAGING_HOST, STAGING_USER, STAGING_SSH_KEY, STAGING_PORT, PROJECT_DIR"
+
       - name: Deploy Agent container
+        if: env.STAGING_HOST != ''
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.STAGING_HOST }}
