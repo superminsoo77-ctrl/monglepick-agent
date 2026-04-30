@@ -486,9 +486,11 @@ async def _generate_one_quiz_llm(
             category=category,
         )
 
+        model_name = getattr(llm, "model", None) or getattr(llm, "model_name", None) or "unknown"
         response = await guarded_ainvoke(
             llm,
             [SystemMessage(content=system_text), HumanMessage(content=user_text)],
+            model=model_name,
         )
         text = response.content if hasattr(response, "content") else str(response)
         parsed = _parse_quiz_json(text)
